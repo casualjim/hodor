@@ -1,0 +1,75 @@
+name: hodor-integration
+
+# Transparent capture topology: the client container shares hodor's network
+# namespace (network_mode: service:hodor). hodor runs --tun and installs its
+# policy routing inside that shared netns, so every client connection is
+# captured without any proxy configuration on the client — LAN included.
+# hodor's marked upstream dials bypass the capture (fwmark rule).
+services:
+  certs:
+    image: oven/bun:1
+    entrypoint: ["bash", "/srv/gen-certs.sh", "/certs"]
+    volumes:
+      - ./gen-certs.sh:/srv/gen-certs.sh:ro
+      - certs:/certs
+    restart: "no"
+
+  hodor:
+    build:
+      context: ./docker
+      dockerfile: ../../Dockerfile
+    command: ["serve", "--tun", "--config", "/etc/hodor/hodor.toml"]
+    environment:
+      RUST_LOG: debug
+    stop_grace_period: 1s
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./hodor.toml:/etc/hodor/hodor.toml:ro
+      - certs:/certs:ro
+    networks:
+      default: {}
+      server:
+        ipv4_address: 10.202.0.10
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
+  api:
+    image: oven/bun:1
+    working_dir: /srv
+    command: ["run", "server.ts"]
+    environment:
+      HODOR_REAL: ghp_deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    volumes:
+      - ./api:/srv:ro
+      - certs:/certs:ro
+    networks:
+      server:
+        ipv4_address: 10.202.0.20
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
+  client:
+    image: oven/bun:1
+    working_dir: /srv
+    command: ["run", "run.ts"]
+    environment:
+      HODOR_FAKE: ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3
+    volumes:
+      - ./client:/srv:ro
+      - certs:/certs:ro
+    network_mode: service:hodor
+    depends_on: [hodor, api]
+
+networks:
+  server:
+    ipam:
+      config:
+        - subnet: 10.202.0.0/24
+
+volumes:
+  certs: {}

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the transparent docker compose integration demo"
+
+proj_dir=$(git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+set -euo pipefail
+
+mise run build -- --release --features tun
+mkdir -p integration/docker
+cp target/release/hodor integration/docker/hodor
+
+compose="docker compose -f integration/compose.yaml"
+trap '$compose down --remove-orphans -v --timeout 3' EXIT
+# compose up --abort-on-container-exit hangs after teardown with the
+# netns-sharing client; drive the lifecycle directly instead.
+$compose up -d --build
+
+client=hodor-integration-client-1
+state=running
+for _ in $(seq 1 60); do
+  state=$(docker inspect -f '{{.State.Status}}' "$client" 2>/dev/null || echo missing)
+  [ "$state" = exited ] && break
+  [ "$state" = missing ] && break
+  sleep 1
+done
+code=$(docker inspect -f '{{.State.ExitCode}}' "$client" 2>/dev/null || echo 1)
+if [ "$state" != exited ]; then
+  code=124
+fi
+docker logs "$client" || true
+exit "$code"

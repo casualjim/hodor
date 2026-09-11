@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features tun -- -D warnings
+
+      - name: Test
+        run: cargo nextest run
+
+      - name: Test (tun)
+        run: cargo nextest run --features tun

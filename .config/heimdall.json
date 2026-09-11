@@ -1,0 +1,159 @@
+{
+  "sandbox": {
+    "gpgAgent": true,
+    "filesystem": {
+      "deny": [
+        "fnox.*",
+        "!~/.docker"
+      ],
+      "writable": [
+        "~/.cache/hk",
+        "~/.docker",
+        "/var/run/docker.pid",
+        "/var/run/docker.sock",
+        "/var/run/docker",
+        "~/.local/state/mise",
+        "~/.local/share/mise",
+        "~/.local/state/hk",
+        "~/.config/fnox"
+      ]
+    }
+  },
+  "commandPolicies": [
+    {
+      "name": "no-fnox-toml",
+      "blocked": [
+        "cat",
+        "fnox.toml"
+      ],
+      "message": "do not access secrets"
+    },
+    {
+      "name": "bare-only-mise-format",
+      "blocked": [
+        "mise",
+        "format"
+      ],
+      "bare": true,
+      "message": "run `mise check` bare only, no pipe, no tail, no redirect, just `mise check`"
+    },
+    {
+      "name": "bare-only-mise-run-format",
+      "blocked": [
+        "mise",
+        "run",
+        "format"
+      ],
+      "bare": true,
+      "message": "run `mise run check` bare only, no pipe, no tail, no redirect, just `mise run check`"
+    },
+    {
+      "name": "bare-only-force-test",
+      "blocked": [
+        "mise",
+        "run",
+        "--force",
+        "test"
+      ],
+      "bare": true,
+      "message": "run `mise run --force test` bare only, no pipe, no tail, no redirect, just the command"
+    },
+    {
+      "name": "bare-only-force-test-rust",
+      "blocked": [
+        "mise",
+        "run",
+        "--force",
+        "test:rust"
+      ],
+      "bare": true,
+      "message": "run `mise run --force test:rust` bare only, no pipe, no tail, no redirect, just the command"
+    },
+    {
+      "name": "bare-only-run-test-rust",
+      "blocked": [
+        "mise",
+        "run",
+        "test:rust"
+      ],
+      "bare": true,
+      "message": "run `mise run test:rust` bare only, no pipe, no tail, no redirect, just the command"
+    },
+    {
+      "name": "bare-only-test-rust",
+      "blocked": [
+        "mise",
+        "test:rust"
+      ],
+      "bare": true,
+      "message": "run `mise test:rust` bare only, no pipe, no tail, no redirect, just the command"
+    },
+    {
+      "name": "bare-only-run-test",
+      "blocked": [
+        "mise",
+        "run",
+        "test"
+      ],
+      "bare": true,
+      "message": "run `mise run test:rust` bare only, no pipe, no tail, no redirect, just the command"
+    },
+    {
+      "name": "bare-only-test",
+      "blocked": [
+        "mise",
+        "test"
+      ],
+      "bare": true,
+      "message": "run `mise test:rust` bare only, no pipe, no tail, no redirect, just the command"
+    },
+    {
+      "name": "no-cargo-check",
+      "blocked": [
+        "cargo",
+        "check"
+      ],
+      "message": "Use `mise format` instead of `cargo check`."
+    },
+    {
+      "name": "no-cargo-build",
+      "blocked": [
+        "cargo",
+        "build"
+      ],
+      "message": "Use `mise build` instead of `cargo check`."
+    },
+    {
+      "name": "no-cargo-test",
+      "blocked": [
+        "cargo",
+        "test"
+      ],
+      "message": "Use `mise test` or `mise run test` instead of `cargo test`."
+    },
+    {
+      "name": "no-cargo-nextest",
+      "blocked": [
+        "cargo",
+        "nextest"
+      ],
+      "message": "Use `mise test` or `mise run --force test` instead of `cargo nextest`."
+    },
+    {
+      "name": "no-cargo-fmt",
+      "blocked": [
+        "cargo",
+        "fmt"
+      ],
+      "message": "Use `mise check` instead of `cargo fmt`."
+    },
+    {
+      "name": "no-cargo-clippy",
+      "blocked": [
+        "cargo",
+        "clippy"
+      ],
+      "message": "Use `mise check` instead of `cargo clippy`."
+    }
+  ]
+}

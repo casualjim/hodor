@@ -1,0 +1,16 @@
+# Project-layer config for the transparent integration demo (loaded via
+# `hodor serve --tun --config`). The client shares hodor's network
+# namespace and holds only the deterministic fake printed by
+# `hodor fake GH_TOKEN`; capture is via TUN policy routing.
+#
+# The tcp:// grant host is the literal destination IP: TUN raw TCP has no
+# SNI, the dst address is the identity (src/tun/mod.rs tun_conn_task).
+# Hence the static api address in compose.yaml.
+[proxy]
+listen = "0.0.0.0:8080"
+ca_file = "/certs/ca.pem"
+
+[secrets.demo]
+env = "GH_TOKEN"
+value = "ghp_deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+allow = ["https://api:8443", "http://api:8000", "tcp://10.202.0.20:9000", "https://api:9443"]

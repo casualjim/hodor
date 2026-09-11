@@ -1,0 +1,26 @@
+redactions = ["*_TOKEN", "*_SECRET", "*_KEY", "*_PASSWORD"]
+
+[settings]
+experimental = true
+lockfile = true
+env_shell_expand = true
+idiomatic_version_file_enable_tools = ["rust"]
+rust.cargo_home = ".cache/native/cargo"
+rust.rustup_home = ".cache/native/rustup"
+
+[tools]
+"aqua:nextest-rs/nextest/cargo-nextest" = "latest"
+hk = "latest"
+pkl = "latest"
+hadolint = "latest"
+shellcheck = "latest"
+"cargo:cargo-sort" = "latest"
+rust = { version = "stable", profile = "default", components = "llvm-tools,rust-analyzer" }
+"github:casualjim/remark" = "latest"
+gum = "latest"
+lychee = "latest"
+
+[env]
+CARGO_TERM_COLOR = "always"
+CARGO_HOME = "{{config_root}}/.cache/native/cargo"
+RUSTUP_HOME = "{{config_root}}/.cache/native/rustup"

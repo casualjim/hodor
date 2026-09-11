@@ -1,8 +1,18 @@
+## [0.1.7] - 2026-09-11
+
+### 🐛 Bug Fixes
+
+- *(container)* Check out the repo so buildx can find the Dockerfile
 ## [0.1.6] - 2026-09-11
 
 ### 🐛 Bug Fixes
 
 - *(container)* Download and extract the release asset correctly
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.6 [ci skip]
+- Release hodor version 0.1.6
 ## [0.1.5] - 2026-09-11
 
 ### 🐛 Bug Fixes

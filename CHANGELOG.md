@@ -1,8 +1,19 @@
+## [0.1.9] - 2026-09-11
+
+### 🚀 Features
+
+- *(ca)* Write the certificate and key beside the CA file
+
+### ⚙️ Miscellaneous Tasks
+
+- *(heimdall)* Point the policy messages at the format task
 ## [0.1.8] - 2026-09-11
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Use current action majors in the hand-written workflows
+- Update changelog for v0.1.8 [ci skip]
+- Release hodor version 0.1.8
 ## [0.1.7] - 2026-09-11
 
 ### 🐛 Bug Fixes

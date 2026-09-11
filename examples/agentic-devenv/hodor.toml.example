@@ -9,12 +9,12 @@
 listen = "127.0.0.1:8080"
 ca_file = "/certs/ca.pem"
 
-[secrets.anthropic]
+[rules.anthropic]
 env = "ANTHROPIC_API_KEY"
 value = "sk-ant-api03-REPLACE-WITH-THE-REAL-KEY"
 allow = ["https://api.anthropic.com"]
 
-[secrets.github]
+[rules.github]
 env = "GH_TOKEN"
 value = "ghp_REPLACE-WITH-THE-REAL-TOKEN"
 allow = ["https://api.github.com", "https://github.com", "https://*.githubusercontent.com"]

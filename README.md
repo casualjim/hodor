@@ -45,7 +45,7 @@ Write the config file.
 listen = "127.0.0.1:8080"
 ca_file = "ca.pem"
 
-[secrets.demo]
+[rules.demo]
 env = "DEMO_TOKEN"
 value = "real-secret-value-xyz"
 allow = ["http://127.0.0.1:8000"]
@@ -128,6 +128,57 @@ Bearer real-secret-value-xyz
 
 To reach a granted `https://` host, the client must trust hodor's CA. Run `hodor ca` to write the CA file and print the certificate. It also writes `ca.crt`, the certificate on its own, and `ca.key`, the private key on its own, beside it. Add the certificate to the client's trust store. A client that does not trust the CA fails the TLS handshake.
 
+## Rules
+
+A rule wires an environment name to the hosts it may reach, the decoy shape the client sees, and where the real value comes from.
+
+`[rules.<label>]` replaces the old `[secrets.<label>]` table. A leftover `[secrets]` table is ignored silently, with no migration shim, so rename it to `[rules]`.
+
+```toml
+[fnox]
+config  = "fnox.toml"   # optional; default is fnox's own discovery
+profile = "work"        # optional; default is FNOX_PROFILE
+
+[rules.gh]
+env        = "GITHUB_TOKEN"        # required: decoy seed, registry key, fnox key
+value      = "..."                 # optional: inline real value
+fnox_key   = "..."                 # optional: fnox secret name, default = env
+allow      = ["https://ghe.corp"]  # optional: unions with registry hosts
+pattern    = "..."                 # optional: overrides the registry pattern
+registry   = false                 # optional: skip registry hosts
+if_missing = "error"               # "error" (default) | "warn" | "ignore"
+```
+
+`env = "GITHUB_TOKEN"` alone is enough: the registry supplies the hosts and the decoy shape.
+
+## Known-host registry
+
+hodor ships a table of known services in `rules/registry.toml`: the environment names each one uses, its API hosts, and its token shape. Override it from `<config-dir>/hodor/rules.d/*.toml` (beside the global config file), loaded in filename order:
+
+```toml
+[providers.github]
+env      = ["GITHUB_TOKEN"]
+hosts    = ["https://api.github.com", "https://ghe.corp.example"]
+pattern  = "ghp_ghe_{hex:32}"
+contains = ["gh_"]
+replace  = false
+
+[names.GH_ENTERPRISE_TOKEN]
+hosts = ["https://ghe.corp.example"]
+```
+
+`replace = true` discards what earlier layers declared for those names. `contains` matches environment-name substrings and selects a decoy shape only, never hosts. `hodor fake <ENV>` uses the same table, so a custom rule's decoy can be previewed without running a proxy.
+
+## Values from fnox
+
+When a rule has no inline `value`, hodor resolves it through [fnox](https://fnox.jdx.dev), which reaches age, 1Password, AWS Secrets Manager, Vault, Bitwarden, the OS keychain, and the rest of its provider catalog. hodor embeds `fnox-core`; no fnox binary is needed.
+
+The fnox config is `[fnox].config`, else `HODOR_FNOX_CONFIG`, else whatever fnox's own discovery finds: an upward `fnox.toml` walk layered over fnox's global config. A key fnox does not declare follows the rule's `if_missing`; a key it declares but cannot resolve is a startup error.
+
+Embedding `fnox-core` brings rustls's `ring` feature into the build, so both crypto backends are compiled and `ClientConfig::builder()` can no longer select a provider on its own. Any new entry point must call `ca::install_crypto_provider()` first, exactly as `main` does.
+
+`Cargo.toml` pins `keepass = "=0.13.22"` for now. keepass 0.13.23 and later declare an `aes` range with an upper bound only (`<0.9.3`), which resolves to aes 0.8.4 and breaks keepass's own cbc and cipher traits. When a keepass release admits a 0.9.x `aes` again, bump the pin, run bare `mise run --force test:rust`, then delete the pin. `fnox-core` itself stays on a caret requirement (`"1.33"`), deliberately, so a future release can carry the fix.
+
 ## Configuration layers
 
 hodor reads four layers. A higher layer wins.
@@ -139,7 +190,7 @@ hodor reads four layers. A higher layer wins.
 
 hodor finds the workspace root by walking up from the working directory. `HODOR_PROJECT_ROOT` sets the root directly and skips the walk. `--config <FILE>` replaces the project file.
 
-`[secrets]` merges by label. If the project file and the global file both define `[secrets.demo]`, the project entry replaces the global entry.
+`[rules]` merges by label. If the project file and the global file both define `[rules.demo]`, the project entry replaces the global entry.
 
 ## Configuration keys
 
@@ -150,14 +201,24 @@ hodor finds the workspace root by walking up from the working directory. `HODOR_
 | `listen` | `127.0.0.1:8080` | `HODOR_LISTEN` | Address the proxy listens on. |
 | `ca_file` | `<config-dir>/hodor/ca.pem` | `HODOR_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `hodor ca` also writes `ca.crt` and `ca.key` beside it. |
 
-`[secrets.<label>]`:
+`[rules.<label>]`:
 
 | Key | Required | Purpose |
 | --- | --- | --- |
-| `env` | yes | Environment variable name. The decoy is derived from it. |
-| `value` | yes | The real secret value. |
-| `allow` | yes | List of allow entries. |
-| `pattern` | no | Decoy pattern, overriding auto-detection. |
+| `env` | yes | Environment variable name. Seeds the decoy, keys the registry lookup, and defaults the fnox key. |
+| `value` | no | Inline real secret value. Wins over fnox. |
+| `fnox_key` | no | fnox secret name. Defaults to `env`. |
+| `allow` | no | List of allow entries. Unions with the hosts the registry supplies. |
+| `pattern` | no | Decoy pattern, overriding the registry. |
+| `registry` | no | Whether this rule uses registry hosts. Default `true`. |
+| `if_missing` | no | `error` (default), `warn`, or `ignore`. |
+
+`[fnox]`:
+
+| Key | Default | Environment | Purpose |
+| --- | --- | --- | --- |
+| `config` | fnox discovery | `HODOR_FNOX_CONFIG` | Path to the fnox config file. |
+| `profile` | fnox's `FNOX_PROFILE` | `HODOR_FNOX_PROFILE` | Comma-separated fnox profile list. |
 
 `HODOR_*` environment variables:
 
@@ -166,10 +227,12 @@ hodor finds the workspace root by walking up from the working directory. `HODOR_
 | `HODOR_LISTEN` | Sets `[proxy] listen`. |
 | `HODOR_CA_FILE` | Sets `[proxy] ca_file`. |
 | `HODOR_CONFIG` | Sets the global config file path. |
+| `HODOR_FNOX_CONFIG` | Sets `[fnox] config`. |
+| `HODOR_FNOX_PROFILE` | Sets `[fnox] profile`. |
 | `HODOR_PROJECT_ROOT` | Sets the workspace root. |
 | `HODOR_TUN` | Same as `--tun`. CLI and environment only. |
 
-hodor validates the config at startup. It rejects two secrets that share an env name, an empty `env` or `value`, a malformed allow entry, and a malformed pattern. A `*` host in an allow entry logs a warning that the grant matches any host and the secret is at risk of exfiltration.
+hodor validates the config at startup. It rejects two rules that share an env name, an empty `env` or `value`, a malformed allow entry, and a malformed pattern. A `*` host in an allow entry logs a warning that the grant matches any host and the secret is at risk of exfiltration.
 
 ## Allow entries
 
@@ -194,17 +257,9 @@ hodor intercepts only a connection whose host and port match some allow entry. A
 
 ## Decoy patterns
 
-`hodor fake <ENV>` prints a decoy that is deterministic for the env name, so it stays stable across restarts. Auto-detection matches a substring of the lowercased env name. The first match wins.
+`hodor fake <ENV>` prints a decoy that is deterministic for the env name, so it stays stable across restarts. hodor picks the pattern in this order: an explicit `pattern`, a `[names.<ENV>]` registry entry, a `[providers.*]` entry that claims the env name, a `contains` match, then `{hex:32}`.
 
-| Substring | Pattern |
-| --- | --- |
-| `gh_` | `ghp_{hex:40}` |
-| `sk-ant-` | `sk-ant-api03-{base62:64}` |
-| `sk-` | `sk-{hex:48}` |
-| `anthropic` | `sk-ant-api03-{base62:64}` |
-| `xox` | `xoxb-{d:10}-{d:11}-{hex:24}` |
-| `slack` | `xoxb-{d:10}-{d:11}-{hex:24}` |
-| none of these | `{hex:32}` |
+The `contains` tier matches a substring of the lowercased env name. It selects a decoy pattern only and never grants hosts, so a name like `ACME_ANTHROPIC_KEY` gets an Anthropic-shaped decoy without reaching Anthropic. When more than one `contains` entry matches, the first one in provider-name order wins. The bundled entries live in `rules/registry.toml`.
 
 ```sh
 hodor fake DEMO_TOKEN
@@ -217,7 +272,7 @@ hodor fake ANTHROPIC_API_KEY
 # sk-ant-api03-pS6w5Sc3x3SwKriEaFJ5kBrOfItZzcJDxT4bD0UzQpvsDrhBJXUcSn3PqE0nUBdd
 ```
 
-Use `--pattern` to override auto-detection. The pattern verbs are `{hex:N}`, `{d:N}`, and `{base62:N}`, where N is greater than zero. Literal text passes through, so a pattern can carry any prefix. hodor rejects any other verb at startup.
+Use `--pattern` to override the registry. The pattern verbs are `{hex:N}`, `{d:N}`, and `{base62:N}`, where N is greater than zero. Literal text passes through, so a pattern can carry any prefix. hodor rejects any other verb at startup.
 
 ```sh
 hodor fake GH_TOKEN --pattern 'acme_{base62:24}'

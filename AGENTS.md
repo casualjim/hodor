@@ -4,14 +4,15 @@
 Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certs, swaps format-valid decoy fakes for real secrets only on URI-grant match (`scheme://host[:port]`), redacts real values back to fakes on responses. Non-matching traffic splices byte-identical. Optional `tun` feature adds transparent capture via userspace TCP/IP stack.
 
 ## Architecture & Data Flow
-Startup: `main.rs` → `config::load` (4-layer overlay) → `grants::resolve` → `ca::load_or_generate` → `ProxyState::new` (pre-gens leaf certs for exact hosts + one wildcard leaf per `*.`-grant) → `proxy::serve` + optional `tun::run_tun`.
+Startup: `main.rs` → `config::load` (4-layer overlay) → `secrets::resolve` (registry hosts, decoy shapes, fnox values) → `grants::resolve` → `ca::load_or_generate` → `ProxyState::new` (pre-gens leaf certs for exact hosts + one wildcard leaf per `*.`-grant) → `proxy::serve` + optional `tun::run_tun`.
 Per-connection: accept → httparse head → `intercept_candidate(host,port)` gates MITM vs splice → SNI sniff (`sni.rs` hand-rolled ClientHello parse) → lock-free leaf-cert lookup (expired rotates on next lookup) → `peek_mode` (HTTP/1 vs H2 preface vs raw) → `relay_guarded` pumps guest chunks through request machine (fake→real) and server chunks through response machine (real→fake). TUN path reuses `serve_candidate_stream`; UDP relayed directly (DNS→system resolver, QUIC :443 dropped).
 Concurrency: `ProxyState` behind plain `Arc` (write-once, no reload); cert cache is a `DashMap` — keygen on caller, never under lock; per-connection `tokio::spawn`; 10s total pre-auth/dial budgets; `SO_MARK` fwmark for TUN loop exclusion.
 
 ## Key Directories
 No `tests/`, `scripts/`, `docs/`, `examples/`. All logic in `src/*.rs`:
 - `src/main.rs` — clap CLI (`serve` default, `fake`, `ca`), wiring
-- `src/config.rs` — confique overlay + deterministic fake generator (`fake_for`, `PATTERNS`)
+- `src/config.rs` — confique overlay + rule schema + deterministic fake generator (`fake_for`)
+- `src/secrets.rs` — host registry (`rules/registry.toml` + `<config-dir>/hodor/rules.d`), rule resolution, fnox value lookup
 - `src/grants.rs` — `HostPat{Exact,Wildcard,Any}`, `parse_uri_grant` (structure via `url` crate, `*` via placeholder), `uri_match`/`request_match`/`intercept_candidate`/`https_eligible`
 - `src/proxy.rs` — `ProxyState`, `serve`/`handle_conn`/`handle_connect`, `sniff_stream`, `mitm_tls_stream`, `relay_guarded`, `Prefixed`
 - `src/substitute.rs` — `SubMachine`/`AnyMachine`, `SecretsMachine` (HTTP/1), `H2Machine` (hpack frame walker)
@@ -53,6 +54,7 @@ Config precedence: CLI > env (`HODOR_*`) > project (`<root>/.config/hodor.toml`)
 | `src/main.rs`, `src/config.rs`, `src/grants.rs` | entry, config overlay, grant model |
 | `src/proxy.rs`, `src/substitute.rs` | proxy core, substitution engine (largest module) |
 | `src/ca.rs`, `src/sni.rs`, `src/tun.rs` | PKI + `DashMap` leaf cache, SNI parse, transparent capture |
+| `rules/registry.toml` | bundled known-host and token-shape registry, overridable per entry |
 | `mise.toml`, `mise.lock` | pinned toolchain (rust stable, nextest, hk, pkl, hadolint, shellcheck, cargo-sort) |
 | `hk.pkl`, `rustfmt.toml`, `.config/nextest.toml` | lint pipeline, format, nextest (retries=3, slow-timeout 30s) |
 | `Dockerfile` | runtime-only `ghcr.io/casualjim/bare:libcxx-ssl` + prebuilt binary (no build stage); multi-arch via per-platform digests + manifest merge in `container.yml` |

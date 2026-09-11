@@ -59,6 +59,8 @@ hodor fake GH_TOKEN
 
 The decoy follows the env name, so renaming an env var changes its decoy. Regenerate the values in the `agent` service when you rename one, or substitution stops matching.
 
+A decoy is shaped like a real key, which is why tools accept it, so a secret scanner can flag it. GitHub push protection allowed the two decoys in this example. A pattern that mimics a provider's live key format is more likely to be blocked.
+
 ## How the CA reaches the agent
 
 The `certs` service writes two files into two volumes. hodor mounts the volume that holds `ca.pem`, the certificate and the private key. The agent mounts the volume that holds `ca.crt`, the certificate alone. An agent holding the key could mint its own leaf certificates and intercept its own traffic.

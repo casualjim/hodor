@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+#MISE description="Run the full project test suite"
+#MISE sources=["Cargo.toml", "src/**/*.rs", ".mise/tasks/test/**"]
+
+proj_dir=$(git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+mise run --force test:rust "$@"
+mise run --force test:tun --use-sudo "$@"

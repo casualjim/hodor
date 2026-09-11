@@ -1,4 +1,4 @@
-## [0.1.2] - 2026-09-11
+## [0.1.3] - 2026-09-11
 
 ### 🐛 Bug Fixes
 
@@ -15,3 +15,7 @@
 - Initial import
 - Update changelog for v0.1.1 [ci skip]
 - Release hodor version 0.1.1
+- Update changelog for v0.1.2 [ci skip]
+- Release hodor version 0.1.2
+- Publish the image on main and use it in the example
+- Build the image from the repo root with an explicit Dockerfile

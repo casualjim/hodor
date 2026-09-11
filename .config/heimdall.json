@@ -35,7 +35,7 @@
         "format"
       ],
       "bare": true,
-      "message": "run `mise check` bare only, no pipe, no tail, no redirect, just `mise check`"
+      "message": "run `mise format` bare only, no pipe, no tail, no redirect, just `mise format`"
     },
     {
       "name": "bare-only-mise-run-format",
@@ -45,7 +45,7 @@
         "format"
       ],
       "bare": true,
-      "message": "run `mise run check` bare only, no pipe, no tail, no redirect, just `mise run check`"
+      "message": "run `mise run format` bare only, no pipe, no tail, no redirect, just `mise run format`"
     },
     {
       "name": "bare-only-force-test",
@@ -145,7 +145,7 @@
         "cargo",
         "fmt"
       ],
-      "message": "Use `mise check` instead of `cargo fmt`."
+      "message": "Use `mise format` instead of `cargo fmt`."
     },
     {
       "name": "no-cargo-clippy",
@@ -153,7 +153,7 @@
         "cargo",
         "clippy"
       ],
-      "message": "Use `mise check` instead of `cargo clippy`."
+      "message": "Use `mise format` instead of `cargo clippy`."
     }
   ]
 }

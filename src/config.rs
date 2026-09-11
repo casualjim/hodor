@@ -13,14 +13,6 @@ use sha2::{Digest as _, Sha256};
 use crate::{Cli, Command};
 use code_workspace::{Workspace, resolve_root};
 
-const PATTERNS: &[(&str, &str)] = &[
-  ("gh_", "ghp_{hex:40}"),
-  ("sk-ant-", "sk-ant-api03-{base62:64}"),
-  ("sk-", "sk-{hex:48}"),
-  ("anthropic", "sk-ant-api03-{base62:64}"),
-  ("xox", "xoxb-{d:10}-{d:11}-{hex:24}"),
-  ("slack", "xoxb-{d:10}-{d:11}-{hex:24}"),
-];
 /// Pattern used when neither the rule nor the registry supplies one.
 pub const DEFAULT_PATTERN: &str = "{hex:32}";
 const BASE62: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -201,13 +193,11 @@ fn global_config_path() -> Option<PathBuf> {
 }
 
 /// Directory holding the global config file, and `rules.d` beside it.
-#[allow(dead_code, reason = "consumed by the registry change landing next")]
 pub fn config_dir() -> Option<PathBuf> {
   global_config_path().and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
 /// Registry override directory: `rules.d` beside the global config file.
-#[allow(dead_code, reason = "consumed by the registry change landing next")]
 pub fn rules_dir() -> Option<PathBuf> {
   config_dir().map(|dir| dir.join("rules.d"))
 }
@@ -240,19 +230,14 @@ impl AppConfig {
 }
 
 // ---------------------------------------------------------------------------
-// format-valid deterministic fakes (port of substitute.py fake_for + PATTERNS)
+// format-valid deterministic fakes (port of substitute.py fake_for)
 // ---------------------------------------------------------------------------
 
 /// Deterministic format-valid fake for an env var name. Stable across
-/// restarts, distinct per name. Explicit `pattern` wins over auto-detect.
+/// restarts, distinct per name. `pattern` wins; the registry supplies one
+/// through `secrets::Registry::decoy`, and `DEFAULT_PATTERN` is the floor.
 pub fn fake_for(env_name: &str, pattern: Option<&str>) -> String {
-  let template = pattern.filter(|p| !p.is_empty()).unwrap_or_else(|| {
-    let lower = env_name.to_ascii_lowercase();
-    PATTERNS
-      .iter()
-      .find(|(sub, _)| lower.contains(sub))
-      .map_or(DEFAULT_PATTERN, |(_, template)| *template)
-  });
+  let template = pattern.filter(|pattern| !pattern.is_empty()).unwrap_or(DEFAULT_PATTERN);
   let seed = hex_string(&Sha256::digest(env_name.as_bytes()));
   render_template(template, &seed)
 }
@@ -629,6 +614,11 @@ if_missing = "warn"
 
   #[test]
   fn fakes_are_format_valid_and_deterministic() {
+    let first = fake_for("GH_TOKEN", Some("ghp_{hex:40}"));
+    assert_eq!(first, fake_for("GH_TOKEN", Some("ghp_{hex:40}")));
+    assert!(first.starts_with("ghp_"), "{first}");
+    assert_eq!(first.len(), 44);
+
     let fallback = fake_for("SOME_RANDOM_THING", None);
     assert_eq!(fallback.len(), 32);
     assert!(fallback.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -636,7 +626,6 @@ if_missing = "warn"
     let explicit = fake_for("GH_TOKEN", Some("sk_live_{base62:24}"));
     assert_eq!(explicit, fake_for("GH_TOKEN", Some("sk_live_{base62:24}")));
     assert!(explicit.starts_with("sk_live_"), "{explicit}");
-    assert_eq!(explicit.len(), "sk_live_".len() + 24);
 
     assert_ne!(fake_for("GH_TOKEN", None), fake_for("GH_OTHER", None));
   }

@@ -9,6 +9,7 @@ mod ca;
 mod config;
 mod grants;
 mod proxy;
+mod secrets;
 mod sni;
 mod substitute;
 #[cfg(feature = "tun")]
@@ -98,7 +99,8 @@ async fn main() -> eyre::Result<()> {
       if let Some(pattern) = args.pattern.as_deref() {
         config::validate_pattern(pattern).map_err(|err| eyre::eyre!("bad --pattern: {err}"))?;
       }
-      println!("{}", config::fake_for(&args.env, args.pattern.as_deref()));
+      let registry = secrets::Registry::load(config::rules_dir().as_deref())?;
+      println!("{}", registry.decoy(&args.env, args.pattern.as_deref()));
       Ok(())
     }
     Command::Ca => {

@@ -19,8 +19,9 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
-# Extra cargo args for every dist build: the tun feature ships in the binary.
-cargo = ["--features", "tun"]
+# The released binaries ship the tun feature. The key is `features`, not raw cargo
+# args: dist ignores unrecognized keys silently, so a wrong one fails at runtime.
+features = ["tun"]
 # Container image build, inlined into the release pipeline (no separate trigger):
 # downloads the dist tarballs from the GitHub release this run just published.
 post-announce-jobs = ["./container"]

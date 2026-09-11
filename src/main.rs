@@ -114,7 +114,9 @@ async fn main() -> eyre::Result<()> {
       if args.tun {
         eyre::bail!("built without the `tun` feature; rebuild with --features tun");
       }
-      let (config, workspace) = config::load(&cli)?;
+      let (mut config, workspace) = config::load(&cli)?;
+      let registry = secrets::Registry::load(config::rules_dir().as_deref())?;
+      secrets::resolve(&mut config, &registry).await?;
       let resolved = grants::resolve(&config)?;
       if let Some(ws) = &workspace {
         tracing::info!(

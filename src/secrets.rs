@@ -204,12 +204,61 @@ impl Registry {
   }
 
   /// Registry hosts for one rule, honoring `registry = false`.
-  #[expect(dead_code, reason = "consumed by secrets::resolve in the next task")]
   pub(crate) fn hosts_for(&self, rule: &RuleCfg) -> Vec<String> {
     if rule.registry == Some(false) {
       return Vec::new();
     }
     self.lookup(&rule.env).hosts
+  }
+}
+
+/// Resolve every rule in place: union registry hosts into `allow`, fill the
+/// decoy pattern, and drop rules that `if_missing` lets go.
+///
+/// Values come from fnox in `resolve_values`; a rule with no value at all is
+/// resolved by the owner of that field, not here.
+#[expect(clippy::unused_async, reason = "consumed by the fnox awaits added in the next task")]
+pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry) -> eyre::Result<()> {
+  let mut dropped = Vec::new();
+  for (label, rule) in &mut config.rules {
+    let mut hosts = registry.hosts_for(rule);
+    for entry in &rule.allow {
+      if !hosts.contains(entry) {
+        hosts.push(entry.clone());
+      }
+    }
+    if hosts.is_empty() && skip(label, rule, "no hosts: registry has no entry and `allow` is empty")? {
+      dropped.push(label.clone());
+      continue;
+    }
+    // Unioned once here so `grants::resolve` sees the final list.
+    rule.allow = hosts;
+    if rule.pattern.is_none() {
+      rule.pattern = Some(registry.template(&rule.env, None));
+    }
+    tracing::info!(
+      label,
+      env = %rule.env,
+      hosts = rule.allow.len(),
+      "rule resolved"
+    );
+  }
+  for label in dropped {
+    config.rules.remove(&label);
+  }
+  Ok(())
+}
+
+/// Apply one rule's `if_missing` policy. `Ok(true)` means drop the rule;
+/// `Error` bails instead.
+fn skip(label: &str, rule: &RuleCfg, what: &str) -> eyre::Result<bool> {
+  match rule.if_missing {
+    crate::config::IfMissing::Error => eyre::bail!("rule `{label}` (env {}): {what}", rule.env),
+    crate::config::IfMissing::Warn => {
+      tracing::warn!(label, env = %rule.env, reason = what, "dropping rule");
+      Ok(true)
+    }
+    crate::config::IfMissing::Ignore => Ok(true),
   }
 }
 
@@ -425,5 +474,100 @@ hosts = ["https://api.example/path"]
     let dir = tempfile::tempdir().unwrap();
     let registry = Registry::load(Some(&dir.path().join("absent"))).unwrap();
     assert!(!registry.lookup("GITHUB_TOKEN").hosts.is_empty());
+  }
+
+  fn rule(env: &str) -> RuleCfg {
+    RuleCfg {
+      env: env.to_string(),
+      value: Some(secrecy::SecretString::from("inline")),
+      fnox_key: None,
+      allow: Vec::new(),
+      pattern: None,
+      registry: None,
+      if_missing: crate::config::IfMissing::Error,
+    }
+  }
+
+  fn config_with(label: &str, rule: RuleCfg) -> crate::config::AppConfig {
+    let mut config = crate::config::AppConfig {
+      proxy: crate::config::ProxyCfg {
+        listen: "127.0.0.1:8080".parse().unwrap(),
+        ca_file: None,
+      },
+      fnox: crate::config::FnoxCfg::default(),
+      rules: BTreeMap::new(),
+    };
+    config.rules.insert(label.to_string(), rule);
+    config
+  }
+
+  #[tokio::test]
+  async fn resolve_unions_registry_hosts_with_explicit_allow() {
+    let registry = Registry::load(None).unwrap();
+    let mut rule = rule("GITHUB_TOKEN");
+    rule.allow = vec!["https://ghe.corp.example".to_string()];
+    let mut config = config_with("gh", rule);
+    resolve(&mut config, &registry).await.unwrap();
+    let allow = &config.rules["gh"].allow;
+    assert!(allow.contains(&"https://api.github.com".to_string()));
+    assert!(allow.contains(&"https://ghe.corp.example".to_string()));
+    assert_eq!(allow.len(), 4);
+  }
+
+  #[tokio::test]
+  async fn resolve_registry_false_keeps_only_explicit_hosts() {
+    let registry = Registry::load(None).unwrap();
+    let mut rule = rule("GITHUB_TOKEN");
+    rule.registry = Some(false);
+    rule.allow = vec!["https://ghe.corp.example".to_string()];
+    let mut config = config_with("gh", rule);
+    resolve(&mut config, &registry).await.unwrap();
+    assert_eq!(config.rules["gh"].allow, vec!["https://ghe.corp.example".to_string()]);
+  }
+
+  #[tokio::test]
+  async fn resolve_fills_the_pattern_from_the_registry() {
+    let registry = Registry::load(None).unwrap();
+    let mut config = config_with("gh", rule("GITHUB_TOKEN"));
+    resolve(&mut config, &registry).await.unwrap();
+    assert_eq!(config.rules["gh"].pattern.as_deref(), Some("ghp_{hex:40}"));
+  }
+
+  #[tokio::test]
+  async fn resolve_keeps_an_explicit_pattern() {
+    let registry = Registry::load(None).unwrap();
+    let mut rule = rule("GITHUB_TOKEN");
+    rule.pattern = Some("ghp_custom_{hex:8}".to_string());
+    let mut config = config_with("gh", rule);
+    resolve(&mut config, &registry).await.unwrap();
+    assert_eq!(config.rules["gh"].pattern.as_deref(), Some("ghp_custom_{hex:8}"));
+  }
+
+  #[tokio::test]
+  async fn missing_hosts_error_by_default() {
+    let registry = Registry::load(None).unwrap();
+    let mut config = config_with("unknown", rule("NO_SUCH_SERVICE_TOKEN"));
+    let err = resolve(&mut config, &registry).await.unwrap_err();
+    assert!(err.to_string().contains("no hosts"), "{err:?}");
+  }
+
+  #[tokio::test]
+  async fn missing_hosts_warn_drops_the_rule() {
+    let registry = Registry::load(None).unwrap();
+    let mut rule = rule("NO_SUCH_SERVICE_TOKEN");
+    rule.if_missing = crate::config::IfMissing::Warn;
+    let mut config = config_with("unknown", rule);
+    resolve(&mut config, &registry).await.unwrap();
+    assert!(config.rules.is_empty());
+  }
+
+  #[tokio::test]
+  async fn missing_hosts_ignore_drops_the_rule_silently() {
+    let registry = Registry::load(None).unwrap();
+    let mut rule = rule("NO_SUCH_SERVICE_TOKEN");
+    rule.if_missing = crate::config::IfMissing::Ignore;
+    let mut config = config_with("unknown", rule);
+    resolve(&mut config, &registry).await.unwrap();
+    assert!(config.rules.is_empty());
   }
 }

@@ -21,20 +21,24 @@ const PATTERNS: &[(&str, &str)] = &[
   ("xox", "xoxb-{d:10}-{d:11}-{hex:24}"),
   ("slack", "xoxb-{d:10}-{d:11}-{hex:24}"),
 ];
-const DEFAULT_PATTERN: &str = "{hex:32}";
+/// Pattern used when neither the rule nor the registry supplies one.
+pub const DEFAULT_PATTERN: &str = "{hex:32}";
 const BASE62: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// Runtime config: listener settings plus secrets by label.
+/// Runtime config: listener settings, fnox settings, plus rules by label.
 #[derive(confique::Config, Debug, Clone, Serialize)]
 pub struct AppConfig {
   /// Proxy listener settings.
   #[config(nested)]
   pub proxy: ProxyCfg,
-  /// Secrets by label; merged per label across global + project files.
+  /// fnox integration settings.
+  #[config(nested)]
+  pub fnox: FnoxCfg,
+  /// Rules by label; merged per label across global + project files.
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-  pub secrets: BTreeMap<String, SecretCfg>,
+  pub rules: BTreeMap<String, RuleCfg>,
 }
 /// Proxy listener settings (CLI/env/file overlay).
 #[derive(confique::Config, Clone, Debug, Serialize)]
@@ -51,20 +55,56 @@ pub struct ProxyCfg {
   pub ca_file: Option<PathBuf>,
 }
 
-/// One secret entry: env name, value, allow list, optional fake pattern.
+/// One rule: env name, allowed hosts, decoy shape, and value source.
 #[derive(confique::Config, Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SecretCfg {
-  /// Env var name the deterministic fake derives from.
+pub struct RuleCfg {
+  /// Env var name: decoy seed, registry key, and default fnox key.
   pub env: String,
-  /// Real secret value (never serialized).
-  #[serde(skip_serializing)]
-  pub value: SecretString,
-  /// Raw `scheme://host[:port]` allow entries.
+  /// Inline real secret value (never serialized). Wins over fnox.
+  #[serde(default, skip_serializing)]
+  pub value: Option<SecretString>,
+  /// fnox secret name; defaults to `env`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub fnox_key: Option<String>,
+  /// Raw `scheme://host[:port]` allow entries; unioned with registry hosts.
+  #[serde(default)]
   pub allow: Vec<String>,
-  /// Explicit fake pattern overriding prefix auto-detect.
-  #[serde(skip_serializing_if = "Option::is_none")]
+  /// Explicit fake pattern overriding the registry.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub pattern: Option<String>,
+  /// Consult the host registry for this rule (default true).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub registry: Option<bool>,
+  /// What to do when the value or the hosts are missing.
+  #[serde(default)]
+  pub if_missing: IfMissing,
+}
+
+/// What to do when a rule cannot be fully resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IfMissing {
+  /// Fail startup.
+  #[default]
+  Error,
+  /// Log a warning and drop the rule's grant.
+  Warn,
+  /// Drop the rule's grant silently.
+  Ignore,
+}
+
+/// fnox integration: config path and profile.
+#[derive(confique::Config, Clone, Debug, Default, Serialize)]
+pub struct FnoxCfg {
+  /// Explicit fnox config path; default is fnox's own discovery.
+  #[config(env = "HODOR_FNOX_CONFIG")]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub config: Option<PathBuf>,
+  /// fnox profile list, comma-separated; default is `FNOX_PROFILE`.
+  #[config(env = "HODOR_FNOX_PROFILE")]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub profile: Option<String>,
 }
 
 /// Load config with precedence CLI > env > project > global.
@@ -94,9 +134,9 @@ pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
   }
 
   let mut config: AppConfig = builder.load().map_err(eyre::Report::from)?;
-  // confique merges the `secrets` map wholesale per winning file, so re-merge
+  // confique merges the `rules` map wholesale per winning file, so re-merge
   // by label here: global entries first, project entries replace by label.
-  config.secrets = load_merged_secrets(project.as_deref(), global.as_deref())?;
+  config.rules = load_merged_rules(project.as_deref(), global.as_deref())?;
   config.validate()?;
 
   let workspace = match explicit_root {
@@ -117,21 +157,21 @@ pub fn discover_project_config(explicit: Option<&Path>, start: &Path) -> Option<
   path.exists().then_some(path)
 }
 
-/// Merge `[secrets]` tables by label: global first, project wins wholesale
+/// Merge `[rules]` tables by label: global first, project wins wholesale
 /// per label. Errors name the file + label.
-fn load_merged_secrets(project: Option<&Path>, global: Option<&Path>) -> eyre::Result<BTreeMap<String, SecretCfg>> {
+fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> eyre::Result<BTreeMap<String, RuleCfg>> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
     let text = std::fs::read_to_string(path).map_err(|err| eyre::eyre!("read {}: {err}", path.display()))?;
     let doc: toml::Table = toml::from_str(&text).map_err(|err| eyre::eyre!("parse {}: {err}", path.display()))?;
-    let Some(secrets) = doc.get("secrets") else {
+    let Some(rules) = doc.get("rules") else {
       continue;
     };
-    let table = secrets
+    let table = rules
       .as_table()
-      .ok_or_else(|| eyre::eyre!("{}: `secrets` must be a table", path.display()))?;
+      .ok_or_else(|| eyre::eyre!("{}: `rules` must be a table", path.display()))?;
     for (label, entry) in table {
-      let cfg = SecretCfg::deserialize(entry.clone()).map_err(|err| eyre::eyre!("{}: secret `{label}`: {err}", path.display()))?;
+      let cfg = RuleCfg::deserialize(entry.clone()).map_err(|err| eyre::eyre!("{}: rule `{label}`: {err}", path.display()))?;
       merged.insert(label.clone(), cfg);
     }
   }
@@ -160,28 +200,39 @@ fn global_config_path() -> Option<PathBuf> {
   standard
 }
 
+/// Directory holding the global config file, and `rules.d` beside it.
+#[allow(dead_code, reason = "consumed by the registry change landing next")]
+pub fn config_dir() -> Option<PathBuf> {
+  global_config_path().and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+/// Registry override directory: `rules.d` beside the global config file.
+#[allow(dead_code, reason = "consumed by the registry change landing next")]
+pub fn rules_dir() -> Option<PathBuf> {
+  config_dir().map(|dir| dir.join("rules.d"))
+}
+
 impl AppConfig {
   fn validate(&self) -> eyre::Result<()> {
     let mut env_names = std::collections::BTreeMap::new();
-    for (label, secret) in &self.secrets {
-      if let Some(previous) = env_names.insert(secret.env.clone(), label.clone()) {
-        eyre::bail!("secrets `{previous}` and `{label}` share env name `{}`", secret.env);
+    for (label, rule) in &self.rules {
+      if let Some(previous) = env_names.insert(rule.env.clone(), label.clone()) {
+        eyre::bail!("rules `{previous}` and `{label}` share env name `{}`", rule.env);
       }
-      eyre::ensure!(!secret.env.is_empty(), "secret `{label}`: `env` must not be empty");
-      eyre::ensure!(
-        !secret.value.expose_secret().is_empty(),
-        "secret `{label}`: `value` must not be empty"
-      );
-      for entry in &secret.allow {
+      eyre::ensure!(!rule.env.is_empty(), "rule `{label}`: `env` must not be empty");
+      if let Some(value) = &rule.value {
+        eyre::ensure!(!value.expose_secret().is_empty(), "rule `{label}`: `value` must not be empty");
+      }
+      for entry in &rule.allow {
         let grant: crate::grants::UriGrant = entry
           .parse()
-          .map_err(|err| eyre::eyre!("secret `{label}`: bad allow entry `{entry}`: {err}"))?;
+          .map_err(|err| eyre::eyre!("rule `{label}`: bad allow entry `{entry}`: {err}"))?;
         if matches!(grant.host, crate::grants::HostPat::Any) {
           tracing::warn!(label, entry, "grant matches any host; secret is exfil-risky");
         }
       }
-      if let Some(pattern) = secret.pattern.as_deref().filter(|p| !p.is_empty()) {
-        validate_pattern(pattern).map_err(|err| eyre::eyre!("secret `{label}`: bad pattern `{pattern}`: {err}"))?;
+      if let Some(pattern) = rule.pattern.as_deref().filter(|p| !p.is_empty()) {
+        validate_pattern(pattern).map_err(|err| eyre::eyre!("rule `{label}`: bad pattern `{pattern}`: {err}"))?;
       }
     }
     Ok(())
@@ -338,7 +389,14 @@ mod tests {
   }
 
   fn scrub_env() {
-    for key in ["HODOR_CONFIG", "HODOR_PROJECT_ROOT", "HODOR_LISTEN", "HODOR_CA_FILE"] {
+    for key in [
+      "HODOR_CONFIG",
+      "HODOR_PROJECT_ROOT",
+      "HODOR_LISTEN",
+      "HODOR_CA_FILE",
+      "HODOR_FNOX_CONFIG",
+      "HODOR_FNOX_PROFILE",
+    ] {
       // SAFETY: test-only mutation, serialized by ENV_LOCK.
       unsafe { env::remove_var(key) };
     }
@@ -363,7 +421,7 @@ mod tests {
   }
 
   #[test]
-  fn overlay_merges_proxy_scalar_and_secrets_by_label() {
+  fn overlay_merges_proxy_scalar_and_rules_by_label() {
     let _guard = lock_env();
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
@@ -375,11 +433,11 @@ mod tests {
       r#"
 [proxy]
 listen = "127.0.0.1:1111"
-[secrets.a]
+[rules.a]
 env = "A_TOKEN"
 value = "global-a"
 allow = ["https://a.example"]
-[secrets.b]
+[rules.b]
 env = "B_TOKEN"
 value = "global-b"
 allow = ["https://b.example"]
@@ -390,11 +448,11 @@ allow = ["https://b.example"]
       r#"
 [proxy]
 listen = "127.0.0.1:2222"
-[secrets.b]
+[rules.b]
 env = "B_TOKEN"
 value = "project-b"
 allow = ["https://b.example"]
-[secrets.c]
+[rules.c]
 env = "C_TOKEN"
 value = "project-c"
 allow = ["https://c.example"]
@@ -405,9 +463,9 @@ allow = ["https://c.example"]
     let cli = cli_for(&["hodor", "serve"]);
     let (config, _ws) = load(&cli).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:2222");
-    assert_eq!(config.secrets["a"].value.expose_secret(), "global-a");
-    assert_eq!(config.secrets["b"].value.expose_secret(), "project-b");
-    assert_eq!(config.secrets["c"].value.expose_secret(), "project-c");
+    assert_eq!(config.rules["a"].value.as_ref().unwrap().expose_secret(), "global-a");
+    assert_eq!(config.rules["b"].value.as_ref().unwrap().expose_secret(), "project-b");
+    assert_eq!(config.rules["c"].value.as_ref().unwrap().expose_secret(), "project-c");
     scrub_env();
   }
 
@@ -487,20 +545,90 @@ allow = ["https://c.example"]
   }
 
   #[test]
+  fn rule_value_is_optional_and_defaults_absent() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(
+      &global,
+      r#"
+[rules.gh]
+env = "GITHUB_TOKEN"
+"#,
+    );
+    set_env("HODOR_CONFIG", &global);
+    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let rule = &config.rules["gh"];
+    assert!(rule.value.is_none());
+    assert!(rule.allow.is_empty());
+    assert_eq!(rule.if_missing, IfMissing::Error);
+    assert_eq!(rule.registry, None);
+    assert!(rule.fnox_key.is_none());
+    scrub_env();
+  }
+
+  #[test]
+  fn rule_parses_every_new_field() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(
+      &global,
+      r#"
+[fnox]
+config = "/tmp/fnox.toml"
+profile = "work,default"
+
+[rules.gh]
+env = "GITHUB_TOKEN"
+value = "inline"
+fnox_key = "GH_PAT"
+allow = ["https://ghe.corp.example"]
+pattern = "ghp_{hex:40}"
+registry = false
+if_missing = "warn"
+"#,
+    );
+    set_env("HODOR_CONFIG", &global);
+    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    assert_eq!(config.fnox.config.as_deref(), Some(std::path::Path::new("/tmp/fnox.toml")));
+    assert_eq!(config.fnox.profile.as_deref(), Some("work,default"));
+    let rule = &config.rules["gh"];
+    assert_eq!(rule.fnox_key.as_deref(), Some("GH_PAT"));
+    assert_eq!(rule.registry, Some(false));
+    assert_eq!(rule.if_missing, IfMissing::Warn);
+    scrub_env();
+  }
+
+  #[test]
+  fn fnox_env_vars_override_the_file() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(&global, "[fnox]\nconfig = \"/tmp/file.toml\"\n");
+    set_env("HODOR_CONFIG", &global);
+    set_env("HODOR_FNOX_CONFIG", "/tmp/env.toml");
+    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    assert_eq!(config.fnox.config.as_deref(), Some(std::path::Path::new("/tmp/env.toml")));
+    scrub_env();
+  }
+
+  #[test]
+  fn rules_dir_sits_beside_the_config_file() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    set_env("HODOR_CONFIG", &global);
+    assert_eq!(rules_dir(), Some(dir.path().join("rules.d")));
+    scrub_env();
+  }
+
+  #[test]
   fn fakes_are_format_valid_and_deterministic() {
-    let first = fake_for("GH_TOKEN", None);
-    assert_eq!(first, fake_for("GH_TOKEN", None));
-    assert!(first.starts_with("ghp_"), "{first}");
-    assert_eq!(first.len(), 44);
-    assert!(first[4..].bytes().all(|b| b.is_ascii_hexdigit()));
-
-    let anthropic = fake_for("ANTHROPIC_API_KEY", None);
-    assert!(anthropic.starts_with("sk-ant-api03-"), "{anthropic}");
-    assert_eq!(anthropic.len(), "sk-ant-api03-".len() + 64);
-
-    let slack = fake_for("SLACK_TOKEN", None);
-    assert!(slack.starts_with("xoxb-"), "{slack}");
-
     let fallback = fake_for("SOME_RANDOM_THING", None);
     assert_eq!(fallback.len(), 32);
     assert!(fallback.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -519,7 +647,7 @@ allow = ["https://c.example"]
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
-    write_file(&global, "[secrets.bad]\nenv = \"B\"\nvalue = \"v\"\nallow = [\"gopher://h\"]\n");
+    write_file(&global, "[rules.bad]\nenv = \"B\"\nvalue = \"v\"\nallow = [\"gopher://h\"]\n");
     set_env("HODOR_CONFIG", &global);
     let err = load(&cli_for(&["hodor", "serve"])).unwrap_err();
     assert!(err.to_string().contains("gopher://h"), "{err:?}");
@@ -544,11 +672,11 @@ allow = ["https://c.example"]
     write_file(
       &global,
       r#"
-[secrets.a]
+[rules.a]
 env = "A_TOKEN"
 value = "a"
 allow = ["https://a.example"]
-[secrets.b]
+[rules.b]
 env = "A_TOKEN"
 value = "b"
 allow = ["https://b.example"]

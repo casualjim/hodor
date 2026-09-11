@@ -31,6 +31,12 @@ jobs:
             target: aarch64-unknown-linux-gnu
             digest-suffix: arm64
     steps:
+      # The Dockerfile lives in the repository, not in the release tarball, so
+      # the job needs a checkout to hand it to buildx with --file.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Resolve tag
         run: echo "TAG=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_ENV"
 
@@ -60,6 +66,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ctx
+          file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,push=true
 
@@ -80,6 +87,12 @@ jobs:
     needs: image
     runs-on: ubuntu-latest
     steps:
+      # The Dockerfile lives in the repository, not in the release tarball, so
+      # the job needs a checkout to hand it to buildx with --file.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Resolve tag
         run: echo "TAG=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_ENV"
 

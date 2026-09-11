@@ -1,9 +1,10 @@
 //! Host registry and rule resolution: known hosts, decoy shapes, and
 //! fnox-sourced values.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use secrecy::SecretString;
 use serde::Deserialize;
 
 use crate::config::RuleCfg;
@@ -212,15 +213,105 @@ impl Registry {
   }
 }
 
-/// Resolve every rule in place: union registry hosts into `allow`, fill the
-/// decoy pattern, and drop rules that `if_missing` lets go.
-///
-/// Values come from fnox in `resolve_values`; a rule with no value at all is
-/// resolved by the owner of that field, not here.
-#[expect(clippy::unused_async, reason = "consumed by the fnox awaits added in the next task")]
+/// Opened fnox handle plus the names it declares.
+struct FnoxSource {
+  fnox: fnox_core::Fnox,
+  declared: BTreeSet<String>,
+}
+
+/// Map a discovery failure with no config found to `None`; other errors stay.
+fn discovered_or_none(found: fnox_core::Result<fnox_core::Fnox>) -> eyre::Result<Option<fnox_core::Fnox>> {
+  match found {
+    Ok(fnox) => Ok(Some(fnox)),
+    Err(fnox_core::FnoxError::ConfigNotFound { .. }) => Ok(None),
+    Err(err) => Err(eyre::eyre!("fnox discovery failed: {err}")),
+  }
+}
+
+impl FnoxSource {
+  /// Open fnox, or `None` when discovery finds no config at all.
+  fn open(cfg: &crate::config::FnoxCfg) -> eyre::Result<Option<Self>> {
+    let fnox = match &cfg.config {
+      Some(path) => Some(fnox_core::Fnox::open(path).map_err(|err| eyre::eyre!("fnox config {}: {err}", path.display()))?),
+      None => discovered_or_none(fnox_core::Fnox::discover())?,
+    };
+    let Some(fnox) = fnox else {
+      return Ok(None);
+    };
+    let fnox = match cfg.profile.as_deref() {
+      Some(profile) => {
+        let profiles = profile
+          .split(',')
+          .map(str::trim)
+          .filter(|profile| !profile.is_empty())
+          .map(str::to_string)
+          .collect::<Vec<_>>();
+        fnox.with_profiles(profiles)
+      }
+      None => fnox,
+    };
+    let declared = fnox
+      .list()
+      .map_err(|err| eyre::eyre!("fnox: cannot list secrets: {err}"))?
+      .into_iter()
+      .collect();
+    Ok(Some(Self { fnox, declared }))
+  }
+
+  /// Value for one key: `None` when fnox does not declare it, error when a
+  /// declared key cannot be resolved.
+  async fn value(&self, key: &str) -> eyre::Result<Option<String>> {
+    if !self.declared.contains(key) {
+      return Ok(None);
+    }
+    let value = self.fnox.get(key).await.map_err(|err| eyre::eyre!("fnox secret `{key}`: {err}"))?;
+    Ok(value.filter(|value| !value.is_empty()))
+  }
+}
+
+/// fnox secret name for one rule: `fnox_key`, else `env`.
+fn fnox_key(rule: &RuleCfg) -> String {
+  rule.fnox_key.clone().unwrap_or_else(|| rule.env.clone())
+}
+
+/// Resolve every rule in place: fetch values from fnox when no inline value
+/// is present, union registry hosts into `allow`, fill the decoy pattern, and
+/// drop rules that `if_missing` lets go.
 pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry) -> eyre::Result<()> {
+  let needs_fnox = config.rules.values().any(|rule| rule.value.is_none());
+  let fnox = if needs_fnox { FnoxSource::open(&config.fnox)? } else { None };
+
+  // Values are fetched before the map is mutated, so rules stay borrowed
+  // immutably while fnox is awaited.
+  let keys = config
+    .rules
+    .iter()
+    .filter(|(_, rule)| rule.value.is_none())
+    .map(|(label, rule)| (label.clone(), fnox_key(rule)))
+    .collect::<Vec<_>>();
+  let mut values = BTreeMap::new();
+  for (label, key) in keys {
+    let value = match &fnox {
+      Some(source) => source.value(&key).await?,
+      None => None,
+    };
+    values.insert(label, value);
+  }
+
   let mut dropped = Vec::new();
   for (label, rule) in &mut config.rules {
+    let inline = rule.value.is_some();
+    if !inline {
+      match values.remove(label).flatten() {
+        Some(value) => rule.value = Some(SecretString::from(value)),
+        None => {
+          if skip(label, rule, "no inline value and fnox does not declare its key")? {
+            dropped.push(label.clone());
+            continue;
+          }
+        }
+      }
+    }
     let mut hosts = registry.hosts_for(rule);
     for entry in &rule.allow {
       if !hosts.contains(entry) {
@@ -236,12 +327,19 @@ pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry)
     if rule.pattern.is_none() {
       rule.pattern = Some(registry.template(&rule.env, None));
     }
-    tracing::info!(
-      label,
-      env = %rule.env,
-      hosts = rule.allow.len(),
-      "rule resolved"
-    );
+    let source = if inline {
+      "inline"
+    } else if rule.value.is_some() {
+      "fnox"
+    } else {
+      "none"
+    };
+    let key = fnox_key(rule);
+    if key == rule.env {
+      tracing::info!(label, env = %rule.env, hosts = rule.allow.len(), value = source, "rule resolved");
+    } else {
+      tracing::info!(label, env = %rule.env, fnox_key = %key, hosts = rule.allow.len(), value = source, "rule resolved");
+    }
   }
   for label in dropped {
     config.rules.remove(&label);
@@ -569,5 +667,114 @@ hosts = ["https://api.example/path"]
     let mut config = config_with("unknown", rule);
     resolve(&mut config, &registry).await.unwrap();
     assert!(config.rules.is_empty());
+  }
+
+  const FNOX_PLAIN: &str = r#"
+[providers.plain]
+type = "plain"
+
+[secrets.GITHUB_TOKEN]
+provider = "plain"
+value = "real-github-token"
+
+[secrets.OTHER_TOKEN]
+provider = "plain"
+value = "other-real-token"
+"#;
+
+  /// Config whose only rule pulls its value from the temp fnox file.
+  fn config_with_fnox(label: &str, env: &str, fnox_path: &Path) -> crate::config::AppConfig {
+    let mut rule = rule(env);
+    rule.value = None;
+    let mut config = config_with(label, rule);
+    config.fnox.config = Some(fnox_path.to_path_buf());
+    config
+  }
+
+  fn write_fnox(dir: &Path, body: &str) -> PathBuf {
+    let path = dir.join("fnox.toml");
+    std::fs::write(&path, body).unwrap();
+    path
+  }
+
+  #[tokio::test]
+  async fn fnox_supplies_the_value() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &fnox_path);
+    resolve(&mut config, &registry).await.unwrap();
+    let value = config.rules["gh"].value.as_ref().unwrap();
+    assert_eq!(secrecy::ExposeSecret::expose_secret(value), "real-github-token");
+  }
+
+  #[tokio::test]
+  async fn inline_value_wins_over_fnox() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &fnox_path);
+    config.rules.get_mut("gh").unwrap().value = Some(secrecy::SecretString::from("inline-wins"));
+    resolve(&mut config, &registry).await.unwrap();
+    let value = config.rules["gh"].value.as_ref().unwrap();
+    assert_eq!(secrecy::ExposeSecret::expose_secret(value), "inline-wins");
+  }
+
+  #[tokio::test]
+  async fn fnox_key_overrides_the_env_name() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &fnox_path);
+    config.rules.get_mut("gh").unwrap().fnox_key = Some("OTHER_TOKEN".to_string());
+    resolve(&mut config, &registry).await.unwrap();
+    let value = config.rules["gh"].value.as_ref().unwrap();
+    assert_eq!(secrecy::ExposeSecret::expose_secret(value), "other-real-token");
+  }
+
+  #[tokio::test]
+  async fn undeclared_fnox_key_follows_if_missing() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &fnox_path);
+    config.rules.get_mut("gh").unwrap().fnox_key = Some("NOT_DECLARED".to_string());
+
+    let mut strict = config.clone();
+    let err = resolve(&mut strict, &registry).await.unwrap_err();
+    assert!(err.to_string().contains("fnox does not declare"), "{err:?}");
+
+    let mut lenient = config;
+    lenient.rules.get_mut("gh").unwrap().if_missing = crate::config::IfMissing::Warn;
+    resolve(&mut lenient, &registry).await.unwrap();
+    assert!(lenient.rules.is_empty());
+  }
+
+  #[tokio::test]
+  async fn declared_but_unreadable_fnox_config_is_an_error() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &dir.path().join("absent.toml"));
+    let err = resolve(&mut config, &registry).await.unwrap_err();
+    assert!(err.to_string().contains("fnox"), "{err:?}");
+  }
+
+  #[tokio::test]
+  async fn all_inline_values_never_open_fnox() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_with("gh", rule("GITHUB_TOKEN"));
+    config.fnox.config = Some(dir.path().join("absent.toml"));
+    resolve(&mut config, &registry).await.unwrap();
+    assert!(config.rules["gh"].value.is_some());
+  }
+
+  #[test]
+  fn config_not_found_during_discovery_is_not_an_error() {
+    let err = fnox_core::FnoxError::ConfigNotFound {
+      message: "no config".to_string(),
+      help: "run fnox init".to_string(),
+    };
+    assert!(discovered_or_none(Err(err)).unwrap().is_none());
   }
 }

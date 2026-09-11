@@ -1651,7 +1651,7 @@ Sources to consult, in order:
 | openai | <https://platform.openai.com/docs/api-reference/introduction> |
 | gemini | <https://ai.google.dev/gemini-api/docs/api-key> |
 | aws | <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements.html> and <https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html> |
-| azure | <https://learn.microsoft.com/en-us/azure/developer/intro/azure-developer-identity> |
+| azure | <https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential> |
 | gcp | <https://cloud.google.com/docs/authentication/application-default-credentials> |
 | cloudflare | <https://developers.cloudflare.com/fundamentals/api/get-started/create-token/> |
 | digitalocean | <https://docs.digitalocean.com/reference/api/create-personal-access-token/> |

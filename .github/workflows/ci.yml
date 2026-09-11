@@ -58,11 +58,6 @@ jobs:
       - name: Build the release binary
         run: cargo build --release --features tun
 
-      - name: Stage the image context
-        run: |
-          mkdir ctx
-          cp target/release/hodor ctx/hodor
-
       - uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
@@ -75,7 +70,10 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ctx
+          context: .
+          file: ./Dockerfile
+          build-args: BIN_DIR=target/release
           platforms: linux/amd64
+          pull: true
           push: true
           tags: ghcr.io/${{ github.repository }}:main

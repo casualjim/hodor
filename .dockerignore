@@ -1,1 +1,9 @@
-target/
+# The CI image job builds with the repository root as the context and copies the
+# release binary out of target/. Keep everything else out of the context.
+/*
+!/Dockerfile
+!/target
+/target/*
+!/target/release
+/target/release/*
+!/target/release/hodor

@@ -7,40 +7,10 @@ name: hodor-devenv
 # agent holds deterministic decoys and the CA certificate, never the CA key.
 
 services:
-  # Splits the CA: hodor gets certificate and key, the agent gets the
-  # certificate alone. oven/bun carries bash and openssl, the same helper the
-  # integration demo uses.
-  certs:
-    image: oven/bun:1
-    command:
-      - bash
-      - -c
-      - |
-        set -euo pipefail
-        if [ -s /private/ca.pem ]; then
-          cp /private/ca.crt /public/ca.crt
-          echo "kept the CA in the volume"
-          exit 0
-        fi
-        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-          -keyout /private/ca.key -out /private/ca.crt \
-          -subj "/CN=hodor devenv CA" \
-          -addext "basicConstraints=critical,CA:TRUE" \
-          -addext "keyUsage=critical,keyCertSign,cRLSign"
-        cat /private/ca.crt /private/ca.key > /private/ca.pem
-        chmod 600 /private/ca.key /private/ca.pem
-        cp /private/ca.crt /public/ca.crt
-        echo "generated a new CA"
-    volumes:
-      - hodor-ca:/private
-      - agent-ca:/public
-    restart: "no"
-
   hodor:
-    build:
-      context: ./docker
-      # Relative to the build context, which is the docker/ directory.
-      dockerfile: ../../../Dockerfile
+    # Published by CI: `:main` on every push to main, `:<version>` and
+    # `:latest` from the release workflow.
+    image: ${HODOR_IMAGE:-ghcr.io/casualjim/hodor:main}
     command: ["serve", "--tun", "--config", "/etc/hodor/hodor.toml"]
     environment:
       RUST_LOG: info
@@ -50,11 +20,9 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./hodor.toml:/etc/hodor/hodor.toml:ro
-      - hodor-ca:/certs:ro
+      # The certificate and the private key, from `hodor ca`.
+      - ./certs/ca.pem:/certs/ca.pem:ro
     stop_grace_period: 1s
-    depends_on:
-      certs:
-        condition: service_completed_successfully
 
   agent:
     image: ${AGENT_IMAGE:-ghcr.io/casualjim/devenv:omp}
@@ -74,13 +42,8 @@ services:
       CURL_CA_BUNDLE: /etc/hodor-ca/ca.crt
       GIT_SSL_CAINFO: /etc/hodor-ca/ca.crt
     volumes:
-      - agent-ca:/etc/hodor-ca:ro
+      # The certificate alone.
+      - ./certs/ca.crt:/etc/hodor-ca/ca.crt:ro
     depends_on:
-      certs:
-        condition: service_completed_successfully
       hodor:
         condition: service_started
-
-volumes:
-  hodor-ca:
-  agent-ca:

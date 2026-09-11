@@ -1,0 +1,86 @@
+name: hodor-devenv
+
+# hodor is the only egress service for the agent container: TLS interception,
+# secret substitution, and transparent capture in one process.
+#
+# The real secret values live in hodor.toml, which only hodor mounts. The
+# agent holds deterministic decoys and the CA certificate, never the CA key.
+
+services:
+  # Splits the CA: hodor gets certificate and key, the agent gets the
+  # certificate alone. oven/bun carries bash and openssl, the same helper the
+  # integration demo uses.
+  certs:
+    image: oven/bun:1
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        if [ -s /private/ca.pem ]; then
+          cp /private/ca.crt /public/ca.crt
+          echo "kept the CA in the volume"
+          exit 0
+        fi
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+          -keyout /private/ca.key -out /private/ca.crt \
+          -subj "/CN=hodor devenv CA" \
+          -addext "basicConstraints=critical,CA:TRUE" \
+          -addext "keyUsage=critical,keyCertSign,cRLSign"
+        cat /private/ca.crt /private/ca.key > /private/ca.pem
+        chmod 600 /private/ca.key /private/ca.pem
+        cp /private/ca.crt /public/ca.crt
+        echo "generated a new CA"
+    volumes:
+      - hodor-ca:/private
+      - agent-ca:/public
+    restart: "no"
+
+  hodor:
+    build:
+      context: ./docker
+      # Relative to the build context, which is the docker/ directory.
+      dockerfile: ../../../Dockerfile
+    command: ["serve", "--tun", "--config", "/etc/hodor/hodor.toml"]
+    environment:
+      RUST_LOG: info
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./hodor.toml:/etc/hodor/hodor.toml:ro
+      - hodor-ca:/certs:ro
+    stop_grace_period: 1s
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
+  agent:
+    image: ${AGENT_IMAGE:-ghcr.io/casualjim/devenv:omp}
+    user: "1000"
+    command: ["sleep", "infinity"]
+    # Sharing hodor's network namespace means every connection is captured and
+    # the container needs no proxy setting.
+    network_mode: "service:hodor"
+    environment:
+      # Deterministic decoys from `hodor fake <ENV>`, safe to commit. The real
+      # values stay in hodor.toml. Regenerate these after renaming an env var.
+      ANTHROPIC_API_KEY: sk-ant-api03-pS6w5Sc3x3SwKriEaFJ5kBrOfItZzcJDxT4bD0UzQpvsDrhBJXUcSn3PqE0nUBdd
+      GH_TOKEN: ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3
+      NODE_EXTRA_CA_CERTS: /etc/hodor-ca/ca.crt
+      REQUESTS_CA_BUNDLE: /etc/hodor-ca/ca.crt
+      SSL_CERT_FILE: /etc/hodor-ca/ca.crt
+      CURL_CA_BUNDLE: /etc/hodor-ca/ca.crt
+      GIT_SSL_CAINFO: /etc/hodor-ca/ca.crt
+    volumes:
+      - agent-ca:/etc/hodor-ca:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      hodor:
+        condition: service_started
+
+volumes:
+  hodor-ca:
+  agent-ca:

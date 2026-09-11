@@ -1,8 +1,18 @@
+## [0.1.6] - 2026-09-11
+
+### 🐛 Bug Fixes
+
+- *(container)* Download and extract the release asset correctly
 ## [0.1.5] - 2026-09-11
 
 ### 🐛 Bug Fixes
 
 - *(dist)* Add the profile cargo-dist builds with
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.5 [ci skip]
+- Release hodor version 0.1.5
 ## [0.1.4] - 2026-09-11
 
 ### 🐛 Bug Fixes

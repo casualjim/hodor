@@ -24,3 +24,6 @@ cargo = ["--features", "tun"]
 # Container image build, inlined into the release pipeline (no separate trigger):
 # downloads the dist tarballs from the GitHub release this run just published.
 post-announce-jobs = ["./container"]
+# The container workflow pushes to GHCR, which the default `contents: write`
+# block does not allow. Grant it explicitly.
+github-custom-job-permissions = { "container" = { "contents" = "read", "packages" = "write" } }

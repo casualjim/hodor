@@ -33,14 +33,14 @@ cp examples/agentic-devenv/hodor.toml.example examples/agentic-devenv/hodor.toml
 $EDITOR examples/agentic-devenv/hodor.toml
 ```
 
-Generate the CA. One `hodor ca` run writes the certificate and the private key to `ca.pem`, and prints the certificate alone to stdout.
+Generate the CA. One `hodor ca` run writes `ca.pem` with the certificate and the private key, and writes `ca.crt` and `ca.key` beside it.
 
 ```sh
 mkdir -p examples/agentic-devenv/certs
 docker run --rm --user "$(id -u):$(id -g)" \
   -v "$PWD/examples/agentic-devenv/certs:/certs" \
   -e HODOR_CA_FILE=/certs/ca.pem \
-  ghcr.io/casualjim/hodor:main ca > examples/agentic-devenv/certs/ca.crt
+  ghcr.io/casualjim/hodor:main ca
 ```
 
 Start it.
@@ -66,7 +66,7 @@ A decoy is shaped like a real key, which is why tools accept it, so a secret sca
 
 ## How the CA reaches the agent
 
-One `hodor ca` run writes both files into `examples/agentic-devenv/certs`. hodor mounts `ca.pem`, the certificate and the private key. The agent mounts `ca.crt`, the certificate alone. An agent holding the key could mint its own leaf certificates and intercept its own traffic.
+One `hodor ca` run writes three files into `examples/agentic-devenv/certs`. `ca.pem` holds the certificate and the private key and is what hodor reads. `ca.crt` and `ca.key` are the same certificate and key on their own, which is what makes the two mounts below possible. hodor mounts `ca.pem`, and the agent mounts `ca.crt` alone. An agent holding `ca.key` could mint its own leaf certificates and intercept its own traffic.
 
 The agent reads the certificate through the variables the common toolchains use, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO`. If your image installs a system trust store instead, mount the certificate there and drop those variables.
 

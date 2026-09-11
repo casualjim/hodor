@@ -126,7 +126,7 @@ cat seen.txt
 Bearer real-secret-value-xyz
 ```
 
-To reach a granted `https://` host, the client must trust hodor's CA. Run `hodor ca` to print the CA certificate and write it to the configured `ca_file`. Add the certificate to the client's trust store. A client that does not trust the CA fails the TLS handshake.
+To reach a granted `https://` host, the client must trust hodor's CA. Run `hodor ca` to write the CA file and print the certificate. It also writes `ca.crt`, the certificate on its own, and `ca.key`, the private key on its own, beside it. Add the certificate to the client's trust store. A client that does not trust the CA fails the TLS handshake.
 
 ## Configuration layers
 
@@ -148,7 +148,7 @@ hodor finds the workspace root by walking up from the working directory. `HODOR_
 | Key | Default | Environment | Purpose |
 | --- | --- | --- | --- |
 | `listen` | `127.0.0.1:8080` | `HODOR_LISTEN` | Address the proxy listens on. |
-| `ca_file` | `<config-dir>/hodor/ca.pem` | `HODOR_CA_FILE` | Path to the CA certificate and key. |
+| `ca_file` | `<config-dir>/hodor/ca.pem` | `HODOR_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `hodor ca` also writes `ca.crt` and `ca.key` beside it. |
 
 `[secrets.<label>]`:
 

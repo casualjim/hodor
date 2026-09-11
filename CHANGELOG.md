@@ -1,8 +1,18 @@
+## [0.1.8] - 2026-09-11
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Use current action majors in the hand-written workflows
 ## [0.1.7] - 2026-09-11
 
 ### 🐛 Bug Fixes
 
 - *(container)* Check out the repo so buildx can find the Dockerfile
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.7 [ci skip]
+- Release hodor version 0.1.7
 ## [0.1.6] - 2026-09-11
 
 ### 🐛 Bug Fixes

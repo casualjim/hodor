@@ -1,8 +1,18 @@
+## [0.1.5] - 2026-09-11
+
+### 🐛 Bug Fixes
+
+- *(dist)* Add the profile cargo-dist builds with
 ## [0.1.4] - 2026-09-11
 
 ### 🐛 Bug Fixes
 
 - *(ci)* Grant the container job the permissions it requests
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.4 [ci skip]
+- Release hodor version 0.1.4
 ## [0.1.3] - 2026-09-11
 
 ### 🐛 Bug Fixes

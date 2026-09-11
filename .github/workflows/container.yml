@@ -40,8 +40,9 @@ jobs:
         run: |
           mkdir ctx
           asset="hodor-${{ matrix.target }}.tar.xz"
-          gh release download "$TAG" -p "$asset" -O bundle.tar.xz
-          tar xJf bundle.tar.xz -C ctx
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "$asset" -O bundle.tar.xz
+          # dist nests the contents under a root dir named after the archive.
+          tar xJf bundle.tar.xz -C ctx --strip-components=1
           test -x ctx/hodor
 
       - name: Set up buildx

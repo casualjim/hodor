@@ -40,10 +40,11 @@ pub enum Command {
   Serve(ServeArgs),
   /// Print the deterministic fake for an env var name.
   Fake(FakeArgs),
-  /// Generate (or load) the CA and print its certificate PEM to stdout.
+  /// Generate (or load) the CA, print its certificate PEM to stdout, and write
+  /// the certificate and the key beside the CA file as `ca.crt` and `ca.key`.
   ///
   /// The printed PEM is the trust anchor to install into workload
-  /// containers; the private key never leaves the CA file.
+  /// containers; the private key stays in the CA file and in `ca.key`.
   Ca,
 }
 

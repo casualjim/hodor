@@ -117,16 +117,25 @@ impl CertAuthority {
 }
 
 /// Load the CA from `path`, or generate + persist one (creating parent dirs).
-/// File format is the cert PEM followed by the PKCS#8 key PEM.
+/// File format is the cert PEM followed by the PKCS#8 key PEM, and both are
+/// also written beside it as `<stem>.crt` and `<stem>.key`.
 /// `create_new` elects a single winner across racing processes; losers load
 /// the winner with backoff because the winner's `write_all` may not have
 /// finished when `AlreadyExists` surfaces. A persistently unparseable file
 /// (crash mid-write) stays a hard error: silently minting a fresh CA would
 /// invalidate every installed client trust anchor.
 pub fn load_or_generate(path: &Path) -> eyre::Result<CertAuthority> {
-  if path.exists() {
-    return load_ca_file(path);
-  }
+  let ca = if path.exists() {
+    load_ca_file(path)?
+  } else {
+    generate_and_persist(path)?
+  };
+  sync_split_pems(path, &ca);
+  Ok(ca)
+}
+
+/// Generate a CA and persist it, electing one winner across racing processes.
+fn generate_and_persist(path: &Path) -> eyre::Result<CertAuthority> {
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent)?;
   }
@@ -139,6 +148,45 @@ pub fn load_or_generate(path: &Path) -> eyre::Result<CertAuthority> {
     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => load_ca_file_with_retry(path),
     Err(err) => Err(err.into()),
   }
+}
+
+/// Keep `<stem>.crt` and `<stem>.key` beside the CA file, so a deployment can
+/// hand the certificate to a workload without handing over the key. The
+/// combined PEM stays the file hodor reads, and it stays authoritative: an
+/// unchanged split file is left alone and a write failure is a warning rather
+/// than a startup error, so a read-only mount still serves.
+fn sync_split_pems(path: &Path, ca: &CertAuthority) {
+  for (target, contents, mode) in [
+    (path.with_extension("crt"), ca.cert_pem(), 0o644),
+    (path.with_extension("key"), ca.key_pem(), 0o600),
+  ] {
+    if std::fs::read(&target).is_ok_and(|existing| existing == contents) {
+      continue;
+    }
+    if let Err(err) = write_with_mode(&target, &contents, mode) {
+      tracing::warn!(path = %target.display(), %err, "failed to write the split CA file");
+    }
+  }
+}
+
+/// Write `contents` to `target`, forcing `mode` so a umask cannot leave the
+/// private key world readable.
+fn write_with_mode(target: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+  let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(target)?;
+  file.write_all(contents)?;
+  file.sync_all()?;
+  set_mode(target, mode)
+}
+
+#[cfg(unix)]
+fn set_mode(target: &Path, mode: u32) -> std::io::Result<()> {
+  use std::os::unix::fs::PermissionsExt as _;
+  std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_target: &Path, _mode: u32) -> std::io::Result<()> {
+  Ok(())
 }
 
 fn load_ca_file(path: &Path) -> eyre::Result<CertAuthority> {
@@ -385,5 +433,48 @@ mod tests {
     let ca = CertAuthority::generate().unwrap();
     let cert = generate_domain_cert("127.0.0.1", &ca).unwrap();
     assert!(cert.expires_at > OffsetDateTime::now_utc());
+  }
+
+  #[test]
+  fn split_pems_hold_one_half_each() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ca.pem");
+    let ca = load_or_generate(&path).unwrap();
+
+    let crt = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+    let key = std::fs::read_to_string(dir.path().join("ca.key")).unwrap();
+    assert!(crt.contains("BEGIN CERTIFICATE"));
+    assert!(!crt.contains("PRIVATE KEY"), "the certificate file carried the key");
+    assert!(key.contains("PRIVATE KEY"));
+    assert!(!key.contains("CERTIFICATE"), "the key file carried the certificate");
+
+    // The combined file is still the certificate followed by the key.
+    let pem = std::fs::read_to_string(&path).unwrap();
+    assert!(pem.starts_with(&crt));
+    assert!(pem.contains(&key));
+    assert_eq!(crt, String::from_utf8(ca.cert_pem()).unwrap());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn split_key_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ca.pem");
+    load_or_generate(&path).unwrap();
+    let mode = std::fs::metadata(dir.path().join("ca.key")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o077, 0, "key mode was {mode:o}");
+  }
+
+  #[test]
+  fn a_deleted_split_file_is_rewritten_from_the_pem() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ca.pem");
+    load_or_generate(&path).unwrap();
+    let before = std::fs::read(dir.path().join("ca.crt")).unwrap();
+    std::fs::remove_file(dir.path().join("ca.crt")).unwrap();
+
+    load_or_generate(&path).unwrap();
+    assert_eq!(std::fs::read(dir.path().join("ca.crt")).unwrap(), before);
   }
 }

@@ -51,6 +51,16 @@ jobs:
           tar xJf bundle.tar.xz -C ctx --strip-components=1
           test -x ctx/hodor
 
+      - name: Assert the binary carries the tun feature
+        run: |
+          # dist silently ignores build settings it does not recognize, and a binary
+          # built without the feature only fails at runtime, in production. The marker
+          # is compiled in with the feature, and this works on the arm64 binary too.
+          if ! grep -aq 'TUN capture failed' ctx/hodor; then
+            echo "::error::ctx/hodor was built without the tun feature"
+            exit 1
+          fi
+
       - name: Set up buildx
         uses: docker/setup-buildx-action@v4
 

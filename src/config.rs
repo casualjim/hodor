@@ -128,6 +128,11 @@ pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
   let mut config: AppConfig = builder.load().map_err(eyre::Report::from)?;
   // confique merges the `rules` map wholesale per winning file, so re-merge
   // by label here: global entries first, project entries replace by label.
+  // This second read of the same files is deliberate. confique's builder
+  // produces the scalars and this pass produces the rule labels, so a file
+  // edited between the two reads yields scalars from one parse and labels
+  // from the other. Do not collapse it into a single read without accounting
+  // for that.
   config.rules = load_merged_rules(project.as_deref(), global.as_deref())?;
   config.validate()?;
 
@@ -204,9 +209,9 @@ pub fn rules_dir() -> Option<PathBuf> {
 
 impl AppConfig {
   fn validate(&self) -> eyre::Result<()> {
-    let mut env_names = std::collections::BTreeMap::new();
+    let mut env_names: BTreeMap<&str, &str> = BTreeMap::new();
     for (label, rule) in &self.rules {
-      if let Some(previous) = env_names.insert(rule.env.clone(), label.clone()) {
+      if let Some(previous) = env_names.insert(rule.env.as_str(), label.as_str()) {
         eyre::bail!("rules `{previous}` and `{label}` share env name `{}`", rule.env);
       }
       eyre::ensure!(!rule.env.is_empty(), "rule `{label}`: `env` must not be empty");

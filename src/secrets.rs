@@ -1,9 +1,11 @@
 //! Host registry and rule resolution: known hosts, decoy shapes, and
 //! fnox-sourced values.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use eyre::WrapErr as _;
 use secrecy::SecretString;
 use serde::Deserialize;
 
@@ -27,8 +29,20 @@ pub struct KnownHosts {
 pub struct Registry {
   /// Entry per uppercase environment name.
   names: BTreeMap<String, KnownHosts>,
-  /// `(provider, lowercase substring, pattern)` in load order.
-  contains: Vec<(String, String, String)>,
+  /// `contains` rules in load order.
+  contains: Vec<ContainsRule>,
+}
+
+/// One `[providers.*].contains` rule: which provider declared it, the
+/// lowercase substring matched against an env name, and the pattern it picks.
+#[derive(Debug, Clone)]
+struct ContainsRule {
+  /// Provider that declared it; `replace = true` clears that provider's rules.
+  provider: String,
+  /// Lowercase substring tested against the env name.
+  needle: String,
+  /// Decoy template selected when the needle matches.
+  pattern: String,
 }
 
 /// A registry file as written: `[providers.*]` and `[names.*]`.
@@ -88,17 +102,13 @@ impl Registry {
       return Ok(registry);
     };
     let mut files = std::fs::read_dir(dir)
-      .map_err(|err| eyre::eyre!("read {}: {err}", dir.display()))?
-      .map(|entry| {
-        entry
-          .map(|entry| entry.path())
-          .map_err(|err| eyre::eyre!("read {}: {err}", dir.display()))
-      })
+      .wrap_err_with(|| format!("read {}", dir.display()))?
+      .map(|entry| entry.map(|entry| entry.path()).wrap_err_with(|| format!("read {}", dir.display())))
       .collect::<eyre::Result<Vec<_>>>()?;
     files.retain(|path| path.extension().is_some_and(|ext| ext == "toml"));
     files.sort();
     for path in files {
-      let text = std::fs::read_to_string(&path).map_err(|err| eyre::eyre!("read {}: {err}", path.display()))?;
+      let text = std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
       registry.apply(&text, &path)?;
     }
     Ok(registry)
@@ -106,13 +116,13 @@ impl Registry {
 
   /// Merge one registry file over what is already loaded.
   fn apply(&mut self, text: &str, source: &Path) -> eyre::Result<()> {
-    let file: RegistryFile = toml::from_str(text).map_err(|err| eyre::eyre!("parse {}: {err}", source.display()))?;
+    let file: RegistryFile = toml::from_str(text).wrap_err_with(|| format!("parse {}", source.display()))?;
     // One file claiming the same name twice is a data bug; a later file
     // overriding an earlier one is the intended mechanism.
-    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    let mut claimed: BTreeMap<String, &str> = BTreeMap::new();
     for (provider, entry) in &file.providers {
       for env in &entry.env {
-        if let Some(previous) = claimed.insert(env.to_ascii_uppercase(), provider.clone()) {
+        if let Some(previous) = claimed.insert(env.to_ascii_uppercase(), provider.as_str()) {
           eyre::bail!("{}: providers `{previous}` and `{provider}` both claim `{env}`", source.display());
         }
       }
@@ -128,9 +138,9 @@ impl Registry {
 
   /// Apply one `[providers.<name>]` entry.
   fn apply_provider(&mut self, provider: &str, entry: &ProviderEntry, source: &Path) -> eyre::Result<()> {
-    validate_hosts(&entry.hosts, source, &format!("provider `{provider}`"))?;
+    validate_hosts(&entry.hosts, source, "provider", provider)?;
     let pattern = entry.pattern.as_deref().filter(|pattern| !pattern.is_empty());
-    validate_optional_pattern(pattern, source, &format!("provider `{provider}`"))?;
+    validate_optional_pattern(pattern, source, "provider", provider)?;
     for env in &entry.env {
       let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
       if entry.replace {
@@ -147,7 +157,7 @@ impl Registry {
       }
     }
     if entry.replace {
-      self.contains.retain(|(name, _, _)| name != provider);
+      self.contains.retain(|rule| rule.provider != provider);
     }
     for needle in &entry.contains {
       eyre::ensure!(
@@ -158,18 +168,20 @@ impl Registry {
       let Some(pattern) = pattern else {
         eyre::bail!("{}: provider `{provider}`: `contains` needs a `pattern`", source.display());
       };
-      self
-        .contains
-        .push((provider.to_string(), needle.to_ascii_lowercase(), pattern.to_string()));
+      self.contains.push(ContainsRule {
+        provider: provider.to_string(),
+        needle: needle.to_ascii_lowercase(),
+        pattern: pattern.to_string(),
+      });
     }
     Ok(())
   }
 
   /// Apply one `[names.<ENV>]` entry.
   fn apply_name(&mut self, env: &str, entry: &NameEntry, source: &Path) -> eyre::Result<()> {
-    validate_hosts(&entry.hosts, source, &format!("name `{env}`"))?;
+    validate_hosts(&entry.hosts, source, "name", env)?;
     let pattern = entry.pattern.as_deref().filter(|pattern| !pattern.is_empty());
-    validate_optional_pattern(pattern, source, &format!("name `{env}`"))?;
+    validate_optional_pattern(pattern, source, "name", env)?;
     let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
     if entry.replace {
       slot.hosts.clear();
@@ -186,24 +198,24 @@ impl Registry {
     Ok(())
   }
 
-  /// Known hosts and pattern for one environment name.
-  pub fn lookup(&self, env: &str) -> KnownHosts {
-    self.names.get(&env.to_ascii_uppercase()).cloned().unwrap_or_default()
+  /// Known hosts and pattern for one environment name, `None` when absent.
+  pub fn lookup(&self, env: &str) -> Option<&KnownHosts> {
+    self.names.get(&env.to_ascii_uppercase())
   }
 
   /// Decoy template for one environment name: explicit, then registry, then default.
-  pub fn template(&self, env: &str, explicit: Option<&str>) -> String {
+  pub fn template<'a>(&'a self, env: &str, explicit: Option<&'a str>) -> Cow<'a, str> {
     if let Some(pattern) = explicit.filter(|pattern| !pattern.is_empty()) {
-      return pattern.to_string();
+      return Cow::Borrowed(pattern);
     }
-    if let Some(pattern) = self.names.get(&env.to_ascii_uppercase()).and_then(|entry| entry.pattern.clone()) {
-      return pattern;
+    if let Some(pattern) = self.names.get(&env.to_ascii_uppercase()).and_then(|entry| entry.pattern.as_deref()) {
+      return Cow::Borrowed(pattern);
     }
     let lower = env.to_ascii_lowercase();
-    if let Some((_, _, pattern)) = self.contains.iter().find(|(_, needle, _)| lower.contains(needle.as_str())) {
-      return pattern.clone();
+    if let Some(rule) = self.contains.iter().find(|rule| lower.contains(rule.needle.as_str())) {
+      return Cow::Borrowed(&rule.pattern);
     }
-    crate::config::DEFAULT_PATTERN.to_string()
+    Cow::Borrowed(crate::config::DEFAULT_PATTERN)
   }
 
   /// Deterministic decoy for one environment name.
@@ -212,11 +224,11 @@ impl Registry {
   }
 
   /// Registry hosts for one rule, honoring `registry = false`.
-  pub(crate) fn hosts_for(&self, rule: &RuleCfg) -> Vec<String> {
+  pub(crate) fn hosts_for(&self, rule: &RuleCfg) -> &[String] {
     if rule.registry == Some(false) {
-      return Vec::new();
+      return &[];
     }
-    self.lookup(&rule.env).hosts
+    self.lookup(&rule.env).map_or(&[], |known| known.hosts.as_slice())
   }
 }
 
@@ -231,7 +243,7 @@ fn discovered_or_none(found: fnox_core::Result<fnox_core::Fnox>) -> eyre::Result
   match found {
     Ok(fnox) => Ok(Some(fnox)),
     Err(fnox_core::FnoxError::ConfigNotFound { .. }) => Ok(None),
-    Err(err) => Err(eyre::eyre!("fnox discovery failed: {err}")),
+    Err(err) => Err(err).wrap_err("fnox discovery failed"),
   }
 }
 
@@ -239,7 +251,7 @@ impl FnoxSource {
   /// Open fnox, or `None` when discovery finds no config at all.
   fn open(cfg: &crate::config::FnoxCfg) -> eyre::Result<Option<Self>> {
     let fnox = match &cfg.config {
-      Some(path) => Some(fnox_core::Fnox::open(path).map_err(|err| eyre::eyre!("fnox config {}: {err}", path.display()))?),
+      Some(path) => Some(fnox_core::Fnox::open(path).wrap_err_with(|| format!("fnox config {}", path.display()))?),
       None => discovered_or_none(fnox_core::Fnox::discover())?,
     };
     let Some(fnox) = fnox else {
@@ -257,11 +269,7 @@ impl FnoxSource {
       }
       None => fnox,
     };
-    let declared = fnox
-      .list()
-      .map_err(|err| eyre::eyre!("fnox: cannot list secrets: {err}"))?
-      .into_iter()
-      .collect();
+    let declared = fnox.list().wrap_err("fnox: cannot list secrets")?.into_iter().collect();
     Ok(Some(Self { fnox, declared }))
   }
 
@@ -271,7 +279,7 @@ impl FnoxSource {
     if !self.declared.contains(key) {
       return Ok(None);
     }
-    let Some(value) = self.fnox.get(key).await.map_err(|err| eyre::eyre!("fnox secret `{key}`: {err}"))? else {
+    let Some(value) = self.fnox.get(key).await.wrap_err_with(|| format!("fnox secret `{key}`"))? else {
       eyre::bail!("fnox key `{key}` is declared but resolves to no value");
     };
     eyre::ensure!(!value.is_empty(), "fnox key `{key}` is declared but resolves to an empty value");
@@ -320,19 +328,19 @@ pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry)
         } else {
           "no inline value and fnox has no configuration"
         };
-        if skip(label, rule, what)? {
-          dropped.push(label.clone());
-          continue;
-        }
+        skip(label, rule, what)?;
+        dropped.push(label.clone());
+        continue;
       }
     }
-    let mut hosts = registry.hosts_for(rule);
+    let mut hosts = registry.hosts_for(rule).to_vec();
     for entry in &rule.allow {
       if !hosts.contains(entry) {
         hosts.push(entry.clone());
       }
     }
-    if hosts.is_empty() && skip(label, rule, "no hosts: registry has no entry and `allow` is empty")? {
+    if hosts.is_empty() {
+      skip(label, rule, "no hosts: registry has no entry and `allow` is empty")?;
       dropped.push(label.clone());
       continue;
     }
@@ -340,15 +348,12 @@ pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry)
     rule.allow = hosts;
     rule.pattern = rule.pattern.take().filter(|pattern| !pattern.is_empty());
     if rule.pattern.is_none() {
-      rule.pattern = Some(registry.template(&rule.env, None));
+      rule.pattern = Some(registry.template(&rule.env, None).into_owned());
     }
     let source = if inline { "inline" } else { "fnox" };
     let key = fnox_key(rule);
-    if key == rule.env {
-      tracing::info!(label, env = %rule.env, hosts = rule.allow.len(), value = source, "rule resolved");
-    } else {
-      tracing::info!(label, env = %rule.env, fnox_key = %key, hosts = rule.allow.len(), value = source, "rule resolved");
-    }
+    let key = (key != rule.env).then_some(key);
+    tracing::info!(label, env = %rule.env, fnox_key = key.as_deref(), hosts = rule.allow.len(), value = source, "rule resolved");
   }
   for label in dropped {
     config.rules.remove(&label);
@@ -356,26 +361,27 @@ pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry)
   Ok(())
 }
 
-/// Apply one rule's `if_missing` policy. `Ok(true)` means drop the rule;
-/// `Error` bails instead.
-fn skip(label: &str, rule: &RuleCfg, what: &str) -> eyre::Result<bool> {
+/// Apply one rule's `if_missing` policy. Returns `Ok(())` when the caller
+/// must drop the rule; `Error` bails instead.
+fn skip(label: &str, rule: &RuleCfg, what: &str) -> eyre::Result<()> {
   match rule.if_missing {
     crate::config::IfMissing::Error => eyre::bail!("rule `{label}` (env {}): {what}", rule.env),
     crate::config::IfMissing::Warn => {
       tracing::warn!(label, env = %rule.env, reason = what, "dropping rule");
-      Ok(true)
+      Ok(())
     }
-    crate::config::IfMissing::Ignore => Ok(true),
+    crate::config::IfMissing::Ignore => Ok(()),
   }
 }
 
 /// Validate one host entry with the same grammar as `allow`.
-fn validate_hosts(hosts: &[String], source: &Path, what: &str) -> eyre::Result<()> {
+fn validate_hosts(hosts: &[String], source: &Path, kind: &str, name: &str) -> eyre::Result<()> {
   for host in hosts {
     let grant: UriGrant = host
       .parse()
-      .map_err(|err| eyre::eyre!("{}: {what}: bad host `{host}`: {err}", source.display()))?;
+      .map_err(|err| eyre::eyre!("{}: {kind} `{name}`: bad host `{host}`: {err}", source.display()))?;
     if matches!(grant.host, crate::grants::HostPat::Any) {
+      let what = format!("{kind} `{name}`");
       tracing::warn!(file = %source.display(), entry = %host, what, "grant matches any host; secret is exfil-risky");
     }
   }
@@ -383,9 +389,10 @@ fn validate_hosts(hosts: &[String], source: &Path, what: &str) -> eyre::Result<(
 }
 
 /// Validate one decoy template when present.
-fn validate_optional_pattern(pattern: Option<&str>, source: &Path, what: &str) -> eyre::Result<()> {
+fn validate_optional_pattern(pattern: Option<&str>, source: &Path, kind: &str, name: &str) -> eyre::Result<()> {
   if let Some(pattern) = pattern {
-    crate::config::validate_pattern(pattern).map_err(|err| eyre::eyre!("{}: {what}: bad pattern `{pattern}`: {err}", source.display()))?;
+    crate::config::validate_pattern(pattern)
+      .map_err(|err| eyre::eyre!("{}: {kind} `{name}`: bad pattern `{pattern}`: {err}", source.display()))?;
   }
   Ok(())
 }
@@ -406,7 +413,7 @@ mod tests {
   #[test]
   fn bundled_table_loads_and_covers_github() {
     let registry = Registry::load(None).unwrap();
-    let known = registry.lookup("GITHUB_TOKEN");
+    let known = registry.lookup("GITHUB_TOKEN").expect("GITHUB_TOKEN in the bundled registry");
     assert_eq!(
       known.hosts,
       vec!["https://api.github.com", "https://github.com", "https://uploads.github.com"]
@@ -451,7 +458,9 @@ mod tests {
       "SUPABASE_SERVICE_ROLE_KEY",
       "SHOP_TOKEN",
     ] {
-      let known = registry.lookup(env);
+      let known = registry
+        .lookup(env)
+        .unwrap_or_else(|| panic!("{env} missing from the bundled registry"));
       assert!(!known.hosts.is_empty(), "{env} has no hosts");
       assert!(known.pattern.is_some(), "{env} has no pattern");
     }
@@ -484,7 +493,7 @@ pattern = "ghp_ghe_{hex:32}"
 "#,
     );
     let registry = Registry::load(Some(dir.path())).unwrap();
-    let known = registry.lookup("GITHUB_TOKEN");
+    let known = registry.lookup("GITHUB_TOKEN").expect("GITHUB_TOKEN in the loaded registry");
     assert_eq!(
       known.hosts,
       vec![
@@ -511,7 +520,7 @@ replace = true
 "#,
     );
     let registry = Registry::load(Some(dir.path())).unwrap();
-    let known = registry.lookup("GITHUB_TOKEN");
+    let known = registry.lookup("GITHUB_TOKEN").expect("GITHUB_TOKEN in the bundled registry");
     assert_eq!(known.hosts, vec!["https://ghe.corp.example"]);
     assert_eq!(known.pattern, None);
   }
@@ -529,7 +538,7 @@ pattern = "ghp_named_{hex:32}"
 "#,
     );
     let registry = Registry::load(Some(dir.path())).unwrap();
-    let known = registry.lookup("GITHUB_TOKEN");
+    let known = registry.lookup("GITHUB_TOKEN").expect("GITHUB_TOKEN in the loaded registry");
     assert!(known.hosts.contains(&"https://api.github.com".to_string()));
     assert!(known.hosts.contains(&"https://ghe.corp.example".to_string()));
     assert_eq!(known.pattern.as_deref(), Some("ghp_named_{hex:32}"));
@@ -539,7 +548,10 @@ pattern = "ghp_named_{hex:32}"
   fn contains_tier_matches_a_substring_without_granting_hosts() {
     let registry = Registry::load(None).unwrap();
     assert_eq!(registry.template("ACME_ANTHROPIC_KEY", None), "sk-ant-api03-{base62:64}");
-    assert!(registry.lookup("ACME_ANTHROPIC_KEY").hosts.is_empty());
+    assert!(
+      registry.lookup("ACME_ANTHROPIC_KEY").is_none(),
+      "contains tier must not grant hosts"
+    );
   }
 
   #[test]
@@ -619,7 +631,10 @@ pattern = ""
 "#,
     );
     let registry = Registry::load(Some(dir.path())).unwrap();
-    assert_eq!(registry.lookup("BLANK_TOKEN").pattern, None);
+    assert_eq!(
+      registry.lookup("BLANK_TOKEN").expect("BLANK_TOKEN in the loaded registry").pattern,
+      None
+    );
     assert_eq!(registry.template("BLANK_TOKEN", None), crate::config::DEFAULT_PATTERN);
   }
 
@@ -635,7 +650,10 @@ hosts = ["https://*"]
 "#,
     );
     let registry = Registry::load(Some(dir.path())).unwrap();
-    assert_eq!(registry.lookup("ANY_TOKEN").hosts, vec!["https://*"]);
+    assert_eq!(
+      registry.lookup("ANY_TOKEN").expect("ANY_TOKEN in the loaded registry").hosts,
+      vec!["https://*"]
+    );
   }
 
   #[test]
@@ -673,7 +691,7 @@ hosts = ["https://api.example/path"]
     );
     write_rules(dir.path(), "20-second.toml", "[names.ORDERED_TOKEN]\npattern = \"late_{hex:8}\"\n");
     let registry = Registry::load(Some(dir.path())).unwrap();
-    let known = registry.lookup("ORDERED_TOKEN");
+    let known = registry.lookup("ORDERED_TOKEN").expect("ORDERED_TOKEN in the loaded registry");
     assert_eq!(known.hosts, vec!["https://first.example"]);
     assert_eq!(known.pattern.as_deref(), Some("late_{hex:8}"));
   }
@@ -682,7 +700,13 @@ hosts = ["https://api.example/path"]
   fn missing_rules_dir_is_not_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let registry = Registry::load(Some(&dir.path().join("absent"))).unwrap();
-    assert!(!registry.lookup("GITHUB_TOKEN").hosts.is_empty());
+    assert!(
+      !registry
+        .lookup("GITHUB_TOKEN")
+        .expect("GITHUB_TOKEN in the bundled registry")
+        .hosts
+        .is_empty()
+    );
   }
 
   fn rule(env: &str) -> RuleCfg {
@@ -878,6 +902,8 @@ value = "other-real-token"
     let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &dir.path().join("absent.toml"));
     let err = resolve(&mut config, &registry).await.unwrap_err();
     assert!(err.to_string().contains("fnox"), "{err:?}");
+    // The io error stays attached as the source of the fnox context.
+    assert!(format!("{err:?}").contains("Caused by"), "{err:?}");
   }
 
   const FNOX_AGE_WITHOUT_KEY_FILE: &str = r#"

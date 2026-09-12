@@ -1,8 +1,45 @@
+## [0.1.11] - 2026-09-12
+
+### 🚀 Features
+
+- *(secrets)* Add the bundled host registry and rules.d overrides
+- *(secrets)* Resolve rule hosts, patterns, and if_missing
+- *(secrets)* Resolve rule values from fnox
+- *(registry)* Seed known hosts for the first provider tranche
+
+### 🐛 Bug Fixes
+
+- *(secrets)* Distinguish missing, absent and empty fnox values
+- *(ci)* Install libudev-dev for the fnox-core dep tree
+
+### 📚 Documentation
+
+- Add the rules and registry spec and plan
+- Fix the dead Azure source link in the plan
+- Document rules, the registry, and fnox values
+- Correct the registry layer precedence
+- Apply markdown formatting to AGENTS.md
+- *(registry)* Mark the undocumented environment names
+
+### 🚜 Refactor
+
+- *(config)* Rename [secrets] to [rules] and open the schema
+- *(secrets)* Chain errors and drop needless clones
+- *(config)* Chain the rule-merge errors
+
+### ⚙️ Miscellaneous Tasks
+
+- *(mise)* Pin node lts in the toolchain
 ## [0.1.10] - 2026-09-11
 
 ### 🐛 Bug Fixes
 
 - *(dist)* Build the released binaries with the tun feature
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.10 [ci skip]
+- Release hodor version 0.1.10
 ## [0.1.9] - 2026-09-11
 
 ### 🚀 Features

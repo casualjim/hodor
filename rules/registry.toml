@@ -158,6 +158,7 @@ pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
 # source: https://postmarkapp.com/developer/api/overview
 # source: https://postmarkapp.com/support/article/1008-what-are-the-account-and-server-api-tokens
 # note: no cited page shows `POSTMARK_SERVER_TOKEN`; the developer overview documents the `X-Postmark-Server-Token` header instead.
+# note: the token article describes the server token as "a randomly generated alphanumeric string"; the pattern is UUID-shaped.
 
 [providers.pypi]
 env = ["PYPI_TOKEN"]

@@ -9,6 +9,9 @@
 listen = "127.0.0.1:8080"
 ca_file = "/certs/ca.pem"
 
+# Both env names below are registry-known (anthropic, github), so resolution
+# unions each registry entry's hosts into that rule's `allow`. Add
+# `registry = false` to a rule to keep only the literal hosts.
 [rules.anthropic]
 env = "ANTHROPIC_API_KEY"
 value = "sk-ant-api03-REPLACE-WITH-THE-REAL-KEY"

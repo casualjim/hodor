@@ -129,7 +129,8 @@ impl Registry {
   /// Apply one `[providers.<name>]` entry.
   fn apply_provider(&mut self, provider: &str, entry: &ProviderEntry, source: &Path) -> eyre::Result<()> {
     validate_hosts(&entry.hosts, source, &format!("provider `{provider}`"))?;
-    validate_optional_pattern(entry.pattern.as_deref(), source, &format!("provider `{provider}`"))?;
+    let pattern = entry.pattern.as_deref().filter(|pattern| !pattern.is_empty());
+    validate_optional_pattern(pattern, source, &format!("provider `{provider}`"))?;
     for env in &entry.env {
       let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
       if entry.replace {
@@ -141,20 +142,25 @@ impl Registry {
           slot.hosts.push(host.clone());
         }
       }
-      if let Some(pattern) = &entry.pattern {
-        slot.pattern = Some(pattern.clone());
+      if let Some(pattern) = pattern {
+        slot.pattern = Some(pattern.to_string());
       }
     }
     if entry.replace {
       self.contains.retain(|(name, _, _)| name != provider);
     }
     for needle in &entry.contains {
-      let Some(pattern) = &entry.pattern else {
+      eyre::ensure!(
+        !needle.is_empty(),
+        "{}: provider `{provider}`: `contains` entries must not be empty",
+        source.display()
+      );
+      let Some(pattern) = pattern else {
         eyre::bail!("{}: provider `{provider}`: `contains` needs a `pattern`", source.display());
       };
       self
         .contains
-        .push((provider.to_string(), needle.to_ascii_lowercase(), pattern.clone()));
+        .push((provider.to_string(), needle.to_ascii_lowercase(), pattern.to_string()));
     }
     Ok(())
   }
@@ -162,7 +168,8 @@ impl Registry {
   /// Apply one `[names.<ENV>]` entry.
   fn apply_name(&mut self, env: &str, entry: &NameEntry, source: &Path) -> eyre::Result<()> {
     validate_hosts(&entry.hosts, source, &format!("name `{env}`"))?;
-    validate_optional_pattern(entry.pattern.as_deref(), source, &format!("name `{env}`"))?;
+    let pattern = entry.pattern.as_deref().filter(|pattern| !pattern.is_empty());
+    validate_optional_pattern(pattern, source, &format!("name `{env}`"))?;
     let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
     if entry.replace {
       slot.hosts.clear();
@@ -173,8 +180,8 @@ impl Registry {
         slot.hosts.push(host.clone());
       }
     }
-    if let Some(pattern) = &entry.pattern {
-      slot.pattern = Some(pattern.clone());
+    if let Some(pattern) = pattern {
+      slot.pattern = Some(pattern.to_string());
     }
     Ok(())
   }
@@ -259,13 +266,16 @@ impl FnoxSource {
   }
 
   /// Value for one key: `None` when fnox does not declare it, error when a
-  /// declared key cannot be resolved.
+  /// declared key resolves to nothing usable (no value or an empty one).
   async fn value(&self, key: &str) -> eyre::Result<Option<String>> {
     if !self.declared.contains(key) {
       return Ok(None);
     }
-    let value = self.fnox.get(key).await.map_err(|err| eyre::eyre!("fnox secret `{key}`: {err}"))?;
-    Ok(value.filter(|value| !value.is_empty()))
+    let Some(value) = self.fnox.get(key).await.map_err(|err| eyre::eyre!("fnox secret `{key}`: {err}"))? else {
+      eyre::bail!("fnox key `{key}` is declared but resolves to no value");
+    };
+    eyre::ensure!(!value.is_empty(), "fnox key `{key}` is declared but resolves to an empty value");
+    Ok(Some(value))
   }
 }
 
@@ -302,13 +312,17 @@ pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry)
   for (label, rule) in &mut config.rules {
     let inline = rule.value.is_some();
     if !inline {
-      match values.remove(label).flatten() {
-        Some(value) => rule.value = Some(SecretString::from(value)),
-        None => {
-          if skip(label, rule, "no inline value and fnox does not declare its key")? {
-            dropped.push(label.clone());
-            continue;
-          }
+      if let Some(value) = values.remove(label).flatten() {
+        rule.value = Some(SecretString::from(value));
+      } else {
+        let what = if fnox.is_some() {
+          "no inline value and fnox does not declare its key"
+        } else {
+          "no inline value and fnox has no configuration"
+        };
+        if skip(label, rule, what)? {
+          dropped.push(label.clone());
+          continue;
         }
       }
     }
@@ -324,16 +338,11 @@ pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry)
     }
     // Unioned once here so `grants::resolve` sees the final list.
     rule.allow = hosts;
+    rule.pattern = rule.pattern.take().filter(|pattern| !pattern.is_empty());
     if rule.pattern.is_none() {
       rule.pattern = Some(registry.template(&rule.env, None));
     }
-    let source = if inline {
-      "inline"
-    } else if rule.value.is_some() {
-      "fnox"
-    } else {
-      "none"
-    };
+    let source = if inline { "inline" } else { "fnox" };
     let key = fnox_key(rule);
     if key == rule.env {
       tracing::info!(label, env = %rule.env, hosts = rule.allow.len(), value = source, "rule resolved");
@@ -363,9 +372,12 @@ fn skip(label: &str, rule: &RuleCfg, what: &str) -> eyre::Result<bool> {
 /// Validate one host entry with the same grammar as `allow`.
 fn validate_hosts(hosts: &[String], source: &Path, what: &str) -> eyre::Result<()> {
   for host in hosts {
-    let _: UriGrant = host
+    let grant: UriGrant = host
       .parse()
       .map_err(|err| eyre::eyre!("{}: {what}: bad host `{host}`: {err}", source.display()))?;
+    if matches!(grant.host, crate::grants::HostPat::Any) {
+      tracing::warn!(file = %source.display(), entry = %host, what, "grant matches any host; secret is exfil-risky");
+    }
   }
   Ok(())
 }
@@ -578,6 +590,55 @@ contains = ["bad"]
   }
 
   #[test]
+  fn empty_contains_needle_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+[providers.bad]
+pattern = "bad_{hex:8}"
+contains = [""]
+"#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("must not be empty"), "{err:?}");
+  }
+
+  #[test]
+  fn empty_registry_pattern_is_treated_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-blank.toml",
+      r#"
+[providers.blank]
+env = ["BLANK_TOKEN"]
+hosts = ["https://blank.example"]
+pattern = ""
+"#,
+    );
+    let registry = Registry::load(Some(dir.path())).unwrap();
+    assert_eq!(registry.lookup("BLANK_TOKEN").pattern, None);
+    assert_eq!(registry.template("BLANK_TOKEN", None), crate::config::DEFAULT_PATTERN);
+  }
+
+  #[test]
+  fn any_host_entry_warns_but_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-any.toml",
+      r#"
+[names.ANY_TOKEN]
+hosts = ["https://*"]
+"#,
+    );
+    let registry = Registry::load(Some(dir.path())).unwrap();
+    assert_eq!(registry.lookup("ANY_TOKEN").hosts, vec!["https://*"]);
+  }
+
+  #[test]
   fn bad_host_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     write_rules(
@@ -692,6 +753,16 @@ hosts = ["https://api.example/path"]
   }
 
   #[tokio::test]
+  async fn empty_explicit_pattern_falls_back_to_the_registry() {
+    let registry = Registry::load(None).unwrap();
+    let mut rule = rule("GITHUB_TOKEN");
+    rule.pattern = Some(String::new());
+    let mut config = config_with("gh", rule);
+    resolve(&mut config, &registry).await.unwrap();
+    assert_eq!(config.rules["gh"].pattern.as_deref(), Some("ghp_{hex:40}"));
+  }
+
+  #[tokio::test]
   async fn missing_hosts_error_by_default() {
     let registry = Registry::load(None).unwrap();
     let mut config = config_with("unknown", rule("NO_SUCH_SERVICE_TOKEN"));
@@ -801,12 +872,75 @@ value = "other-real-token"
   }
 
   #[tokio::test]
-  async fn declared_but_unreadable_fnox_config_is_an_error() {
+  async fn missing_fnox_config_file_is_an_error() {
     let registry = Registry::load(None).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &dir.path().join("absent.toml"));
     let err = resolve(&mut config, &registry).await.unwrap_err();
     assert!(err.to_string().contains("fnox"), "{err:?}");
+  }
+
+  const FNOX_AGE_WITHOUT_KEY_FILE: &str = r#"
+[providers.age]
+type = "age"
+recipients = ["age1hodorreviewplaceholder"]
+key_file = "/nonexistent/hodor-final-review-age-key.txt"
+
+[secrets.DECLARED_BUT_UNRESOLVABLE]
+provider = "age"
+value = "not-an-age-ciphertext"
+"#;
+
+  const FNOX_EMPTY_VALUE: &str = r#"
+[providers.plain]
+type = "plain"
+
+[secrets.DECLARED_BUT_EMPTY]
+provider = "plain"
+value = ""
+"#;
+
+  #[tokio::test]
+  async fn declared_key_that_cannot_be_fetched_errors_under_every_if_missing() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fnox_path = write_fnox(dir.path(), FNOX_AGE_WITHOUT_KEY_FILE);
+    for if_missing in [
+      crate::config::IfMissing::Error,
+      crate::config::IfMissing::Warn,
+      crate::config::IfMissing::Ignore,
+    ] {
+      let mut rule = rule("GITHUB_TOKEN");
+      rule.value = None;
+      rule.fnox_key = Some("DECLARED_BUT_UNRESOLVABLE".to_string());
+      rule.if_missing = if_missing;
+      let mut config = config_with("gh", rule);
+      config.fnox.config = Some(fnox_path.clone());
+      let err = resolve(&mut config, &registry).await.unwrap_err();
+      assert!(err.to_string().contains("DECLARED_BUT_UNRESOLVABLE"), "{if_missing:?}: {err:?}");
+    }
+  }
+
+  #[tokio::test]
+  async fn declared_key_that_resolves_empty_errors_under_every_if_missing() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fnox_path = write_fnox(dir.path(), FNOX_EMPTY_VALUE);
+    for if_missing in [
+      crate::config::IfMissing::Error,
+      crate::config::IfMissing::Warn,
+      crate::config::IfMissing::Ignore,
+    ] {
+      let mut rule = rule("GITHUB_TOKEN");
+      rule.value = None;
+      rule.fnox_key = Some("DECLARED_BUT_EMPTY".to_string());
+      rule.if_missing = if_missing;
+      let mut config = config_with("gh", rule);
+      config.fnox.config = Some(fnox_path.clone());
+      let err = resolve(&mut config, &registry).await.unwrap_err();
+      assert!(err.to_string().contains("DECLARED_BUT_EMPTY"), "{if_missing:?}: {err:?}");
+      assert!(err.to_string().contains("empty"), "{if_missing:?}: {err:?}");
+    }
   }
 
   #[tokio::test]

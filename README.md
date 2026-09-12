@@ -184,7 +184,7 @@ Embedding `fnox-core` brings rustls's `ring` feature into the build, so both cry
 hodor reads four layers. A higher layer wins.
 
 1. CLI flags, `--listen`, `--ca-file`, and `--config`.
-2. Environment variables, `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_PROJECT_ROOT`, and `HODOR_TUN`.
+2. Environment variables, `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_FNOX_CONFIG`, `HODOR_FNOX_PROFILE`, `HODOR_PROJECT_ROOT`, and `HODOR_TUN`.
 3. The project file at `<workspace root>/.config/hodor.toml`.
 4. The global file at `$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`.
 
@@ -257,9 +257,9 @@ hodor intercepts only a connection whose host and port match some allow entry. A
 
 ## Decoy patterns
 
-`hodor fake <ENV>` prints a decoy that is deterministic for the env name, so it stays stable across restarts. hodor picks the pattern in this order: an explicit `pattern`, a `[names.<ENV>]` registry entry, a `[providers.*]` entry that claims the env name, a `contains` match, then `{hex:32}`.
+`hodor fake <ENV>` prints a decoy that is deterministic for the env name, so it stays stable across restarts. hodor picks the pattern in this order: an explicit `pattern`, a `[names.<ENV>]` registry entry, a `[providers.*]` entry that claims the env name, a `contains` match, then `{hex:32}`. That order holds within one registry file; across files a later load's pattern overrides an earlier one, regardless of tier, because the bundled table loads first and then `rules.d` in filename order.
 
-The `contains` tier matches a substring of the lowercased env name. It selects a decoy pattern only and never grants hosts, so a name like `ACME_ANTHROPIC_KEY` gets an Anthropic-shaped decoy without reaching Anthropic. When more than one `contains` entry matches, the first one in provider-name order wins. The bundled entries live in `rules/registry.toml`.
+The `contains` tier matches a substring of the lowercased env name. It selects a decoy pattern only and never grants hosts, so a name like `ACME_ANTHROPIC_KEY` gets an Anthropic-shaped decoy without reaching Anthropic. `contains` is the one exception to later-wins: matches are tried in load order, so the earliest-loaded file wins, and within one file the first provider name in sort order wins. A bundled `contains` entry therefore beats a `rules.d` entry under a different provider name. The bundled entries live in `rules/registry.toml`.
 
 ```sh
 hodor fake DEMO_TOKEN

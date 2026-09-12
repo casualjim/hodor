@@ -9,7 +9,7 @@ Per-connection: accept → httparse head → `intercept_candidate(host,port)` ga
 Concurrency: `ProxyState` behind plain `Arc` (write-once, no reload); cert cache is a `DashMap` — keygen on caller, never under lock; per-connection `tokio::spawn`; 10s total pre-auth/dial budgets; `SO_MARK` fwmark for TUN loop exclusion.
 
 ## Key Directories
-No `tests/`, `scripts/`, `docs/`, `examples/`. All logic in `src/*.rs`:
+No `tests/` or `scripts/`. All logic in `src/*.rs`:
 - `src/main.rs` — clap CLI (`serve` default, `fake`, `ca`), wiring
 - `src/config.rs` — confique overlay + rule schema + deterministic fake generator (`fake_for`)
 - `src/secrets.rs` — host registry (`rules/registry.toml` + `<config-dir>/hodor/rules.d`), rule resolution, fnox value lookup

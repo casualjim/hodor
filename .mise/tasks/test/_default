@@ -10,3 +10,4 @@ cd "$proj_dir" || exit 1
 
 mise run --force test:rust "$@"
 mise run --force test:tun --use-sudo "$@"
+

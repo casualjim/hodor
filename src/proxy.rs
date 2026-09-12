@@ -61,8 +61,9 @@ impl ProxyState {
     }
   }
 
-  #[cfg(feature = "tun")]
-  /// Mark upstream sockets so TUN policy routing bypasses capture.
+  #[cfg(target_os = "linux")]
+  /// Mark upstream sockets so capture policy routing bypasses them
+  /// (`tun` legacy and `tproxy` alike).
   pub fn with_fwmark(mut self, mark: u32) -> Self {
     self.fwmark = Some(mark);
     self
@@ -71,11 +72,6 @@ impl ProxyState {
   /// Load the current config snapshot.
   pub fn snapshot(&self) -> Arc<ResolvedConfig> {
     Arc::clone(&self.config)
-  }
-  #[cfg(feature = "tun")]
-  /// `SO_MARK` for upstream sockets (`None` = unmarked).
-  pub fn fwmark(&self) -> Option<u32> {
-    self.fwmark
   }
 
   /// Leaf cert for `domain`: exact hit first, then the wildcard leaf when a

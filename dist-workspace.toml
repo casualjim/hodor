@@ -19,9 +19,8 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
-# The released binaries ship the tun feature. The key is `features`, not raw cargo
-# args: dist ignores unrecognized keys silently, so a wrong one fails at runtime.
-features = ["tun"]
+# Transparent capture (TPROXY) is compiled in unconditionally on Linux; no
+# cargo features are needed. The key block stays removed.
 # Container image build, inlined into the release pipeline (no separate trigger):
 # downloads the dist tarballs from the GitHub release this run just published.
 post-announce-jobs = ["./container"]

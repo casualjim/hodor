@@ -4,7 +4,7 @@ hodor is a grant-scoped MITM proxy that swaps a workload's format-valid decoy cr
 
 ## How it works
 
-A workload points its HTTP proxy setting at hodor, or hodor captures its traffic with `--tun`. Either way the workload holds a decoy credential, never the real one. The decoy is format-valid, so a tool that checks the shape of a token accepts it.
+A workload points its HTTP proxy setting at hodor, or hodor captures its traffic with `--tproxy`. Either way the workload holds a decoy credential, never the real one. The decoy is format-valid, so a tool that checks the shape of a token accepts it.
 
 When a connection's host and port match an allow entry, hodor terminates TLS with a per-domain leaf certificate signed by its own CA. It replaces each decoy with its real value in headers, in basic auth, and in bodies, for both HTTP/1 and HTTP/2. On the response, it replaces real values with the decoy again, so the client sees only the decoy.
 
@@ -24,10 +24,10 @@ cargo build --release
 
 The binary lands at `target/release/hodor`. The crate uses edition 2024, so build with a recent stable Rust toolchain.
 
-To include transparent capture, add the `tun` feature.
+Transparent capture is compiled in on Linux; no cargo feature is needed.
 
 ```sh
-cargo build --release --features tun
+cargo build --release
 ```
 
 When releases are published, they carry Linux binaries for amd64 and arm64 plus a container image. The image holds a prebuilt binary. Its entrypoint is `hodor` and its default command is `serve`.
@@ -184,7 +184,7 @@ Embedding `fnox-core` brings rustls's `ring` feature into the build, so both cry
 hodor reads four layers. A higher layer wins.
 
 1. CLI flags, `--listen`, `--ca-file`, and `--config`.
-2. Environment variables, `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_FNOX_CONFIG`, `HODOR_FNOX_PROFILE`, `HODOR_PROJECT_ROOT`, and `HODOR_TUN`.
+2. Environment variables, `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_FNOX_CONFIG`, `HODOR_FNOX_PROFILE`, `HODOR_PROJECT_ROOT`, and `HODOR_TPROXY`.
 3. The project file at `<workspace root>/.config/hodor.toml`.
 4. The global file at `$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`.
 
@@ -281,7 +281,7 @@ hodor fake GH_TOKEN --pattern 'acme_{base62:24}'
 
 ## Transparent capture
 
-`hodor serve --tun` captures egress from its network namespace with a userspace TCP/IP stack. The client needs no proxy setting. Capture needs root, the `CAP_NET_ADMIN` capability, and `/dev/net/tun`. It captures LAN traffic as well as traffic to the internet. It relays UDP directly. DNS goes to the system resolver, and hodor drops QUIC on port 443.
+`hodor serve --tproxy` captures egress from its network namespace with kernel TPROXY: an `IP_TRANSPARENT` listener plus nftables rules and policy routes hodor installs itself over netlink (no `nft`/`ip` binaries needed). The client needs no proxy setting. Capture needs root and the `CAP_NET_ADMIN` capability. It captures LAN traffic as well as traffic to the internet. DNS and other UDP pass through unintercepted; hodor drops QUIC on port 443 via nft rule.
 
 A raw TCP connection has no SNI, so the destination address is the identity. A `tcp://` entry must name that address.
 
@@ -289,7 +289,7 @@ A raw TCP connection has no SNI, so the destination address is the identity. A `
 allow = ["tcp://10.202.0.20:9000"]
 ```
 
-`--tun` and `HODOR_TUN` are CLI and environment only. hodor does not read them from a config file, because TUN changes host routes.
+`--tproxy` and `HODOR_TPROXY` are CLI and environment only. hodor does not read them from a config file, because TPROXY changes host nft rules and routes.
 
 [integration/README.md](integration/README.md) has a runnable demo. It runs the container image, a client, and an upstream, and it asserts four substitution scenarios and one splice scenario.
 
@@ -301,7 +301,7 @@ allow = ["tcp://10.202.0.20:9000"]
 - A `*` host allow entry matches any destination. hodor warns at startup, but the exposure is yours to accept.
 - hodor swaps the decoy where it appears verbatim. A workload that hashes, signs, or re-encodes the credential before sending it sends a decoy-derived value, and the upstream rejects the request.
 - A client must trust hodor's CA to reach a granted HTTPS host. Without trust, the TLS handshake fails.
-- Transparent capture needs root, `CAP_NET_ADMIN`, and `/dev/net/tun`.
+- Transparent capture needs root and `CAP_NET_ADMIN` (Linux only).
 
 ## Contributing
 

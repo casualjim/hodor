@@ -9,5 +9,5 @@ proj_dir=$(git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
 
 mise run --force test:rust "$@"
-mise run --force test:tun --use-sudo "$@"
+mise run --force test:tproxy --use-sudo "$@"
 

@@ -51,13 +51,13 @@ jobs:
           tar xJf bundle.tar.xz -C ctx --strip-components=1
           test -x ctx/hodor
 
-      - name: Assert the binary carries the tun feature
+      - name: Assert the binary carries transparent capture
         run: |
           # dist silently ignores build settings it does not recognize, and a binary
-          # built without the feature only fails at runtime, in production. The marker
-          # is compiled in with the feature, and this works on the arm64 binary too.
-          if ! grep -aq 'TUN capture failed' ctx/hodor; then
-            echo "::error::ctx/hodor was built without the tun feature"
+          # built without capture only fails at runtime, in production. The marker
+          # is compiled in unconditionally on Linux, and this works on arm64 too.
+          if ! grep -aq 'TPROXY capture failed' ctx/hodor; then
+            echo "::error::ctx/hodor was built without transparent capture"
             exit 1
           fi
 

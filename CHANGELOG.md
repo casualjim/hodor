@@ -1,3 +1,8 @@
+## [0.1.12] - 2026-09-12
+
+### 🐛 Bug Fixes
+
+- *(dist)* Install libudev-dev in the dist build setup
 ## [0.1.11] - 2026-09-12
 
 ### 🚀 Features
@@ -30,6 +35,8 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(mise)* Pin node lts in the toolchain
+- Update changelog for v0.1.11 [ci skip]
+- Release hodor version 0.1.11
 ## [0.1.10] - 2026-09-11
 
 ### 🐛 Bug Fixes

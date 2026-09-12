@@ -19,6 +19,7 @@ rust = { version = "stable", profile = "default", components = "llvm-tools,rust-
 "github:casualjim/remark" = "latest"
 gum = "latest"
 lychee = "latest"
+node = "lts"
 
 [env]
 CARGO_TERM_COLOR = "always"

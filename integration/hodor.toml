@@ -10,7 +10,9 @@
 listen = "0.0.0.0:8080"
 ca_file = "/certs/ca.pem"
 
-[secrets.demo]
+# GH_TOKEN is registry-known (github), so resolution unions the registry's
+# hosts into `allow` below. `registry = false` keeps only the literal hosts.
+[rules.demo]
 env = "GH_TOKEN"
 value = "ghp_deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 allow = ["https://api:8443", "http://api:8000", "tcp://10.202.0.20:9000", "https://api:9443"]

@@ -9,6 +9,7 @@ mod ca;
 mod config;
 mod grants;
 mod proxy;
+mod secrets;
 mod sni;
 mod substitute;
 #[cfg(feature = "tun")]
@@ -73,8 +74,8 @@ pub struct FakeArgs {
 
 /// Resolve the CA file path: config `ca_file` if set, else the default
 /// `<config-dir>/hodor/ca.pem`.
-fn ca_path(resolved: &grants::ResolvedConfig) -> eyre::Result<PathBuf> {
-  match resolved.proxy.ca_file.clone() {
+fn ca_path(proxy: &config::ProxyCfg) -> eyre::Result<PathBuf> {
+  match proxy.ca_file.clone() {
     Some(path) => Ok(path),
     None => dirs::config_dir()
       .map(|dir: PathBuf| dir.join("hodor").join("ca.pem"))
@@ -98,13 +99,13 @@ async fn main() -> eyre::Result<()> {
       if let Some(pattern) = args.pattern.as_deref() {
         config::validate_pattern(pattern).map_err(|err| eyre::eyre!("bad --pattern: {err}"))?;
       }
-      println!("{}", config::fake_for(&args.env, args.pattern.as_deref()));
+      let registry = secrets::Registry::load(config::rules_dir().as_deref())?;
+      println!("{}", registry.decoy(&args.env, args.pattern.as_deref()));
       Ok(())
     }
     Command::Ca => {
       let (config, _) = config::load(&cli)?;
-      let resolved = grants::resolve(&config)?;
-      let ca = ca::load_or_generate(&ca_path(&resolved)?)?;
+      let ca = ca::load_or_generate(&ca_path(&config.proxy)?)?;
       print!("{}", String::from_utf8_lossy(&ca.cert_pem()));
       Ok(())
     }
@@ -113,7 +114,9 @@ async fn main() -> eyre::Result<()> {
       if args.tun {
         eyre::bail!("built without the `tun` feature; rebuild with --features tun");
       }
-      let (config, workspace) = config::load(&cli)?;
+      let (mut config, workspace) = config::load(&cli)?;
+      let registry = secrets::Registry::load(config::rules_dir().as_deref())?;
+      secrets::resolve(&mut config, &registry).await?;
       let resolved = grants::resolve(&config)?;
       if let Some(ws) = &workspace {
         tracing::info!(
@@ -125,7 +128,7 @@ async fn main() -> eyre::Result<()> {
       } else {
         tracing::debug!("no workspace root, global config only");
       }
-      let ca = ca::load_or_generate(&ca_path(&resolved)?)?;
+      let ca = ca::load_or_generate(&ca_path(&resolved.proxy)?)?;
       let listen_addr = resolved.proxy.listen;
       let grant_count = resolved.grants.len();
       #[cfg(feature = "tun")]

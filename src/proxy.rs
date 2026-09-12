@@ -864,6 +864,7 @@ mod tests {
   }
 
   fn test_state_with(grants: Vec<Grant>, ca: CertAuthority) -> Arc<ProxyState> {
+    install_crypto_provider();
     Arc::new(ProxyState::new(
       ResolvedConfig {
         proxy: crate::config::ProxyCfg {

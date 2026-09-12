@@ -129,7 +129,7 @@ jobs:
           fi
       - name: "Install cmake"
         if: "${{ runner.os == 'Linux' }}"
-        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake"
+        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

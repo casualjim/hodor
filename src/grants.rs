@@ -183,19 +183,25 @@ pub struct ResolvedConfig {
 }
 
 pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
-  let mut grants = Vec::with_capacity(cfg.secrets.len());
-  for (label, secret) in &cfg.secrets {
-    let mut allow = Vec::with_capacity(secret.allow.len());
-    for entry in &secret.allow {
+  let mut grants = Vec::with_capacity(cfg.rules.len());
+  for (label, rule) in &cfg.rules {
+    let Some(value) = rule.value.clone() else {
+      // `secrets::resolve` fills this before `serve`; a caller that skips
+      // resolution gets no grant rather than a rule that swaps in nothing.
+      tracing::warn!(label, env = %rule.env, "rule has no resolved value; no grant");
+      continue;
+    };
+    let mut allow = Vec::with_capacity(rule.allow.len());
+    for entry in &rule.allow {
       let uri: UriGrant = entry
         .parse()
-        .map_err(|err| eyre::eyre!("secret `{label}`: bad allow entry `{entry}`: {err}"))?;
+        .map_err(|err| eyre::eyre!("rule `{label}`: bad allow entry `{entry}`: {err}"))?;
       allow.push(uri);
     }
     grants.push(Grant {
       label: label.clone(),
-      fake: crate::config::fake_for(&secret.env, secret.pattern.as_deref()),
-      value: secret.value.clone(),
+      fake: crate::config::fake_for(&rule.env, rule.pattern.as_deref()),
+      value,
       allow,
     });
   }

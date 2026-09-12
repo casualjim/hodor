@@ -403,6 +403,56 @@ mod tests {
   }
 
   #[test]
+  fn bundled_table_covers_the_first_tranche() {
+    let registry = Registry::load(None).unwrap();
+    // Names follow the platforms' docs: Atlas documents `MONGODB_ATLAS_PRIVATE_API_KEY`
+    // and Shopify's Admin API examples use `SHOP_TOKEN`.
+    for env in [
+      "GITHUB_TOKEN",
+      "GITLAB_TOKEN",
+      "ANTHROPIC_API_KEY",
+      "OPENAI_API_KEY",
+      "GEMINI_API_KEY",
+      "AWS_ACCESS_KEY_ID",
+      "AZURE_CLIENT_SECRET",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "CLOUDFLARE_API_TOKEN",
+      "DIGITALOCEAN_TOKEN",
+      "HCLOUD_TOKEN",
+      "FLY_API_TOKEN",
+      "VERCEL_TOKEN",
+      "NETLIFY_AUTH_TOKEN",
+      "HEROKU_API_KEY",
+      "STRIPE_SECRET_KEY",
+      "SLACK_BOT_TOKEN",
+      "TWILIO_AUTH_TOKEN",
+      "SENDGRID_API_KEY",
+      "POSTMARK_SERVER_TOKEN",
+      "RESEND_API_KEY",
+      "NPM_TOKEN",
+      "PYPI_TOKEN",
+      "HF_TOKEN",
+      "DD_API_KEY",
+      "SENTRY_AUTH_TOKEN",
+      "GRAFANA_API_KEY",
+      "MONGODB_ATLAS_PRIVATE_API_KEY",
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "SHOP_TOKEN",
+    ] {
+      let known = registry.lookup(env);
+      assert!(!known.hosts.is_empty(), "{env} has no hosts");
+      assert!(known.pattern.is_some(), "{env} has no pattern");
+    }
+  }
+
+  #[test]
+  fn bundled_table_patterns_and_hosts_are_valid() {
+    // `load` validates every entry, so a bad pattern or host fails here.
+    let registry = Registry::load(None).unwrap();
+    assert!(!registry.names.is_empty());
+  }
+
+  #[test]
   fn lookup_is_case_insensitive() {
     let registry = Registry::load(None).unwrap();
     assert_eq!(registry.lookup("github_token"), registry.lookup("GITHUB_TOKEN"));

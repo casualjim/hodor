@@ -1,5 +1,10 @@
 # Bundled registry: environment names, API hosts, and token shapes.
 # Override any entry from <config-dir>/hodor/rules.d/*.toml; see README.
+#
+# `hosts` are stable API endpoints; a service whose endpoint is per tenant
+# uses the host family its docs state (`https://*.example.com`).
+# `pattern` keeps the prefix a platform documents; where the docs state no
+# format, the shape approximates that platform's tokens.
 
 [providers.anthropic]
 env = ["ANTHROPIC_API_KEY"]
@@ -7,6 +12,67 @@ hosts = ["https://api.anthropic.com"]
 pattern = "sk-ant-api03-{base62:64}"
 contains = ["anthropic", "sk-ant-"]
 # source: https://docs.anthropic.com/en/api/getting-started
+# source: https://docs.anthropic.com/en/docs/initial-setup
+# note: the `sk-ant-api03` prefix is retained from the Task 2 seed; the cited pages do not restate it.
+
+[providers.aws]
+env = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+hosts = ["https://*.amazonaws.com"]
+pattern = "AKIA{base62:16}"
+# source: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
+# source: https://docs.aws.amazon.com/general/latest/gr/rande.html
+# note: the `AKIA` prefix comes from the docs' `AKIAIOSFODNN7EXAMPLE`; real key ids are uppercase, which `{base62:N}` approximates.
+
+[providers.azure]
+env = ["AZURE_CLIENT_SECRET"]
+hosts = ["https://login.microsoftonline.com", "https://management.azure.com"]
+pattern = "{base62:32}"
+# source: https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential
+# source: https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow
+# source: https://learn.microsoft.com/en-us/rest/api/azure/
+
+[providers.cloudflare]
+env = ["CLOUDFLARE_API_TOKEN"]
+hosts = ["https://api.cloudflare.com"]
+pattern = "{hex:32}"
+# source: https://developers.cloudflare.com/fundamentals/api/get-started/create-token/
+# source: https://developers.cloudflare.com/workers/wrangler/system-environment-variables/
+
+[providers.datadog]
+env = ["DD_API_KEY"]
+hosts = ["https://api.datadoghq.com"]
+pattern = "{hex:32}"
+# source: https://docs.datadoghq.com/account_management/api-app-keys/
+# source: https://docs.datadoghq.com/api/latest/key-management/get-all-api-keys/
+
+[providers.digitalocean]
+env = ["DIGITALOCEAN_TOKEN"]
+hosts = ["https://api.digitalocean.com"]
+pattern = "{hex:64}"
+# source: https://docs.digitalocean.com/reference/api/create-personal-access-token/
+# source: https://docs.digitalocean.com/reference/libraries/
+# source: https://docs.digitalocean.com/reference/api/reference/droplets/
+# note: the token length is not stated in the docs; `{hex:64}` matches DigitalOcean's token shape.
+
+[providers.fly]
+env = ["FLY_API_TOKEN"]
+hosts = ["https://api.machines.dev"]
+pattern = "{base62:32}"
+# source: https://fly.io/docs/machines/api/working-with-machines-api/
+
+[providers.gcp]
+env = ["GOOGLE_APPLICATION_CREDENTIALS"]
+hosts = ["https://*.googleapis.com"]
+pattern = "{hex:32}"
+# source: https://cloud.google.com/docs/authentication/application-default-credentials
+# source: https://docs.cloud.google.com/docs/security/compliance/endpoints
+# note: the value is a path to a JSON key file, so the pattern is the default shape.
+
+[providers.gemini]
+env = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+hosts = ["https://generativelanguage.googleapis.com"]
+pattern = "{base62:32}"
+# source: https://ai.google.dev/gemini-api/docs/api-key
 
 [providers.github]
 env = ["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"]
@@ -15,12 +81,120 @@ pattern = "ghp_{hex:40}"
 contains = ["gh_"]
 # source: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github
 
+[providers.gitlab]
+env = ["GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN"]
+hosts = ["https://gitlab.com"]
+pattern = "glpat-{base62:32}"
+# source: https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html
+# source: https://docs.gitlab.com/cli/authentication/
+# source: https://docs.gitlab.com/security/tokens/
+# note: self-managed instances are per tenant; `gitlab.com` is the documented SaaS host.
+
+[providers.grafana]
+env = ["GRAFANA_API_KEY", "GRAFANA_SERVICE_ACCOUNT_TOKEN"]
+hosts = ["https://*.grafana.net"]
+pattern = "{hex:32}"
+# source: https://grafana.com/docs/grafana/latest/developers/http_api/
+# source: https://grafana.com/docs/grafana/latest/developer-resources/mcp/set-up/client-configuration-examples/
+# source: https://grafana.com/docs/grafana-cloud/developer-resources/api-reference/cloud-api/
+# note: `GRAFANA_API_KEY` is documented as deprecated in favor of `GRAFANA_SERVICE_ACCOUNT_TOKEN`; stack instances are `<STACK_SLUG>.grafana.net`.
+
+[providers.heroku]
+env = ["HEROKU_API_KEY"]
+hosts = ["https://api.heroku.com"]
+pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
+# source: https://devcenter.heroku.com/articles/platform-api-quickstart
+
+[providers.hetzner]
+env = ["HCLOUD_TOKEN"]
+hosts = ["https://api.hetzner.cloud", "https://api.hetzner.com"]
+pattern = "{hex:64}"
+# source: https://docs.hetzner.cloud/
+# source: https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/
+# note: docs.hetzner.com shows `$API_TOKEN` in its examples; `HCLOUD_TOKEN` is the hcloud CLI name, not stated on the cited pages.
+
+[providers.huggingface]
+env = ["HF_TOKEN"]
+hosts = ["https://huggingface.co"]
+pattern = "hf_{base62:32}"
+# source: https://huggingface.co/docs/hub/security-tokens
+
+[providers.mongodb-atlas]
+env = ["MONGODB_ATLAS_PRIVATE_API_KEY"]
+hosts = ["https://cloud.mongodb.com"]
+pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
+# source: https://www.mongodb.com/docs/atlas/configure-api-access/
+# source: https://www.mongodb.com/docs/atlas/cli/current/atlas-cli-env-variables/
+# note: the Atlas CLI docs name the key `MONGODB_ATLAS_PRIVATE_API_KEY`, not `MONGODB_ATLAS_PRIVATE_KEY`; private keys are UUID-shaped.
+
+[providers.netlify]
+env = ["NETLIFY_AUTH_TOKEN"]
+hosts = ["https://api.netlify.com"]
+pattern = "{hex:32}"
+# source: https://docs.netlify.com/api/get-started/
+# source: https://docs.netlify.com/api-and-cli-guides/cli-guides/get-started-with-cli/
+
+[providers.npm]
+env = ["NPM_TOKEN"]
+hosts = ["https://registry.npmjs.org"]
+pattern = "{hex:36}"
+# source: https://docs.npmjs.com/about-access-tokens
+# source: https://docs.npmjs.com/using-private-packages-in-a-ci-cd-workflow/
+
 [providers.openai]
 env = ["OPENAI_API_KEY"]
 hosts = ["https://api.openai.com"]
 pattern = "sk-{base62:48}"
 contains = ["openai"]
 # source: https://platform.openai.com/docs/api-reference/introduction
+# source: https://platform.openai.com/docs/quickstart
+# note: the API-reference page returns 403 to fetchers; the quickstart documents the names and host.
+
+[providers.postmark]
+env = ["POSTMARK_SERVER_TOKEN"]
+hosts = ["https://api.postmarkapp.com"]
+pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
+# source: https://postmarkapp.com/developer/api/overview
+# source: https://postmarkapp.com/support/article/1008-what-are-the-account-and-server-api-tokens
+# note: the developer overview documents the `X-Postmark-Server-Token` header; the env name appears in Postmark's own setup material.
+
+[providers.pypi]
+env = ["PYPI_TOKEN"]
+hosts = ["https://upload.pypi.org"]
+pattern = "pypi-{base62:32}"
+# source: https://pypi.org/help/#apitoken
+# source: https://docs.pypi.org/api/upload/
+# source: https://docs.pypi.org/trusted-publishers/using-a-publisher/
+
+[providers.resend]
+env = ["RESEND_API_KEY"]
+hosts = ["https://api.resend.com"]
+pattern = "re_{base62:32}"
+# source: https://resend.com/docs/api-reference/introduction
+# source: https://resend.com/docs/create-an-api-key
+
+[providers.sendgrid]
+env = ["SENDGRID_API_KEY"]
+hosts = ["https://api.sendgrid.com"]
+pattern = "{base62:32}"
+# source: https://www.twilio.com/docs/sendgrid/ui/account-and-settings/api-keys
+# note: the page names no token prefix, so the shape is generic.
+
+[providers.sentry]
+env = ["SENTRY_AUTH_TOKEN"]
+hosts = ["https://sentry.io"]
+pattern = "{hex:32}"
+# source: https://docs.sentry.io/api/auth/
+# source: https://docs.sentry.io/cli/configuration/
+# note: the cited pages do not state an auth-token prefix.
+
+[providers.shopify]
+env = ["SHOP_TOKEN"]
+hosts = ["https://*.myshopify.com"]
+pattern = "shpat_{hex:32}"
+# source: https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens
+# source: https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/generate-app-access-tokens-admin
+# note: Admin API examples use `SHOP_TOKEN` and `shpat_`; every store is `{shop}.myshopify.com`.
 
 [providers.slack]
 env = ["SLACK_TOKEN", "SLACK_BOT_TOKEN"]
@@ -28,3 +202,32 @@ hosts = ["https://slack.com", "https://api.slack.com"]
 pattern = "xoxb-{d:10}-{d:11}-{hex:24}"
 contains = ["slack", "xox"]
 # source: https://api.slack.com/authentication/token-types
+
+[providers.stripe]
+env = ["STRIPE_SECRET_KEY"]
+hosts = ["https://api.stripe.com"]
+pattern = "sk_live_{base62:32}"
+# source: https://docs.stripe.com/keys
+# source: https://docs.stripe.com/api
+# note: the keys page says only "use an environment variable"; `sk_live_` and `sk_test_` prefixes are documented.
+
+[providers.supabase]
+env = ["SUPABASE_SERVICE_ROLE_KEY"]
+hosts = ["https://*.supabase.co"]
+pattern = "{base62:32}"
+# source: https://supabase.com/docs/guides/api/api-keys
+# note: every project is `<project-ref>.supabase.co`; the service-role key is a JWT, which the pattern approximates.
+
+[providers.twilio]
+env = ["TWILIO_AUTH_TOKEN"]
+hosts = ["https://api.twilio.com"]
+pattern = "{hex:32}"
+# source: https://www.twilio.com/docs/iam/api/account
+
+[providers.vercel]
+env = ["VERCEL_TOKEN", "VERCEL_ACCESS_TOKEN"]
+hosts = ["https://api.vercel.com"]
+pattern = "{base62:32}"
+# source: https://vercel.com/docs/rest-api
+# source: https://vercel.com/docs/cli/tokens
+# source: https://vercel.com/docs/accounts/access-tokens

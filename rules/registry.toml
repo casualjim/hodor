@@ -140,6 +140,7 @@ hosts = ["https://registry.npmjs.org"]
 pattern = "{hex:36}"
 # source: https://docs.npmjs.com/about-access-tokens
 # source: https://docs.npmjs.com/using-private-packages-in-a-ci-cd-workflow/
+# note: the token length is not stated in the docs; `{hex:36}` matches npm's hexadecimal token shape.
 
 [providers.openai]
 env = ["OPENAI_API_KEY"]
@@ -156,7 +157,7 @@ hosts = ["https://api.postmarkapp.com"]
 pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
 # source: https://postmarkapp.com/developer/api/overview
 # source: https://postmarkapp.com/support/article/1008-what-are-the-account-and-server-api-tokens
-# note: the developer overview documents the `X-Postmark-Server-Token` header; the env name appears in Postmark's own setup material.
+# note: no cited page shows `POSTMARK_SERVER_TOKEN`; the developer overview documents the `X-Postmark-Server-Token` header instead.
 
 [providers.pypi]
 env = ["PYPI_TOKEN"]
@@ -165,6 +166,7 @@ pattern = "pypi-{base62:32}"
 # source: https://pypi.org/help/#apitoken
 # source: https://docs.pypi.org/api/upload/
 # source: https://docs.pypi.org/trusted-publishers/using-a-publisher/
+# note: no PyPI page documents `PYPI_TOKEN` as an environment variable; the help page documents the `pypi-` token prefix.
 
 [providers.resend]
 env = ["RESEND_API_KEY"]

@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use confique::{Config as _, Layer as _};
+use eyre::WrapErr as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -159,8 +160,8 @@ pub fn discover_project_config(explicit: Option<&Path>, start: &Path) -> Option<
 fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> eyre::Result<BTreeMap<String, RuleCfg>> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = std::fs::read_to_string(path).map_err(|err| eyre::eyre!("read {}: {err}", path.display()))?;
-    let doc: toml::Table = toml::from_str(&text).map_err(|err| eyre::eyre!("parse {}: {err}", path.display()))?;
+    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
     let Some(rules) = doc.get("rules") else {
       continue;
     };
@@ -168,7 +169,7 @@ fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> eyre::Res
       .as_table()
       .ok_or_else(|| eyre::eyre!("{}: `rules` must be a table", path.display()))?;
     for (label, entry) in table {
-      let cfg = RuleCfg::deserialize(entry.clone()).map_err(|err| eyre::eyre!("{}: rule `{label}`: {err}", path.display()))?;
+      let cfg = RuleCfg::deserialize(entry.clone()).wrap_err_with(|| format!("{}: rule `{label}`", path.display()))?;
       merged.insert(label.clone(), cfg);
     }
   }

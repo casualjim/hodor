@@ -3,44 +3,44 @@
 lockfile_version = 1
 
 [[tools."aqua:nextest-rs/nextest/cargo-nextest"]]
-version = "0.9.143"
+version = "0.9.144"
 backend = "aqua:nextest-rs/nextest/cargo-nextest"
 specifiers = ["latest"]
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.linux-arm64"]
-checksum = "sha256:2a64b3566a92508550a7ab29c3e8db25472ca37730ecb4d22100b6aa440c2a68"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501881925"
+checksum = "sha256:7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/555799802"
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.linux-arm64-musl"]
-checksum = "sha256:0560ce0ce017f368c54b5db86588370fc03b470985490fa81200e62a657dda05"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501882957"
+checksum = "sha256:1b17ee6d30820c9c993dd0745fdab5df9b3d8706e67f9bf72c31979180ee60d9"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/555798088"
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.linux-x64"]
-checksum = "sha256:66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501882467"
+checksum = "sha256:8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/555799959"
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.linux-x64-musl"]
-checksum = "sha256:6d891c18105ec2d33f6e441a4f92b7ccab47ba263e22055c8bb66884243f3389"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501883394"
+checksum = "sha256:20ed0a7d3d6f8dda9bb1b0bcb5838aea5784d3e2360746280868996d709dde0a"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/555798324"
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.macos-arm64"]
-checksum = "sha256:4830d430411148d17602a75cc880bfb4dc8dac153dea59a48a2ef4cc93577f07"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-universal-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501885637"
+checksum = "sha256:87472b2c3ee09154cadd34d168a5cdede478806810f095c3dc4dc499943da42e"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-universal-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/555817983"
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.macos-x64"]
-checksum = "sha256:4830d430411148d17602a75cc880bfb4dc8dac153dea59a48a2ef4cc93577f07"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-universal-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501885637"
+checksum = "sha256:87472b2c3ee09154cadd34d168a5cdede478806810f095c3dc4dc499943da42e"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-universal-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/555817983"
 
 [tools."aqua:nextest-rs/nextest/cargo-nextest"."platforms.windows-x64"]
-checksum = "sha256:c42a1dbde532da06dc9b4a43d44fd0ce668b836c2ab7388410f10ff9834476a2"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-x86_64-pc-windows-msvc.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501885753"
+checksum = "sha256:b0d6a6569d4ef63a095c5a574a6856c17fb755b51a02a17e4651e738e9192831"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/555805900"
 
 [[tools."cargo:cargo-sort"]]
 version = "2.1.4"
@@ -88,50 +88,50 @@ url = "https://github.com/casualjim/remark/releases/download/v0.6.2/remark-x86_6
 url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/536124385"
 
 [[tools.gum]]
-version = "2.0.0"
+version = "2.0.1"
 backend = "aqua:charmbracelet/gum"
 specifiers = ["latest"]
 
 [tools.gum."platforms.linux-arm64"]
-checksum = "sha256:ed51e91457a48f5681f67dd925bd40eb1794d41d1f48cf1d7e19e2517b7fac76"
-url = "https://github.com/charmbracelet/gum/releases/download/v2.0.0/gum_2.0.0_Linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/521957954"
+checksum = "sha256:6998202a8fea27bb2007f69e44ec5dcb4cff5268c62d995de857eee0e2cd52cb"
+url = "https://github.com/charmbracelet/gum/releases/download/v2.0.1/gum_2.0.1_Linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/556562997"
 provenance = "cosign"
 
 [tools.gum."platforms.linux-arm64-musl"]
-checksum = "sha256:ed51e91457a48f5681f67dd925bd40eb1794d41d1f48cf1d7e19e2517b7fac76"
-url = "https://github.com/charmbracelet/gum/releases/download/v2.0.0/gum_2.0.0_Linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/521957954"
+checksum = "sha256:6998202a8fea27bb2007f69e44ec5dcb4cff5268c62d995de857eee0e2cd52cb"
+url = "https://github.com/charmbracelet/gum/releases/download/v2.0.1/gum_2.0.1_Linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/556562997"
 provenance = "cosign"
 
 [tools.gum."platforms.linux-x64"]
-checksum = "sha256:c99b0005bb5b514770eea404b24c7987e08eba35bb0b2d7bc6545bb676c36861"
-url = "https://github.com/charmbracelet/gum/releases/download/v2.0.0/gum_2.0.0_Linux_x86_64.tar.gz"
-url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/521957928"
+checksum = "sha256:4dfe4547f960813864c803b3617aa64427fa32ca566707fde949e08975297c48"
+url = "https://github.com/charmbracelet/gum/releases/download/v2.0.1/gum_2.0.1_Linux_x86_64.tar.gz"
+url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/556563001"
 provenance = "cosign"
 
 [tools.gum."platforms.linux-x64-musl"]
-checksum = "sha256:c99b0005bb5b514770eea404b24c7987e08eba35bb0b2d7bc6545bb676c36861"
-url = "https://github.com/charmbracelet/gum/releases/download/v2.0.0/gum_2.0.0_Linux_x86_64.tar.gz"
-url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/521957928"
+checksum = "sha256:4dfe4547f960813864c803b3617aa64427fa32ca566707fde949e08975297c48"
+url = "https://github.com/charmbracelet/gum/releases/download/v2.0.1/gum_2.0.1_Linux_x86_64.tar.gz"
+url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/556563001"
 provenance = "cosign"
 
 [tools.gum."platforms.macos-arm64"]
-checksum = "sha256:20224bcddeda5b9146373862ca77be7b1592c46c271435e00a2d3ab3f7750bb0"
-url = "https://github.com/charmbracelet/gum/releases/download/v2.0.0/gum_2.0.0_Darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/521957955"
+checksum = "sha256:994662daab6fcfe9dcfc57d87ca42bcae2948d86fa864f9010a3848fa9bb7d6e"
+url = "https://github.com/charmbracelet/gum/releases/download/v2.0.1/gum_2.0.1_Darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/556563007"
 provenance = "cosign"
 
 [tools.gum."platforms.macos-x64"]
-checksum = "sha256:a5aa27c887f891427cfa84d4e11aa25254c982fb1591633009bb16d0e9398f49"
-url = "https://github.com/charmbracelet/gum/releases/download/v2.0.0/gum_2.0.0_Darwin_x86_64.tar.gz"
-url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/521957922"
+checksum = "sha256:4d125b60fbaa28ef1674bb16f3859ed4e813acb027a79d24603b598ea4a0b71f"
+url = "https://github.com/charmbracelet/gum/releases/download/v2.0.1/gum_2.0.1_Darwin_x86_64.tar.gz"
+url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/556562991"
 provenance = "cosign"
 
 [tools.gum."platforms.windows-x64"]
-checksum = "sha256:eb78a29bf9bb365016c85a285ba8387611e8fe10e50c8e8358537bfa2eabf4f8"
-url = "https://github.com/charmbracelet/gum/releases/download/v2.0.0/gum_2.0.0_Windows_x86_64.zip"
-url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/521957920"
+checksum = "sha256:1d5e49d02339c185849992f4d1c49af337ac84933360341e3588100d34664f38"
+url = "https://github.com/charmbracelet/gum/releases/download/v2.0.1/gum_2.0.1_Windows_x86_64.zip"
+url_api = "https://api.github.com/repos/charmbracelet/gum/releases/assets/556563050"
 provenance = "cosign"
 
 [[tools.hadolint]]
@@ -186,6 +186,36 @@ version = "1.58.1"
 backend = "packslip:github.com/jdx/hk"
 specifiers = ["latest"]
 
+[tools.hk."platforms.linux-arm64"]
+checksum = "sha256:0972e05774ea3651fd521676c1bc6411333fe4404beb4a48067e10b54dfd1b4d"
+url = "https://github.com/jdx/hk/releases/download/v1.58.1/hk-aarch64-unknown-linux-gnu.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
+
+[tools.hk."platforms.linux-arm64-musl"]
+checksum = "sha256:a49cc7c21cf914c03fbda6289254bb704d424e91458afd91074f16921f9a5e84"
+url = "https://github.com/jdx/hk/releases/download/v1.58.1/hk-aarch64-unknown-linux-musl.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
+
+[tools.hk."platforms.linux-x64"]
+checksum = "sha256:8139133a70ed7cf1d4a0f2f19c26b1b68d714d81af91b2b1f42c4c524afc0fe5"
+url = "https://github.com/jdx/hk/releases/download/v1.58.1/hk-x86_64-unknown-linux-gnu.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
+
+[tools.hk."platforms.linux-x64-musl"]
+checksum = "sha256:df8a97c000d59756c14096a550d211d7346c41abf2a20d394aaa0d9bc9695ef5"
+url = "https://github.com/jdx/hk/releases/download/v1.58.1/hk-x86_64-unknown-linux-musl.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
+
+[tools.hk."platforms.macos-arm64"]
+checksum = "sha256:5529d95c63ea3ba9318f551e19760998a9ddf7ed926a14daf39dc46717ab32bf"
+url = "https://github.com/jdx/hk/releases/download/v1.58.1/hk-aarch64-apple-darwin.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
+
+[tools.hk."platforms.windows-x64"]
+checksum = "sha256:fb11cf7aa477f3f0546cf66a05ac9a8563322500e5766f63c011ffb97f5c708d"
+url = "https://github.com/jdx/hk/releases/download/v1.58.1/hk-x86_64-pc-windows-msvc.zip"
+signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
+
 [[tools.lychee]]
 version = "0.24.2"
 backend = "aqua:lycheeverse/lychee"
@@ -225,6 +255,39 @@ url_api = "https://api.github.com/repos/lycheeverse/lychee/releases/assets/40995
 checksum = "sha256:32975d1493ee1a975d6bb41e4fb56fe419cb442ded628bb772ba2e614acfacad"
 url = "https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/lycheeverse/lychee/releases/assets/409959491"
+
+[[tools.node]]
+version = "24.21.0"
+backend = "core:node"
+specifiers = ["lts"]
+
+[tools.node."platforms.linux-arm64"]
+checksum = "sha256:724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5"
+url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-arm64.tar.gz"
+
+[tools.node."platforms.linux-arm64-musl"]
+checksum = "sha256:3048b0811e158ca0d8672b59c839861763e144492980d8d29b369dfee45747e4"
+url = "https://unofficial-builds.nodejs.org/download/release/v24.21.0/node-v24.21.0-linux-arm64-musl.tar.gz"
+
+[tools.node."platforms.linux-x64"]
+checksum = "sha256:6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff"
+url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.gz"
+
+[tools.node."platforms.linux-x64-musl"]
+checksum = "sha256:01a713e34da98e7b4d2a3191ee7ca3f93dd0384d1a2ef23c379b2161ee6e133a"
+url = "https://unofficial-builds.nodejs.org/download/release/v24.21.0/node-v24.21.0-linux-x64-musl.tar.gz"
+
+[tools.node."platforms.macos-arm64"]
+checksum = "sha256:bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057"
+url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-arm64.tar.gz"
+
+[tools.node."platforms.macos-x64"]
+checksum = "sha256:1462cb3b3046b815cf8ea436d3da450ec1a9f11dac7e5a46b0ada5305d7e8097"
+url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-x64.tar.gz"
+
+[tools.node."platforms.windows-x64"]
+checksum = "sha256:158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541"
+url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-win-x64.zip"
 
 [[tools.pkl]]
 version = "0.32.1"

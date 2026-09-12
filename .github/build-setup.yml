@@ -1,3 +1,3 @@
 - name: Install cmake
   if: ${{ runner.os == 'Linux' }}
-  run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake
+  run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev

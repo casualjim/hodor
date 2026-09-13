@@ -1,0 +1,3 @@
+# platform.openai.com 403s link checkers (bot-blocked); the pages are fine
+# in a browser, so exclude the host rather than de-linking docs.
+exclude = ["https://platform.openai.com"]

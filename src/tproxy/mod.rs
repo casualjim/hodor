@@ -361,7 +361,7 @@ mod tests {
   }
 
   #[tokio::test]
-  #[ignore = "needs root + HODOR_TEST_TPROXY=1 (mutates host nft rules and routes)"]
+  #[ignore = "needs root (mutates host nft rules and routes)"]
   #[expect(clippy::too_many_lines, reason = "linear live-test script, split would obscure the flow")]
   async fn tproxy_live_tcp_mitm_substitutes() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

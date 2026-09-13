@@ -230,7 +230,8 @@ hodor finds the workspace root by walking up from the working directory. `HODOR_
 | `HODOR_FNOX_CONFIG` | Sets `[fnox] config`. |
 | `HODOR_FNOX_PROFILE` | Sets `[fnox] profile`. |
 | `HODOR_PROJECT_ROOT` | Sets the workspace root. |
-| `HODOR_TUN` | Same as `--tun`. CLI and environment only. |
+| `HODOR_TPROXY` | Same as `--tproxy`. CLI and environment only. |
+| `HODOR_TPROXY_ALLOW_ROOT_NETNS` | Same as `--tproxy-allow-root-netns`: acknowledges unscoped capture rules in the current network namespace. |
 
 hodor validates the config at startup. It rejects two rules that share an env name, an empty `env` or `value`, a malformed allow entry, and a malformed pattern. A `*` host in an allow entry logs a warning that the grant matches any host and the secret is at risk of exfiltration.
 

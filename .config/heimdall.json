@@ -4,7 +4,8 @@
     "filesystem": {
       "deny": [
         "fnox.*",
-        "!~/.docker"
+        "!~/.docker",
+        "!~/.config/hodor"
       ],
       "writable": [
         "~/.cache/hk",
@@ -15,7 +16,8 @@
         "~/.local/state/mise",
         "~/.local/share/mise",
         "~/.local/state/hk",
-        "~/.config/fnox"
+        "~/.config/fnox",
+        "~/.config/hodor"
       ]
     }
   },

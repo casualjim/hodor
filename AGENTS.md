@@ -23,10 +23,9 @@ No `tests/` or `scripts/`. All logic in `src/*.rs`:
 - `src/ca.rs` — `CertAuthority`, `CertCache` (`DashMap`, lazy expiry rotation), `upstream_connector`
 - `src/sni.rs` — `extract_sni`, `MAX_HELLO` 16K
 
-- `src/tun.rs` — `tun` feature only: `TunPhy`, `TcpTracker`, `ChanStream`, `RouteGuard`
-- `.mise/tasks/` — ops scripts (`format`, `build`, `test/_default`, `test/rust`, `test/tun`, `demo`)
-- `integration/` — transparent docker compose demo: client shares hodor's netns (`--tun` capture, no proxy knowledge, fake-only) + bun api (real-token validation, RFC1918 subnet to prove LAN capture); `mise run demo` builds the runtime image and asserts all four substitution/splice scenarios
-+++++++ srvkrtwv 0fea401c "feat(tproxy): kernel TPROXY capture replacing tun, with demo and guard" (rebased revision)
+- `src/tproxy/` — Linux TPROXY: `IP_TRANSPARENT` listener, nft rules over netfilter netlink (`nft.rs`), policy routes (`route.rs`)
+- `.mise/tasks/` — ops scripts (`format`, `build`, `test/_default`, `test/rust`, `test/tproxy`, `demo`)
+- `integration/` — transparent docker compose demo: client shares hodor's netns (`--tproxy` capture, no proxy knowledge, fake-only) + bun api (real-token validation, RFC1918 subnet to prove LAN capture); `mise run demo` builds the runtime image and asserts all four substitution/splice scenarios
 
 - `.github/workflows/` — `ci.yml` (format/clippy/nextest gates), `release.yml` (cargo-dist, generated — do not hand-edit), `release-cut.yml` (version bump + git-cliff + cargo-release), `container.yml` (reusable workflow called by release.yml via `post-announce-jobs`; packs release tarballs into runtime-only image)
 
@@ -36,10 +35,6 @@ Sanctioned path is mise (runs both feature sets):
 
 ```sh
 mise run format   # hk run fix --all, must be green
- mise run test     # nextest default features, then --features tun
- mise run test:tun # live TUN only: needs root, serial
-mise run demo      # docker compose integration demo (builds image, needs docker)
-+++++++ srvkrtwv 0fea401c "feat(tproxy): kernel TPROXY capture replacing tun, with demo and guard" (rebased revision)
 mise run test     # nextest, default features only
 mise run test:tproxy # live TPROXY only: needs root, serial
 mise run demo      # docker compose integration demo (builds image, needs docker)
@@ -83,6 +78,4 @@ Rust-only repo (no Node/Bun). Toolchain Rust 1.98.1 stable via mise; `CARGO_HOME
 
 ## Testing & QA
 
-+++++++ pwpwzprn cae30e67 "chore(mise): restructure task files into namespaced dirs" (rebase destination)
-Framework: `cargo-nextest` over inline `#[cfg(test)] mod tests` per file; `tokio::test` for async; helpers co-located (`MitmFixture` in `proxy.rs`, `test_iface` in `tun.rs`, `lock_env`+`tempdir` in `config.rs`); deps `pretty_assertions`, `tempfile` only. No `tests/` dir, no snapshots, no coverage tooling. Live TUN tests are `#[ignore]`, gated by `HODOR_TEST_TUN=1` + root + `--test-threads=1` (`mise run test:tun`); closest end-to-end proof is `tun_live_tcp_mitm_substitutes` (fake→real→fake).
-Framework: `cargo-nextest` over inline `#[cfg(test)] mod tests` per file; `tokio::test` for async; helpers co-located (`MitmFixture` in `proxy.rs`, `lock_env`+`tempdir` in `config.rs`); deps `pretty_assertions`, `tempfile` only. No `tests/` dir, no snapshots, no coverage tooling. Live TPROXY tests are `#[ignore]`, gated by `HODOR_TEST_TPROXY=1` + root + `--test-threads=1` (`mise run test:tproxy`); closest end-to-end proof is `tproxy_live_tcp_mitm_substitutes` (fake→real→fake).
+Framework: `cargo-nextest` over inline `#[cfg(test)] mod tests` per file; `tokio::test` for async; helpers co-located (`MitmFixture` in `proxy.rs`, `lock_env`+`tempdir` in `config.rs`); deps `pretty_assertions`, `tempfile` only. No `tests/` dir, no snapshots, no coverage tooling. Live TPROXY tests are `#[ignore]`, run explicitly via `mise run test:tproxy` (root + `--test-threads=1`); closest end-to-end proof is `tproxy_live_tcp_mitm_substitutes` (fake→real→fake).

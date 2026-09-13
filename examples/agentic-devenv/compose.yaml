@@ -10,14 +10,12 @@ services:
   hodor:
     # Published by CI: `:main` on every push to main, `:<version>` and
     # `:latest` from the release workflow.
-    image: ${HODOR_IMAGE:-ghcr.io/casualjim/hodor:main}
-    command: ["serve", "--tun", "--config", "/etc/hodor/hodor.toml"]
+    image: ${HODOR_IMAGE:-ghcr.io/casualjim/hodor:latest}
+    command: ["serve", "--tproxy", "--config", "/etc/hodor/hodor.toml"]
     environment:
       RUST_LOG: info
     cap_add:
       - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
     volumes:
       - ./hodor.toml:/etc/hodor/hodor.toml:ro
       # The certificate and the private key, from `hodor ca`.
@@ -34,8 +32,8 @@ services:
     environment:
       # Deterministic decoys from `hodor fake <ENV>`, safe to commit. The real
       # values stay in hodor.toml. Regenerate these after renaming an env var.
-      ANTHROPIC_API_KEY: sk-ant-api03-pS6w5Sc3x3SwKriEaFJ5kBrOfItZzcJDxT4bD0UzQpvsDrhBJXUcSn3PqE0nUBdd
-      GH_TOKEN: ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3
+      ANTHROPIC_API_KEY: sk-ant-api03-JtOeeFZ3iFDI4fYj0lRvy23a5CgePRG73b2hVv7Wx8451W2qaoehoSOkdM9LaqoD
+      GH_TOKEN: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `hodor fake GH_TOKEN`, not a credential # nosemgrep: deterministic decoy from `hodor fake GH_TOKEN`, not a credential
       NODE_EXTRA_CA_CERTS: /etc/hodor-ca/ca.crt
       REQUESTS_CA_BUNDLE: /etc/hodor-ca/ca.crt
       SSL_CERT_FILE: /etc/hodor-ca/ca.crt

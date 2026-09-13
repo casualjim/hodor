@@ -56,7 +56,7 @@ services:
     working_dir: /srv
     command: ["run", "run.ts"]
     environment:
-      HODOR_FAKE: ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3
+      HODOR_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `hodor fake GH_TOKEN`, not a credential
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro

@@ -16,7 +16,6 @@
         "~/.local/state/mise",
         "~/.local/share/mise",
         "~/.local/state/hk",
-        "~/.config/fnox",
         "~/.config/hodor"
       ]
     }

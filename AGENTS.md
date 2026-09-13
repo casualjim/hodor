@@ -16,7 +16,7 @@ No `tests/` or `scripts/`. All logic in `src/*.rs`:
 
 - `src/main.rs` — clap CLI (`serve` default, `fake`, `ca`), wiring
 - `src/config.rs` — confique overlay + rule schema + deterministic fake generator (`fake_for`)
-- `src/secrets.rs` — host registry (`rules/registry.toml` + `<config-dir>/hodor/rules.d`), rule resolution, fnox value lookup
+- `src/secrets.rs` — host registry (`rules/registry.toml` + global `<config-dir>/hodor/rules.d` + project `<root>/.config/hodor/rules.d`), rule resolution, fnox value lookup
 - `src/grants.rs` — `HostPat{Exact,Wildcard,Any}`, `parse_uri_grant` (structure via `url` crate, `*` via placeholder), `uri_match`/`request_match`/`intercept_candidate`/`https_eligible`
 - `src/proxy.rs` — `ProxyState`, `serve`/`handle_conn`/`handle_connect`, `sniff_stream`, `mitm_tls_stream`, `relay_guarded`, `Prefixed`
 - `src/substitute.rs` — `SubMachine`/`AnyMachine`, `SecretsMachine` (HTTP/1), `H2Machine` (hpack frame walker)

@@ -94,22 +94,22 @@ struct NameEntry {
 }
 
 impl Registry {
-  /// Load the bundled table, then every `<rules_dir>/*.toml` in filename order.
+  /// Load the bundled table, then one override directory.
   pub fn load(rules_dir: Option<&Path>) -> eyre::Result<Self> {
+    let dirs = rules_dir.into_iter().collect::<Vec<_>>();
     let mut registry = Self::default();
     registry.apply(BUNDLED, Path::new("<bundled>"))?;
-    let Some(dir) = rules_dir.filter(|dir| dir.is_dir()) else {
-      return Ok(registry);
-    };
-    let mut files = std::fs::read_dir(dir)
-      .wrap_err_with(|| format!("read {}", dir.display()))?
-      .map(|entry| entry.map(|entry| entry.path()).wrap_err_with(|| format!("read {}", dir.display())))
-      .collect::<eyre::Result<Vec<_>>>()?;
-    files.retain(|path| path.extension().is_some_and(|ext| ext == "toml"));
-    files.sort();
-    for path in files {
-      let text = std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
-      registry.apply(&text, &path)?;
+    for dir in dirs.iter().filter(|dir| dir.is_dir()) {
+      let mut files = std::fs::read_dir(dir)
+        .wrap_err_with(|| format!("read {}", dir.display()))?
+        .map(|entry| entry.map(|entry| entry.path()).wrap_err_with(|| format!("read {}", dir.display())))
+        .collect::<eyre::Result<Vec<_>>>()?;
+      files.retain(|path| path.extension().is_some_and(|ext| ext == "toml"));
+      files.sort();
+      for path in files {
+        let text = std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
+        registry.apply(&text, &path)?;
+      }
     }
     Ok(registry)
   }
@@ -233,7 +233,8 @@ impl Registry {
 }
 
 /// Opened fnox handle plus the names it declares.
-struct FnoxSource {
+#[derive(Clone, Debug)]
+pub(crate) struct FnoxSource {
   fnox: fnox_core::Fnox,
   declared: BTreeSet<String>,
 }
@@ -248,29 +249,27 @@ fn discovered_or_none(found: fnox_core::Result<fnox_core::Fnox>) -> eyre::Result
 }
 
 impl FnoxSource {
-  /// Open fnox, or `None` when discovery finds no config at all.
-  fn open(cfg: &crate::config::FnoxCfg) -> eyre::Result<Option<Self>> {
-    let fnox = match &cfg.config {
-      Some(path) => Some(fnox_core::Fnox::open(path).wrap_err_with(|| format!("fnox config {}", path.display()))?),
-      None => discovered_or_none(fnox_core::Fnox::discover())?,
-    };
+  /// Open fnox via its own discovery, or `None` when no config exists.
+  pub(crate) fn open() -> eyre::Result<Option<Self>> {
+    let fnox = discovered_or_none(fnox_core::Fnox::discover())?;
     let Some(fnox) = fnox else {
       return Ok(None);
     };
-    let fnox = match cfg.profile.as_deref() {
-      Some(profile) => {
-        let profiles = profile
-          .split(',')
-          .map(str::trim)
-          .filter(|profile| !profile.is_empty())
-          .map(str::to_string)
-          .collect::<Vec<_>>();
-        fnox.with_profiles(profiles)
-      }
-      None => fnox,
-    };
     let declared = fnox.list().wrap_err("fnox: cannot list secrets")?.into_iter().collect();
     Ok(Some(Self { fnox, declared }))
+  }
+
+  /// Open fnox at an explicit config path; test injection point.
+  #[cfg(test)]
+  fn open_at(path: &Path) -> eyre::Result<Self> {
+    let fnox = fnox_core::Fnox::open(path).wrap_err_with(|| format!("fnox config {}", path.display()))?;
+    let declared = fnox.list().wrap_err("fnox: cannot list secrets")?.into_iter().collect();
+    Ok(Self { fnox, declared })
+  }
+
+  /// Names fnox declares, sorted.
+  pub(crate) fn declared(&self) -> &BTreeSet<String> {
+    &self.declared
   }
 
   /// Value for one key: `None` when fnox does not declare it, error when a
@@ -287,6 +286,17 @@ impl FnoxSource {
   }
 }
 
+/// Env names fnox declares that the registry knows, sorted; `None` yields none.
+pub(crate) fn selected_envs(fnox: Option<&FnoxSource>, registry: &Registry) -> Vec<String> {
+  let Some(fnox) = fnox else { return Vec::new() };
+  fnox
+    .declared()
+    .iter()
+    .filter(|name| registry.lookup(name).is_some())
+    .cloned()
+    .collect()
+}
+
 /// fnox secret name for one rule: `fnox_key`, else `env`.
 fn fnox_key(rule: &RuleCfg) -> String {
   rule.fnox_key.clone().unwrap_or_else(|| rule.env.clone())
@@ -295,10 +305,7 @@ fn fnox_key(rule: &RuleCfg) -> String {
 /// Resolve every rule in place: fetch values from fnox when no inline value
 /// is present, union registry hosts into `allow`, fill the decoy pattern, and
 /// drop rules that `if_missing` lets go.
-pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry) -> eyre::Result<()> {
-  let needs_fnox = config.rules.values().any(|rule| rule.value.is_none());
-  let fnox = if needs_fnox { FnoxSource::open(&config.fnox)? } else { None };
-
+pub async fn resolve(config: &mut crate::config::AppConfig, registry: &Registry, fnox: Option<FnoxSource>) -> eyre::Result<()> {
   // Values are fetched before the map is mutated, so rules stay borrowed
   // immutably while fnox is awaited.
   let keys = config
@@ -457,6 +464,10 @@ mod tests {
       "MONGODB_ATLAS_PRIVATE_API_KEY",
       "SUPABASE_SERVICE_ROLE_KEY",
       "SHOP_TOKEN",
+      "DEEPSEEK_API_KEY",
+      "OPENROUTER_API_KEY",
+      "TURSO_PLATFORM_TOKEN",
+      "GITEA_TOKEN",
     ] {
       let known = registry
         .lookup(env)
@@ -727,7 +738,7 @@ hosts = ["https://api.example/path"]
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
       },
-      fnox: crate::config::FnoxCfg::default(),
+      workspace: crate::config::WorkspaceCfg::default(),
       rules: BTreeMap::new(),
     };
     config.rules.insert(label.to_string(), rule);
@@ -740,7 +751,7 @@ hosts = ["https://api.example/path"]
     let mut rule = rule("GITHUB_TOKEN");
     rule.allow = vec!["https://ghe.corp.example".to_string()];
     let mut config = config_with("gh", rule);
-    resolve(&mut config, &registry).await.unwrap();
+    resolve(&mut config, &registry, None).await.unwrap();
     let allow = &config.rules["gh"].allow;
     assert!(allow.contains(&"https://api.github.com".to_string()));
     assert!(allow.contains(&"https://ghe.corp.example".to_string()));
@@ -754,7 +765,7 @@ hosts = ["https://api.example/path"]
     rule.registry = Some(false);
     rule.allow = vec!["https://ghe.corp.example".to_string()];
     let mut config = config_with("gh", rule);
-    resolve(&mut config, &registry).await.unwrap();
+    resolve(&mut config, &registry, None).await.unwrap();
     assert_eq!(config.rules["gh"].allow, vec!["https://ghe.corp.example".to_string()]);
   }
 
@@ -762,7 +773,7 @@ hosts = ["https://api.example/path"]
   async fn resolve_fills_the_pattern_from_the_registry() {
     let registry = Registry::load(None).unwrap();
     let mut config = config_with("gh", rule("GITHUB_TOKEN"));
-    resolve(&mut config, &registry).await.unwrap();
+    resolve(&mut config, &registry, None).await.unwrap();
     assert_eq!(config.rules["gh"].pattern.as_deref(), Some("ghp_{hex:40}"));
   }
 
@@ -772,7 +783,7 @@ hosts = ["https://api.example/path"]
     let mut rule = rule("GITHUB_TOKEN");
     rule.pattern = Some("ghp_custom_{hex:8}".to_string());
     let mut config = config_with("gh", rule);
-    resolve(&mut config, &registry).await.unwrap();
+    resolve(&mut config, &registry, None).await.unwrap();
     assert_eq!(config.rules["gh"].pattern.as_deref(), Some("ghp_custom_{hex:8}"));
   }
 
@@ -782,7 +793,7 @@ hosts = ["https://api.example/path"]
     let mut rule = rule("GITHUB_TOKEN");
     rule.pattern = Some(String::new());
     let mut config = config_with("gh", rule);
-    resolve(&mut config, &registry).await.unwrap();
+    resolve(&mut config, &registry, None).await.unwrap();
     assert_eq!(config.rules["gh"].pattern.as_deref(), Some("ghp_{hex:40}"));
   }
 
@@ -790,7 +801,7 @@ hosts = ["https://api.example/path"]
   async fn missing_hosts_error_by_default() {
     let registry = Registry::load(None).unwrap();
     let mut config = config_with("unknown", rule("NO_SUCH_SERVICE_TOKEN"));
-    let err = resolve(&mut config, &registry).await.unwrap_err();
+    let err = resolve(&mut config, &registry, None).await.unwrap_err();
     assert!(err.to_string().contains("no hosts"), "{err:?}");
   }
 
@@ -800,7 +811,7 @@ hosts = ["https://api.example/path"]
     let mut rule = rule("NO_SUCH_SERVICE_TOKEN");
     rule.if_missing = crate::config::IfMissing::Warn;
     let mut config = config_with("unknown", rule);
-    resolve(&mut config, &registry).await.unwrap();
+    resolve(&mut config, &registry, None).await.unwrap();
     assert!(config.rules.is_empty());
   }
 
@@ -810,7 +821,7 @@ hosts = ["https://api.example/path"]
     let mut rule = rule("NO_SUCH_SERVICE_TOKEN");
     rule.if_missing = crate::config::IfMissing::Ignore;
     let mut config = config_with("unknown", rule);
-    resolve(&mut config, &registry).await.unwrap();
+    resolve(&mut config, &registry, None).await.unwrap();
     assert!(config.rules.is_empty());
   }
 
@@ -827,13 +838,21 @@ provider = "plain"
 value = "other-real-token"
 "#;
 
+  #[tokio::test]
+  async fn selected_envs_intersects_fnox_with_the_registry() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fnox(dir.path(), FNOX_PLAIN);
+    let fnox = FnoxSource::open_at(&path).unwrap();
+    assert_eq!(selected_envs(Some(&fnox), &registry), vec!["GITHUB_TOKEN".to_string()]);
+    assert!(selected_envs(None, &registry).is_empty());
+  }
+
   /// Config whose only rule pulls its value from the temp fnox file.
-  fn config_with_fnox(label: &str, env: &str, fnox_path: &Path) -> crate::config::AppConfig {
+  fn config_with_fnox(label: &str, env: &str) -> crate::config::AppConfig {
     let mut rule = rule(env);
     rule.value = None;
-    let mut config = config_with(label, rule);
-    config.fnox.config = Some(fnox_path.to_path_buf());
-    config
+    config_with(label, rule)
   }
 
   fn write_fnox(dir: &Path, body: &str) -> PathBuf {
@@ -847,8 +866,9 @@ value = "other-real-token"
     let registry = Registry::load(None).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
-    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &fnox_path);
-    resolve(&mut config, &registry).await.unwrap();
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN");
+    let fnox = FnoxSource::open_at(&fnox_path).unwrap();
+    resolve(&mut config, &registry, Some(fnox)).await.unwrap();
     let value = config.rules["gh"].value.as_ref().unwrap();
     assert_eq!(secrecy::ExposeSecret::expose_secret(value), "real-github-token");
   }
@@ -858,9 +878,10 @@ value = "other-real-token"
     let registry = Registry::load(None).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
-    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &fnox_path);
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN");
     config.rules.get_mut("gh").unwrap().value = Some(secrecy::SecretString::from("inline-wins"));
-    resolve(&mut config, &registry).await.unwrap();
+    let fnox = FnoxSource::open_at(&fnox_path).unwrap();
+    resolve(&mut config, &registry, Some(fnox)).await.unwrap();
     let value = config.rules["gh"].value.as_ref().unwrap();
     assert_eq!(secrecy::ExposeSecret::expose_secret(value), "inline-wins");
   }
@@ -870,9 +891,10 @@ value = "other-real-token"
     let registry = Registry::load(None).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
-    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &fnox_path);
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN");
     config.rules.get_mut("gh").unwrap().fnox_key = Some("OTHER_TOKEN".to_string());
-    resolve(&mut config, &registry).await.unwrap();
+    let fnox = FnoxSource::open_at(&fnox_path).unwrap();
+    resolve(&mut config, &registry, Some(fnox)).await.unwrap();
     let value = config.rules["gh"].value.as_ref().unwrap();
     assert_eq!(secrecy::ExposeSecret::expose_secret(value), "other-real-token");
   }
@@ -882,25 +904,26 @@ value = "other-real-token"
     let registry = Registry::load(None).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
-    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &fnox_path);
+    let mut config = config_with_fnox("gh", "GITHUB_TOKEN");
     config.rules.get_mut("gh").unwrap().fnox_key = Some("NOT_DECLARED".to_string());
+    let fnox = FnoxSource::open_at(&fnox_path).unwrap();
 
     let mut strict = config.clone();
-    let err = resolve(&mut strict, &registry).await.unwrap_err();
+    let err = resolve(&mut strict, &registry, Some(fnox.clone())).await.unwrap_err();
     assert!(err.to_string().contains("fnox does not declare"), "{err:?}");
 
     let mut lenient = config;
     lenient.rules.get_mut("gh").unwrap().if_missing = crate::config::IfMissing::Warn;
-    resolve(&mut lenient, &registry).await.unwrap();
+    resolve(&mut lenient, &registry, Some(fnox)).await.unwrap();
     assert!(lenient.rules.is_empty());
   }
 
   #[tokio::test]
   async fn missing_fnox_config_file_is_an_error() {
-    let registry = Registry::load(None).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = config_with_fnox("gh", "GITHUB_TOKEN", &dir.path().join("absent.toml"));
-    let err = resolve(&mut config, &registry).await.unwrap_err();
+    let err = match FnoxSource::open_at(std::path::Path::new("/nonexistent/hodor-absent-fnox.toml")) {
+      Err(err) => err,
+      Ok(source) => panic!("expected an error, got {source:?}"),
+    };
     assert!(err.to_string().contains("fnox"), "{err:?}");
     // The io error stays attached as the source of the fnox context.
     assert!(format!("{err:?}").contains("Caused by"), "{err:?}");
@@ -941,8 +964,8 @@ value = ""
       rule.fnox_key = Some("DECLARED_BUT_UNRESOLVABLE".to_string());
       rule.if_missing = if_missing;
       let mut config = config_with("gh", rule);
-      config.fnox.config = Some(fnox_path.clone());
-      let err = resolve(&mut config, &registry).await.unwrap_err();
+      let fnox = FnoxSource::open_at(&fnox_path).unwrap();
+      let err = resolve(&mut config, &registry, Some(fnox)).await.unwrap_err();
       assert!(err.to_string().contains("DECLARED_BUT_UNRESOLVABLE"), "{if_missing:?}: {err:?}");
     }
   }
@@ -962,8 +985,8 @@ value = ""
       rule.fnox_key = Some("DECLARED_BUT_EMPTY".to_string());
       rule.if_missing = if_missing;
       let mut config = config_with("gh", rule);
-      config.fnox.config = Some(fnox_path.clone());
-      let err = resolve(&mut config, &registry).await.unwrap_err();
+      let fnox = FnoxSource::open_at(&fnox_path).unwrap();
+      let err = resolve(&mut config, &registry, Some(fnox)).await.unwrap_err();
       assert!(err.to_string().contains("DECLARED_BUT_EMPTY"), "{if_missing:?}: {err:?}");
       assert!(err.to_string().contains("empty"), "{if_missing:?}: {err:?}");
     }
@@ -972,10 +995,8 @@ value = ""
   #[tokio::test]
   async fn all_inline_values_never_open_fnox() {
     let registry = Registry::load(None).unwrap();
-    let dir = tempfile::tempdir().unwrap();
     let mut config = config_with("gh", rule("GITHUB_TOKEN"));
-    config.fnox.config = Some(dir.path().join("absent.toml"));
-    resolve(&mut config, &registry).await.unwrap();
+    resolve(&mut config, &registry, None).await.unwrap();
     assert!(config.rules["gh"].value.is_some());
   }
 

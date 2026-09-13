@@ -1,8 +1,22 @@
+## [0.1.13] - 2026-09-13
+
+### 🚀 Features
+
+- *(tproxy)* Kernel TPROXY capture replacing tun, with demo and guard
+
+### ⚙️ Miscellaneous Tasks
+
+- *(mise)* Restructure task files into namespaced dirs
 ## [0.1.12] - 2026-09-12
 
 ### 🐛 Bug Fixes
 
 - *(dist)* Install libudev-dev in the dist build setup
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.12 [ci skip]
+- Release hodor version 0.1.12
 ## [0.1.11] - 2026-09-12
 
 ### 🚀 Features

@@ -8,5 +8,5 @@ cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
+cargo nextest run --cargo-quiet --workspace --show-progress=bar --status-level=slow "$@"
 cargo nextest run --cargo-quiet --show-progress=bar --status-level=slow "$@"
-cargo nextest run --cargo-quiet --show-progress=bar --status-level=slow --features tun "$@"

@@ -1,7 +1,7 @@
 name: hodor-integration
 
 # Transparent capture topology: the client container shares hodor's network
-# namespace (network_mode: service:hodor). hodor runs --tun and installs its
+# namespace (network_mode: service:hodor). hodor runs --tproxy and installs its
 # policy routing inside that shared netns, so every client connection is
 # captured without any proxy configuration on the client — LAN included.
 # hodor's marked upstream dials bypass the capture (fwmark rule).
@@ -18,14 +18,12 @@ services:
     build:
       context: ./docker
       dockerfile: ../../Dockerfile
-    command: ["serve", "--tun", "--config", "/etc/hodor/hodor.toml"]
+    command: ["serve", "--tproxy", "--config", "/etc/hodor/hodor.toml"]
     environment:
       RUST_LOG: debug
     stop_grace_period: 1s
     cap_add:
       - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
     volumes:
       - ./hodor.toml:/etc/hodor/hodor.toml:ro
       - certs:/certs:ro

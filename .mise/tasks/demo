@@ -7,7 +7,7 @@ cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
-mise run build -- --release --features tun
+mise run build -- --release
 mkdir -p integration/docker
 cp target/release/hodor integration/docker/hodor
 

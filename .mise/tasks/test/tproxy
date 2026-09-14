@@ -25,11 +25,11 @@ if [ ${#filters[@]} -eq 0 ]; then
 fi
 
 if [ "${usage_use_sudo:-false}" = "true" ]; then
-  sudo env HODOR_TEST_TPROXY=1 "$test_bin" --test-threads=1 --ignored "${filters[@]}"
+  sudo "$test_bin" --test-threads=1 --ignored "${filters[@]}"
 else
   if ! gum confirm "TPROXY tests need root; escalate with sudo?"; then
     echo "escalation declined; test binary: $test_bin" >&2
     exit 1
   fi
-  sudo env HODOR_TEST_TPROXY=1 "$test_bin" --test-threads=1 --ignored "${filters[@]}"
+  sudo "$test_bin" --test-threads=1 --ignored "${filters[@]}"
 fi

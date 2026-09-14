@@ -20,6 +20,7 @@ allow-branch = ["main"]
 pre-release-commit-message = "chore: Release {{crate_name}} version {{version}}"
 
 [dependencies]
+base62 = "2.0"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 code-workspace = "0.1.4"
@@ -30,6 +31,7 @@ eyre = "0.6"
 fnox-core = "1.33"
 futures-sink = "0.3"
 futures-util = "0.3.34"
+hex = "0.4"
 httlib-hpack = "0.1.3"
 httparse = "1"
 keepass = "=0.13.22" # pinned: 0.13.23+ ships an upper-bound-only aes range that resolves to aes 0.8.4 and breaks the cbc/cipher traits; see README
@@ -46,6 +48,7 @@ rustls-native-certs = "0.8"
 rustls-pki-types = "1"
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
 sha2 = "0.10"
 socket2 = "0.6"
 time = "=0.3.47" # pinned: rama main requires exactly 0.3.47; bump together with Cargo.lock's rama rev

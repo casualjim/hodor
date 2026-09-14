@@ -135,10 +135,6 @@ A rule wires an environment name to the hosts it may reach, the decoy shape the 
 `[rules.<label>]` replaces the old `[secrets.<label>]` table. A leftover `[secrets]` table is ignored silently, with no migration shim, so rename it to `[rules]`.
 
 ```toml
-[fnox]
-config  = "fnox.toml"   # optional; default is fnox's own discovery
-profile = "work"        # optional; default is FNOX_PROFILE
-
 [rules.gh]
 env        = "GITHUB_TOKEN"        # required: decoy seed, registry key, fnox key
 value      = "..."                 # optional: inline real value
@@ -153,7 +149,7 @@ if_missing = "error"               # "error" (default) | "warn" | "ignore"
 
 ## Known-host registry
 
-hodor ships a table of known services in `rules/registry.toml`: the environment names each one uses, its API hosts, and its token shape. Override it from `<config-dir>/hodor/rules.d/*.toml` (beside the global config file), loaded in filename order:
+hodor ships a table of known services in `rules/registry.toml`: the environment names each one uses, its API hosts, and its token shape. Override it from the global `<config-dir>/hodor/rules.d/*.toml` (beside the global config file) or the project `<project-root>/.config/hodor/rules.d/*.toml`, both loaded in filename order; project entries override global ones, which override the bundled table:
 
 ```toml
 [providers.github]
@@ -173,7 +169,7 @@ hosts = ["https://ghe.corp.example"]
 
 When a rule has no inline `value`, hodor resolves it through [fnox](https://fnox.jdx.dev), which reaches age, 1Password, AWS Secrets Manager, Vault, Bitwarden, the OS keychain, and the rest of its provider catalog. hodor embeds `fnox-core`; no fnox binary is needed.
 
-The fnox config is `[fnox].config`, else `HODOR_FNOX_CONFIG`, else whatever fnox's own discovery finds: an upward `fnox.toml` walk layered over fnox's global config. A key fnox does not declare follows the rule's `if_missing`; a key it declares but cannot resolve is a startup error.
+The fnox source is whatever fnox's own discovery finds from the working directory: an upward `fnox.toml` walk layered over fnox's global config, per workspace. A key fnox does not declare follows the rule's `if_missing`; a key it declares but cannot resolve is a startup error.
 
 Embedding `fnox-core` brings rustls's `ring` feature into the build, so both crypto backends are compiled and `ClientConfig::builder()` can no longer select a provider on its own. Any new entry point must call `ca::install_crypto_provider()` first, exactly as `main` does.
 
@@ -184,11 +180,11 @@ Embedding `fnox-core` brings rustls's `ring` feature into the build, so both cry
 hodor reads four layers. A higher layer wins.
 
 1. CLI flags, `--listen`, `--ca-file`, and `--config`.
-2. Environment variables, `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_FNOX_CONFIG`, `HODOR_FNOX_PROFILE`, `HODOR_PROJECT_ROOT`, and `HODOR_TPROXY`.
+2. Environment variables, `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, and `HODOR_TPROXY`.
 3. The project file at `<workspace root>/.config/hodor.toml`.
 4. The global file at `$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`.
 
-hodor finds the workspace root by walking up from the working directory. `HODOR_PROJECT_ROOT` sets the root directly and skips the walk. `--config <FILE>` replaces the project file.
+hodor finds the workspace root by walking up from the working directory. `--config <FILE>` replaces the project file.
 
 `[rules]` merges by label. If the project file and the global file both define `[rules.demo]`, the project entry replaces the global entry.
 
@@ -213,13 +209,6 @@ hodor finds the workspace root by walking up from the working directory. `HODOR_
 | `registry` | no | Whether this rule uses registry hosts. Default `true`. |
 | `if_missing` | no | `error` (default), `warn`, or `ignore`. |
 
-`[fnox]`:
-
-| Key | Default | Environment | Purpose |
-| --- | --- | --- | --- |
-| `config` | fnox discovery | `HODOR_FNOX_CONFIG` | Path to the fnox config file. |
-| `profile` | fnox's `FNOX_PROFILE` | `HODOR_FNOX_PROFILE` | Comma-separated fnox profile list. |
-
 `HODOR_*` environment variables:
 
 | Variable | Effect |
@@ -227,10 +216,8 @@ hodor finds the workspace root by walking up from the working directory. `HODOR_
 | `HODOR_LISTEN` | Sets `[proxy] listen`. |
 | `HODOR_CA_FILE` | Sets `[proxy] ca_file`. |
 | `HODOR_CONFIG` | Sets the global config file path. |
-| `HODOR_FNOX_CONFIG` | Sets `[fnox] config`. |
-| `HODOR_FNOX_PROFILE` | Sets `[fnox] profile`. |
-| `HODOR_PROJECT_ROOT` | Sets the workspace root. |
-| `HODOR_TUN` | Same as `--tun`. CLI and environment only. |
+| `HODOR_TPROXY` | Same as `--tproxy`. CLI and environment only. |
+| `HODOR_TPROXY_ALLOW_ROOT_NETNS` | Same as `--tproxy-allow-root-netns`: acknowledges unscoped capture rules in the current network namespace. |
 
 hodor validates the config at startup. It rejects two rules that share an env name, an empty `env` or `value`, a malformed allow entry, and a malformed pattern. A `*` host in an allow entry logs a warning that the grant matches any host and the secret is at risk of exfiltration.
 
@@ -266,10 +253,10 @@ hodor fake DEMO_TOKEN
 # fd0c437df7ae3abca3e37d89840b4503
 
 hodor fake GH_TOKEN
-# ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3
+# ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142
 
 hodor fake ANTHROPIC_API_KEY
-# sk-ant-api03-pS6w5Sc3x3SwKriEaFJ5kBrOfItZzcJDxT4bD0UzQpvsDrhBJXUcSn3PqE0nUBdd
+# sk-ant-api03-JtOeeFZ3iFDI4fYj0lRvy23a5CgePRG73b2hVv7Wx8451W2qaoehoSOkdM9LaqoD
 ```
 
 Use `--pattern` to override the registry. The pattern verbs are `{hex:N}`, `{d:N}`, and `{base62:N}`, where N is greater than zero. Literal text passes through, so a pattern can carry any prefix. hodor rejects any other verb at startup.

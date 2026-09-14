@@ -6,6 +6,7 @@
 //! else splices through byte-identical.
 
 mod ca;
+mod compose;
 mod config;
 mod grants;
 mod proxy;
@@ -47,6 +48,36 @@ pub enum Command {
   /// The printed PEM is the trust anchor to install into workload
   /// containers; the private key stays in the CA file and in `ca.key`.
   Ca,
+  /// Print `[rules.*]` for the secrets this workspace can get (fnox ∩ registry).
+  Rules,
+  /// Confine a workspace: generate its stack once as an editable file, then
+  /// start and stop the layered docker compose project.
+  Confine(ConfineArgs),
+}
+
+/// Arguments for [`Command::Confine`].
+#[derive(clap::Args, Debug, Clone)]
+pub struct ConfineArgs {
+  /// What to do with the confined workspace.
+  #[command(subcommand)]
+  pub action: ConfineAction,
+  /// Workspace directory; defaults to the current directory.
+  pub workspace: Option<PathBuf>,
+}
+
+/// What to do with the confined workspace.
+#[derive(Subcommand, Debug, Clone)]
+pub enum ConfineAction {
+  /// Generate the workspace stack into
+  /// `<state-dir>/hodor/ws/<slug>/stack.yml` if absent; existing files are
+  /// left untouched so edits survive.
+  Init,
+  /// Start the layered compose project from the files on disk.
+  Up,
+  /// Stop the layered compose project.
+  Down,
+  /// Enter the agent environment in the translated workspace directory.
+  Shell,
 }
 
 /// Arguments for [`Command::Serve`].
@@ -119,6 +150,14 @@ async fn main() -> eyre::Result<()> {
       print!("{}", String::from_utf8_lossy(&ca.cert_pem()));
       Ok(())
     }
+    Command::Rules => {
+      print!("{}", compose::rules_command()?);
+      Ok(())
+    }
+    Command::Confine(args) => {
+      let workspace = args.workspace.clone().unwrap_or_else(|| PathBuf::from("."));
+      compose::confine_command(&args.action, &workspace)
+    }
     Command::Serve(args) => {
       #[cfg(not(target_os = "linux"))]
       if args.tproxy {
@@ -126,7 +165,9 @@ async fn main() -> eyre::Result<()> {
       }
       let (mut config, workspace) = config::load(&cli)?;
       let registry = secrets::Registry::load(config::rules_dir().as_deref())?;
-      secrets::resolve(&mut config, &registry).await?;
+      let needs_fnox = config.rules.values().any(|rule| rule.value.is_none());
+      let fnox = if needs_fnox { secrets::FnoxSource::open()? } else { None };
+      secrets::resolve(&mut config, &registry, fnox).await?;
       let resolved = grants::resolve(&config)?;
       if let Some(ws) = &workspace {
         tracing::info!(

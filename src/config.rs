@@ -16,22 +16,42 @@ use code_workspace::{Workspace, resolve_root};
 
 /// Pattern used when neither the rule nor the registry supplies one.
 pub const DEFAULT_PATTERN: &str = "{hex:32}";
-const BASE62: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// Runtime config: listener settings, fnox settings, plus rules by label.
+/// Runtime config: listener settings, workspace mounts, plus rules by label.
 #[derive(confique::Config, Debug, Clone, Serialize)]
 pub struct AppConfig {
   /// Proxy listener settings.
   #[config(nested)]
   pub proxy: ProxyCfg,
-  /// fnox integration settings.
+  /// Workspace settings for generated compose output.
   #[config(nested)]
-  pub fnox: FnoxCfg,
+  pub workspace: WorkspaceCfg,
   /// Rules by label; merged per label across global + project files.
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
   pub rules: BTreeMap<String, RuleCfg>,
+}
+
+/// Extra host paths the generated agent service mounts, translated into the
+/// container home; overlapping paths reuse the covering mount.
+#[derive(confique::Config, Debug, Clone, Default, Serialize)]
+pub struct WorkspaceCfg {
+  /// Compose project name for the generated stack; defaults to the
+  /// workspace slug.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub name: Option<String>,
+  /// Shell invoked by `hodor confine shell`; defaults to sh.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub shell: Option<String>,
+  /// Paths included in the generated compose; `~` expands, relative paths
+  /// resolve against the workspace root.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub include: Vec<PathBuf>,
+  /// `$HOME` inside the agent container; host paths under the host home
+  /// translate into this prefix, others mount at their own path.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub home: Option<String>,
 }
 /// Proxy listener settings (CLI/env/file overlay).
 #[derive(confique::Config, Clone, Debug, Serialize)]
@@ -87,19 +107,6 @@ pub enum IfMissing {
   Ignore,
 }
 
-/// fnox integration: config path and profile.
-#[derive(confique::Config, Clone, Debug, Default, Serialize)]
-pub struct FnoxCfg {
-  /// Explicit fnox config path; default is fnox's own discovery.
-  #[config(env = "HODOR_FNOX_CONFIG")]
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub config: Option<PathBuf>,
-  /// fnox profile list, comma-separated; default is `FNOX_PROFILE`.
-  #[config(env = "HODOR_FNOX_PROFILE")]
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub profile: Option<String>,
-}
-
 /// Load config with precedence CLI > env > project > global.
 /// Returns the config plus the discovered workspace (`None` when no
 /// workspace marker was found and no explicit root was given).
@@ -110,11 +117,10 @@ pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
     cli_layer.proxy = args.proxy.clone();
   }
 
-  let explicit_root = env::var("HODOR_PROJECT_ROOT").ok().map(PathBuf::from);
   let mut builder = AppConfig::builder().preloaded(cli_layer).env();
   let project = match &cli.config {
     Some(path) => Some(path.clone()),
-    None => discover_project_config(explicit_root.as_deref(), &cwd),
+    None => discover_project_config(&cwd),
   };
   if let Some(path) = &project
     && path.exists()
@@ -137,20 +143,14 @@ pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
   config.rules = load_merged_rules(project.as_deref(), global.as_deref())?;
   config.validate()?;
 
-  let workspace = match explicit_root {
-    Some(root) => Some(Workspace::from_root(&root).map_err(|err| eyre::eyre!("bad HODOR_PROJECT_ROOT {}: {err}", root.display()))?),
-    None => resolve_root(None, &cwd).ok().and_then(|root| Workspace::from_root(&root).ok()),
-  };
+  let workspace = resolve_root(None, &cwd).ok().and_then(|root| Workspace::from_root(&root).ok());
   Ok((config, workspace))
 }
 
-/// Locate the project-layer file: explicit root wins without a walk,
-/// otherwise resolve the workspace root upward from `start`.
-pub fn discover_project_config(explicit: Option<&Path>, start: &Path) -> Option<PathBuf> {
-  let root = match explicit {
-    Some(root) => root.to_path_buf(),
-    None => resolve_root(None, start).ok()?,
-  };
+/// Locate the project-layer file: resolve the workspace root upward from
+/// `start`, then check `<root>/.config/hodor.toml`.
+pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
+  let root = resolve_root(None, start).ok()?;
   let path = root.join(".config").join("hodor.toml");
   path.exists().then_some(path)
 }
@@ -244,7 +244,7 @@ impl AppConfig {
 /// through `secrets::Registry::decoy`, and `DEFAULT_PATTERN` is the floor.
 pub fn fake_for(env_name: &str, pattern: Option<&str>) -> String {
   let template = pattern.filter(|pattern| !pattern.is_empty()).unwrap_or(DEFAULT_PATTERN);
-  let seed = hex_string(&Sha256::digest(env_name.as_bytes()));
+  let seed = hex::encode(Sha256::digest(env_name.as_bytes()));
   render_template(template, &seed)
 }
 /// Validate an explicit `pattern` template: every `{...}` must be a known
@@ -341,27 +341,27 @@ fn render_template(template: &str, seed: &str) -> String {
   out
 }
 
-/// Render `count` chars of `verb` from `seed`. Only [`Verb`] reaches here,
-/// so every arm is reachable and no fallback exists.
+/// Render `count` chars of `verb` from `seed`. Every encoding is a library
+/// call: `hex::encode`, `base62::encode`, or std `Display` for decimal.
 fn fill_verb(seed: &str, verb: Verb, count: usize) -> String {
   let mut out = String::with_capacity(count);
-  for i in 0..count {
-    let digest = Sha256::digest(format!("{}:{}:{i}", seed, verb.tag()).as_bytes());
-    let word = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+  let mut index = 0;
+  while out.len() < count {
+    let digest = Sha256::digest(format!("{}:{}:{index}", seed, verb.tag()).as_bytes());
     match verb {
-      Verb::Hex => out.push(char::from_digit(u32::from(digest[0] >> 4), 16).unwrap_or('0')),
-      Verb::Decimal => out.push((b'0' + (word % 10) as u8) as char),
-      Verb::Base62 => out.push(BASE62[(word % 62) as usize] as char),
+      Verb::Hex => out.push_str(&hex::encode(digest)),
+      Verb::Decimal => {
+        let word = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        out.push_str(&word.to_string());
+      }
+      Verb::Base62 => {
+        let word: [u8; 16] = digest[0..16].try_into().expect("16 digest bytes");
+        out.push_str(&base62::encode(u128::from_be_bytes(word)));
+      }
     }
+    index += 1;
   }
-  out
-}
-fn hex_string(bytes: &[u8]) -> String {
-  let mut out = String::with_capacity(bytes.len() * 2);
-  for byte in bytes {
-    out.push(HEX[(byte >> 4) as usize] as char);
-    out.push(HEX[(byte & 0xf) as usize] as char);
-  }
+  out.truncate(count);
   out
 }
 
@@ -380,14 +380,7 @@ mod tests {
   }
 
   fn scrub_env() {
-    for key in [
-      "HODOR_CONFIG",
-      "HODOR_PROJECT_ROOT",
-      "HODOR_LISTEN",
-      "HODOR_CA_FILE",
-      "HODOR_FNOX_CONFIG",
-      "HODOR_FNOX_PROFILE",
-    ] {
+    for key in ["HODOR_CONFIG", "HODOR_LISTEN", "HODOR_CA_FILE"] {
       // SAFETY: test-only mutation, serialized by ENV_LOCK.
       unsafe { env::remove_var(key) };
     }
@@ -409,6 +402,23 @@ mod tests {
 
   fn cli_for(argv: &[&str]) -> Cli {
     Cli::try_parse_from(argv).unwrap()
+  }
+
+  /// Enter `dir` as the process cwd, restoring the previous one on drop.
+  struct CwdGuard(PathBuf);
+
+  impl CwdGuard {
+    fn enter(dir: &Path) -> Self {
+      let previous = env::current_dir().unwrap();
+      env::set_current_dir(dir).unwrap();
+      Self(previous)
+    }
+  }
+
+  impl Drop for CwdGuard {
+    fn drop(&mut self) {
+      env::set_current_dir(&self.0).unwrap();
+    }
   }
 
   #[test]
@@ -450,7 +460,10 @@ allow = ["https://c.example"]
 "#,
     );
     set_env("HODOR_CONFIG", &global);
-    set_env("HODOR_PROJECT_ROOT", &project_root);
+    let nested = project_root.join("crates").join("inner");
+    write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
+    std::fs::create_dir_all(&nested).unwrap();
+    let _cwd = CwdGuard::enter(&nested);
     let cli = cli_for(&["hodor", "serve"]);
     let (config, _ws) = load(&cli).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:2222");
@@ -473,7 +486,10 @@ allow = ["https://c.example"]
       "[proxy]\nlisten = \"127.0.0.1:2222\"\n",
     );
     set_env("HODOR_CONFIG", &global);
-    set_env("HODOR_PROJECT_ROOT", &project_root);
+    let nested = project_root.join("crates").join("inner");
+    write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
+    std::fs::create_dir_all(&nested).unwrap();
+    let _cwd = CwdGuard::enter(&nested);
     // project beats global
     let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:2222");
@@ -497,7 +513,9 @@ allow = ["https://c.example"]
     write_file(&global, "[proxy]\nlisten = \"127.0.0.1:1111\"\n");
     write_file(&override_file, "[proxy]\nlisten = \"127.0.0.1:5555\"\n");
     set_env("HODOR_CONFIG", &global);
-    set_env("HODOR_PROJECT_ROOT", dir.path().join("markerless"));
+    let markerless = dir.path().join("markerless");
+    std::fs::create_dir_all(&markerless).unwrap();
+    let _cwd = CwdGuard::enter(&markerless);
     let cli = cli_for(&["hodor", "--config", override_file.to_str().unwrap(), "serve"]);
     let (config, _) = load(&cli).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:5555");
@@ -514,25 +532,16 @@ allow = ["https://c.example"]
     write_file(&root.join("Cargo.toml"), "[workspace]\n");
     let project = root.join(".config").join("hodor.toml");
     write_file(&project, "[proxy]\n");
-    assert_eq!(discover_project_config(None, &nested), Some(project));
+    assert_eq!(discover_project_config(&nested), Some(project));
     // same tree without the file: no project layer
     std::fs::remove_file(root.join(".config").join("hodor.toml")).unwrap();
-    assert_eq!(discover_project_config(None, &nested), None);
+    assert_eq!(discover_project_config(&nested), None);
   }
 
   #[test]
   fn discovery_bare_dir_yields_no_project_layer() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(discover_project_config(None, dir.path()), None);
-  }
-
-  #[test]
-  fn discovery_explicit_root_skips_walk() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("markerless");
-    let project = root.join(".config").join("hodor.toml");
-    write_file(&project, "[proxy]\n");
-    assert_eq!(discover_project_config(Some(&root), dir.path()), Some(project));
+    assert_eq!(discover_project_config(dir.path()), None);
   }
 
   #[test]
@@ -568,10 +577,6 @@ env = "GITHUB_TOKEN"
     write_file(
       &global,
       r#"
-[fnox]
-config = "/tmp/fnox.toml"
-profile = "work,default"
-
 [rules.gh]
 env = "GITHUB_TOKEN"
 value = "inline"
@@ -584,26 +589,10 @@ if_missing = "warn"
     );
     set_env("HODOR_CONFIG", &global);
     let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
-    assert_eq!(config.fnox.config.as_deref(), Some(std::path::Path::new("/tmp/fnox.toml")));
-    assert_eq!(config.fnox.profile.as_deref(), Some("work,default"));
     let rule = &config.rules["gh"];
     assert_eq!(rule.fnox_key.as_deref(), Some("GH_PAT"));
     assert_eq!(rule.registry, Some(false));
     assert_eq!(rule.if_missing, IfMissing::Warn);
-    scrub_env();
-  }
-
-  #[test]
-  fn fnox_env_vars_override_the_file() {
-    let _guard = lock_env();
-    scrub_env();
-    let dir = tempfile::tempdir().unwrap();
-    let global = dir.path().join("global.toml");
-    write_file(&global, "[fnox]\nconfig = \"/tmp/file.toml\"\n");
-    set_env("HODOR_CONFIG", &global);
-    set_env("HODOR_FNOX_CONFIG", "/tmp/env.toml");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
-    assert_eq!(config.fnox.config.as_deref(), Some(std::path::Path::new("/tmp/env.toml")));
     scrub_env();
   }
 

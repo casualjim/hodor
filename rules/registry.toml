@@ -1,10 +1,144 @@
 # Bundled registry: environment names, API hosts, and token shapes.
-# Override any entry from <config-dir>/hodor/rules.d/*.toml; see README.
+# Override any entry from <config-dir>/hodor/rules.d/*.toml or
+# <project-root>/.config/hodor/rules.d/*.toml; see README.
 #
 # `hosts` are stable API endpoints; a service whose endpoint is per tenant
 # uses the host family its docs state (`https://*.example.com`).
 # `pattern` keeps the prefix a platform documents; where the docs state no
 # format, the shape approximates that platform's tokens.
+
+[providers.302ai]
+env = ["302AI_API_KEY"]
+hosts = ["https://api.302.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.abacus]
+env = ["ABACUS_API_KEY"]
+hosts = ["https://routellm.abacus.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.abliteration-ai]
+env = ["ABLIT_KEY"]
+hosts = ["https://api.abliteration.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.above]
+env = ["ABOVE_API_KEY"]
+hosts = ["https://api.above.dev"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.agentrouter]
+env = ["AGENTROUTER_API_KEY"]
+hosts = ["https://agentrouter.org"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.agnes]
+env = ["AGNES_API_KEY"]
+hosts = ["https://apihub.agnes-ai.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.ai-router]
+env = ["AI_ROUTER_API_KEY"]
+hosts = ["https://api.ai-router.dev"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.aiand]
+env = ["AIAND_API_KEY"]
+hosts = ["https://api.aiand.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.aihubmix]
+env = ["AIHUBMIX_API_KEY"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.airtable]
+env = ["AIRTABLE_API_KEY"]
+hosts = ["https://api.airtable.com"]
+pattern = "pat{base62:14}.{hex:64}"
+# source: https://support.airtable.com/docs/creating-personal-access-tokens
+# source: https://support.airtable.com/docs/getting-started-with-airtables-web-api
+# note: no cited page documents the `AIRTABLE_API_KEY` name; the Web API authenticates with `Authorization: Bearer` PATs.
+# note: the docs state no token format; the pattern approximates the `pat`-prefixed, dot-separated token shape.
+
+[providers.aixy]
+env = ["AIXY_API_KEY"]
+hosts = ["https://api.aixy-gateway.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.akeyless]
+env = ["AKEYLESS_API_KEY"]
+hosts = ["https://vault.akeyless.io"]
+pattern = "{base62:32}"
+# source: https://docs.akeyless.io/docs/secret-retrieval-k8s-quickstart
+# source: https://docs.akeyless.io/docs/cli
+# note: `AKEYLESS_API_KEY` is documented as the Kubernetes Secrets Injector's Helm-chart env (with `AKEYLESS_ACCESS_ID`/`AKEYLESS_ACCESS_TYPE`); no shell-level token env is documented.
+# note: `https://vault.akeyless.io` is the documented US SaaS endpoint example; `AKEYLESS_URL`/`AKEYLESS_GATEWAY_URL` point to a per-deployment Gateway, so self-hosted gateways need explicit allow entries.
+# note: the Access Key format and length are not stated in the docs; the pattern is the default shape.
+
+[providers.aki-io]
+env = ["AKI_IO_API_KEY"]
+hosts = ["https://aki.io"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.alibaba]
+env = ["DASHSCOPE_API_KEY"]
+hosts = ["https://*.maas.aliyuncs.com"]
+pattern = "sk-{base62:32}"
+# source: https://www.alibabacloud.com/help/en/model-studio/first-api-call-to-qwen
+# note: Model Studio (Qwen/DashScope) documents `export DASHSCOPE_API_KEY`; every example base URL is a workspace-prefixed per-region host (`{WorkspaceId}.ap-southeast-1`, `.cn-beijing`, `.us-east-1.maas.aliyuncs.com`), so the wildcard covers the host family.
+# note: the key examples render as `sk-xxx`/`sk-ee166797fe40xxx`; the body length is not stated, so the pattern approximates it.
+# note: Singapore, US (Virginia), and China (Beijing) API keys are not interchangeable.
+
+[providers.amazon-bedrock]
+env = ["AWS_BEARER_TOKEN_BEDROCK"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.ambient]
+env = ["AMBIENT_API_KEY"]
+hosts = ["https://api.ambient.xyz"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.amd]
+env = ["AMD_API_KEY"]
+hosts = ["https://developer.amd.com.cn"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.anaconda]
+env = ["ANACONDA_AUTH_API_KEY"]
+hosts = ["https://repo.anaconda.cloud"]
+pattern = "{base62:32}"
+# source: https://www.anaconda.com/docs/anaconda-platform/user/api-keys
+# source: https://www.anaconda.com/docs/anaconda-platform/cloud/admin/anaconda-auth-reference
+# note: Anaconda documents `ANACONDA_AUTH_API_KEY`, not `ANACONDA_API_TOKEN`; the key is passed as a Docker secret and an `Authorization: Bearer` header.
+# note: the cited pages state no key format; `repo.anaconda.cloud` is the channel host they name, and platform deployments authenticate against a per-site `domain` (`anaconda.com` by default).
 
 [providers.anthropic]
 env = ["ANTHROPIC_API_KEY"]
@@ -15,6 +149,74 @@ contains = ["anthropic", "sk-ant-"]
 # source: https://docs.anthropic.com/en/docs/initial-setup
 # note: the `sk-ant-api03` prefix is retained from the Task 2 seed; the cited pages do not restate it.
 
+[providers.anyapi]
+env = ["ANYAPI_API_KEY"]
+hosts = ["https://api.anyapi.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.arcee]
+env = ["ARCEE_API_KEY"]
+hosts = ["https://api.arcee.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.argo-cd]
+env = ["ARGOCD_AUTH_TOKEN", "ARGOCD_TOKEN"]
+pattern = "eyJ{base62:32}.{base62:32}.{base62:32}"
+# source: https://raw.githubusercontent.com/argoproj/argo-cd/master/docs/user-guide/environment-variables.md
+# source: https://raw.githubusercontent.com/argoproj/argo-cd/master/docs/developer-guide/api-docs.md
+# note: `ARGOCD_AUTH_TOKEN` is the env var the CLI page documents ("the Argo CD `apiKey` for your Argo CD user"); the API-docs curl example passes the bearer token from `$ARGOCD_TOKEN`.
+# note: the API server is self-hosted (`ARGOCD_SERVER`, e.g. `argocd.example.com`); rules carry explicit allow entries.
+# note: tokens are JWTs — the API-docs session example header is `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9` — so the pattern approximates a three-segment JWT and its segment lengths.
+
+[providers.argo-workflows]
+env = ["ARGO_TOKEN"]
+pattern = "eyJ{base62:32}.{base62:32}.{base62:32}"
+# source: https://raw.githubusercontent.com/argoproj/argo-workflows/main/docs/access-token.md
+# note: the access-token page sets `ARGO_TOKEN` from a Kubernetes service-account token and uses it as `Authorization: $ARGO_TOKEN`; the documented value includes a literal `Bearer ` prefix, which the pattern omits so the decoy stays a bare token.
+# note: the Argo Server is self-hosted (`ARGO_SERVER`, e.g. `https://localhost:2746`); rules carry explicit allow entries.
+# note: tokens are Kubernetes service-account JWTs; the pattern approximates one.
+
+[providers.asana]
+env = ["ASANA_ACCESS_TOKEN", "ASANA_PAT"]
+hosts = ["https://app.asana.com"]
+pattern = "{base62:32}"
+# source: https://developers.asana.com/reference/getattachmentsforobject.md
+# source: https://raw.githubusercontent.com/Asana/php-asana/master/examples/example-accesstoken.php
+# source: https://developers.asana.com/docs/personal-access-token
+# source: https://developers.asana.com/docs/quick-start
+# note: `ASANA_PAT` is the name Asana's API reference uses in its curl example (`Authorization: Bearer $ASANA_PAT`); `ASANA_ACCESS_TOKEN` is what the official PHP client example reads via `getenv`.
+# note: the PAT page declares Asana tokens opaque and warns the format may change without notice, so the pattern approximates rather than states a shape.
+
+[providers.atlassian-cloud]
+env = ["JIRA_API_TOKEN"]
+hosts = ["https://*.atlassian.net", "https://api.atlassian.com"]
+pattern = "{base62:24}"
+# source: https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/
+# source: https://developer.atlassian.com/cloud/jira/platform/basic-auth-for-rest-apis/
+# source: https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/
+# source: https://raw.githubusercontent.com/atlassian/gajira-login/master/README.md
+# note: covers Jira on Atlassian Cloud; every site is `<site>.atlassian.net`, and scoped API tokens call Jira at `https://api.atlassian.com/ex/jira/<cloudId>`.
+# note: the token pairs with the account email in basic auth; only the token variable is listed here, not the email.
+# note: Atlassian states API tokens use a varied (non-fixed) length, so `{base62:24}` approximates the 24-character `JIRA_API_TOKEN` example Atlassian's own gajira-login action documents.
+
+[providers.atomic-chat]
+env = ["ATOMIC_CHAT_API_KEY"]
+hosts = ["http://127.0.0.1:1337"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.auriko]
+env = ["AURIKO_API_KEY"]
+hosts = ["https://api.auriko.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
 [providers.aws]
 env = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
 hosts = ["https://*.amazonaws.com"]
@@ -22,6 +224,20 @@ pattern = "AKIA{base62:16}"
 # source: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
 # source: https://docs.aws.amazon.com/general/latest/gr/rande.html
 # note: the `AKIA` prefix comes from the docs' `AKIAIOSFODNN7EXAMPLE`; real key ids are uppercase, which `{base62:N}` approximates.
+
+[providers.azure-cognitive-services]
+env = ["AZURE_COGNITIVE_SERVICES_API_KEY"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.azure-devops]
+env = ["AZURE_DEVOPS_EXT_PAT"]
+hosts = ["https://dev.azure.com"]
+pattern = "{base62:84}"
+# source: https://learn.microsoft.com/en-us/azure/devops/cli/log-in-via-pat?view=azure-devops
+# source: https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate?view=azure-devops
+# note: the PAT-format section states tokens are 84 characters long with 52 randomised and an `AZDO` signature at positions 76-80; `{base62:84}` keeps the length only.
 
 [providers.azure]
 env = ["AZURE_CLIENT_SECRET"]
@@ -31,6 +247,149 @@ pattern = "{base62:32}"
 # source: https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow
 # source: https://learn.microsoft.com/en-us/rest/api/azure/
 
+[providers.baidu]
+env = ["QIANFAN_AK", "QIANFAN_SK", "QIANFAN_BEARER_TOKEN"]
+hosts = ["https://aip.baidubce.com", "https://qianfan.baidubce.com"]
+pattern = "{base62:32}"
+# source: https://raw.githubusercontent.com/baidubce/bce-qianfan-sdk/main/python/qianfan/config.py
+# source: https://raw.githubusercontent.com/baidubce/bce-qianfan-sdk/main/python/qianfan/consts.py
+# note: the official Qianfan SDK reads `QIANFAN_AK`/`QIANFAN_SK` (LLM API key pair), `QIANFAN_ACCESS_KEY`/`QIANFAN_SECRET_KEY` (console IAM pair), and `QIANFAN_BEARER_TOKEN`; only the bearer key suits a single-pattern entry.
+# note: `https://aip.baidubce.com` is the SDK default LLM base URL and `https://qianfan.baidubce.com` the console/v2 API host.
+# note: no fetched source states the key shape; the pattern is generic.
+
+[providers.bailing]
+env = ["BAILING_API_TOKEN"]
+hosts = ["https://api.tbox.cn"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.baseten]
+env = ["BASETEN_API_KEY"]
+hosts = ["https://inference.baseten.co"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.berget]
+env = ["BERGET_API_KEY"]
+hosts = ["https://api.berget.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.bitwarden-secrets-manager]
+env = ["BWS_ACCESS_TOKEN"]
+hosts = ["https://api.bitwarden.com", "https://api.bitwarden.eu"]
+pattern = "0.{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}.{base62:30}"
+# source: https://bitwarden.com/help/secrets-manager-cli/
+# source: https://bitwarden.com/help/bitwarden-addresses/
+# note: the CLI docs show `BWS_ACCESS_TOKEN=0.48c78342-1635-48a6-accd-afbe01336365.<30 chars>:<base64>`; the trailing `:<base64>` segment is not expressible with the pattern verbs, so the pattern stops at the middle segment.
+
+[providers.blueclaw]
+env = ["BLUECLAW_API_KEY"]
+hosts = ["https://openai.blueclaw.network"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.bothub]
+env = ["BOTHUB_API_KEY"]
+hosts = ["https://openai.bothub.ru"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.buildkite]
+env = ["BUILDKITE_API_TOKEN"]
+hosts = ["https://api.buildkite.com"]
+pattern = "bkua_{base62:40}"
+# source: https://buildkite.com/docs/platform/cli/configuration
+# source: https://buildkite.com/docs/platform/security/tokens
+# note: the CLI page passes `--token $BUILDKITE_API_TOKEN`; the token-security page documents the `bkua_` prefix but masks the body length, so `{base62:40}` approximates it.
+
+[providers.bytedance]
+env = ["ARK_API_KEY"]
+hosts = ["https://ark.cn-beijing.volces.com"]
+pattern = "{base62:32}"
+# source: https://raw.githubusercontent.com/volcengine/volcengine-python-sdk/master/volcenginesdkarkruntime/_client.py
+# source: https://raw.githubusercontent.com/volcengine/volcengine-python-sdk/master/volcenginesdkarkruntime/_constants.py
+# note: Volcengine Ark (Doubao) reads `ARK_API_KEY` in the official Python SDK, which falls back to the IAM `VOLC_ACCESSKEY`/`VOLC_SECRETKEY` pair (not listed); the SDK default base URL is `https://ark.cn-beijing.volces.com/api/v3`.
+# note: the key format is not stated in the SDK; the pattern is generic.
+
+[providers.cerebras]
+env = ["CEREBRAS_API_KEY"]
+hosts = ["https://api.cerebras.ai"]
+pattern = "{base62:32}"
+# source: https://inference-docs.cerebras.ai/quickstart
+# note: the docs name the variable and host but show no key format; the shape is generic.
+
+[providers.chutes]
+env = ["CHUTES_API_KEY"]
+hosts = ["https://llm.chutes.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.circleci]
+env = ["CIRCLE_TOKEN"]
+hosts = ["https://circleci.com"]
+pattern = "CCIPAT_{base62:22}_{hex:40}"
+# source: https://circleci.com/docs/guides/toolkit/api-developers-guide/
+# source: https://circleci.com/changelog/new-format-for-api-access-tokens/
+# note: the changelog states `CCIPAT_<base58-UUID>_<40-char-hex string>`; `{base62:22}` approximates the base58 segment, whose length comes from the changelog's example only.
+# note: CircleCI Server installations replace `circleci.com` with the server hostname.
+
+[providers.civo]
+env = ["CIVO_TOKEN"]
+hosts = ["https://api.civo.com"]
+pattern = "{base62:50}"
+# source: https://github.com/civo/cli
+# source: https://www.civo.com/api
+# note: no Civo page states a key format; the official CLI README's sample key is 50 base62 characters, which the pattern approximates.
+# note: docs.civo.com documents pasting the key into `civo apikey save`; `CIVO_TOKEN` comes from the vendor's CLI README.
+
+[providers.clarifai]
+env = ["CLARIFAI_PAT"]
+hosts = ["https://api.clarifai.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.claudinio]
+env = ["CLAUDINIO_API_KEY"]
+hosts = ["https://api.claudin.io"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.cline-pass]
+env = ["CLINE_API_KEY"]
+hosts = ["https://api.cline.bot"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.cloudferro-sherlock]
+env = ["CLOUDFERRO_SHERLOCK_API_KEY"]
+hosts = ["https://api-sherlock.cloudferro.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.cloudflare-ai-gateway]
+env = ["CLOUDFLARE_GATEWAY_ID"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.cloudflare-workers-ai]
+env = ["CLOUDFLARE_API_KEY"]
+hosts = ["https://api.cloudflare.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
 [providers.cloudflare]
 env = ["CLOUDFLARE_API_TOKEN"]
 hosts = ["https://api.cloudflare.com"]
@@ -38,12 +397,103 @@ pattern = "{hex:32}"
 # source: https://developers.cloudflare.com/fundamentals/api/get-started/create-token/
 # source: https://developers.cloudflare.com/workers/wrangler/system-environment-variables/
 
+[providers.cockroach-cloud]
+env = ["COCKROACH_API_KEY"]
+hosts = ["https://cockroachlabs.cloud"]
+pattern = "{base62:64}"
+# source: https://www.cockroachlabs.com/docs/cockroachcloud/cloud-api
+# source: https://github.com/cockroachdb/terraform-provider-cockroach
+# note: the Cloud API page documents only the `Authorization: Bearer {secret_key}` header; the env name comes from CockroachDB's Terraform provider.
+# note: the docs state no key format; the provider also accepts a JWT variant (`COCKROACH_API_JWT`), which the pattern approximates.
+
+[providers.cohere]
+env = ["CO_API_KEY"]
+hosts = ["https://api.cohere.com"]
+pattern = "{base62:32}"
+# source: https://docs.cohere.com/reference/chat.md
+# source: https://raw.githubusercontent.com/cohere-ai/cohere-python/main/README.md
+# note: the SDK default variable is `CO_API_KEY`, not `COHERE_API_KEY`; the token format is not stated in the docs.
+
+[providers.coralbricks]
+env = ["CORAL_API_KEY"]
+hosts = ["https://inference.coralbricks.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.cortecs]
+env = ["CORTECS_API_KEY"]
+hosts = ["https://api.cortecs.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.crates-io]
+env = ["CARGO_REGISTRY_TOKEN"]
+hosts = ["https://crates.io"]
+pattern = "{base62:32}"
+# source: https://doc.rust-lang.org/cargo/reference/environment-variables.html
+# source: https://doc.rust-lang.org/cargo/reference/registries.html
+# source: https://doc.rust-lang.org/cargo/reference/publishing.html
+# note: `CARGO_REGISTRY_TOKEN` is documented as the "authentication token for crates.io"; alternate registries use `CARGO_REGISTRIES_<NAME>_TOKEN`.
+# note: no cited page states the crates.io token shape; the publishing page's `cargo login` prompt shows 32 lowercase alphanumerics, which `{base62:32}` approximates.
+
+[providers.crof]
+env = ["CROF_API_KEY"]
+hosts = ["https://crof.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.crossmodel]
+env = ["CROSSMODEL_API_KEY"]
+hosts = ["https://api.crossmodel.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.crusoe]
+env = ["CRUSOE_API_KEY"]
+hosts = ["https://api.inference.crusoecloud.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.daoxe]
+env = ["DAOXE_API_KEY"]
+hosts = ["https://daoxe.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.databricks]
+env = ["DATABRICKS_TOKEN"]
+hosts = ["https://${DATABRICKS_HOST}"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
 [providers.datadog]
 env = ["DD_API_KEY"]
 hosts = ["https://api.datadoghq.com"]
 pattern = "{hex:32}"
 # source: https://docs.datadoghq.com/account_management/api-app-keys/
 # source: https://docs.datadoghq.com/api/latest/key-management/get-all-api-keys/
+
+[providers.deepinfra]
+env = ["DEEPINFRA_TOKEN", "DEEPINFRA_API_KEY"]
+hosts = ["https://api.deepinfra.com"]
+pattern = "{base62:32}"
+# source: https://docs.deepinfra.com/apis/deepinfra-native
+# source: https://docs.deepinfra.com/account/authentication.md
+# note: the docs use `$DEEPINFRA_TOKEN` for the native API and `$DEEPINFRA_API_KEY` for the scoped-jwt endpoints; no key length is stated, and scoped JWTs carry a `jwt:` prefix.
+
+[providers.deepseek]
+env = ["DEEPSEEK_API_KEY"]
+hosts = ["https://api.deepseek.com"]
+pattern = "{base62:32}"
+# source: https://api-docs.deepseek.com/
+# note: the docs show the variable and base URL in an OpenAI-compatible example; the key format is not stated.
 
 [providers.digitalocean]
 env = ["DIGITALOCEAN_TOKEN"]
@@ -54,11 +504,152 @@ pattern = "{hex:64}"
 # source: https://docs.digitalocean.com/reference/api/reference/droplets/
 # note: the token length is not stated in the docs; `{hex:64}` matches DigitalOcean's token shape.
 
+[providers.dinference]
+env = ["DINFERENCE_API_KEY"]
+hosts = ["https://api.dinference.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.dnsimple]
+env = ["DNSIMPLE_TOKEN"]
+hosts = ["https://api.dnsimple.com", "https://api.sandbox.dnsimple.com"]
+pattern = "{base62:64}"
+# source: https://developer.dnsimple.com/cli/
+# source: https://developer.dnsimple.com/v2/
+# source: https://support.dnsimple.com/articles/api-access-token/
+# note: the CLI page shows `DNSIMPLE_TOKEN`, and the API v2 page documents `Authorization: Bearer <token>`; no page states the token's shape, so the pattern approximates it.
+
+[providers.docker-hub]
+env = ["DOCKERHUB_TOKEN"]
+hosts = ["https://auth.docker.io", "https://hub.docker.com"]
+pattern = "{base62:32}"
+# source: https://docs.docker.com/security/access-tokens/
+# source: https://docs.docker.com/reference/api/registry/auth/
+# source: https://github.com/docker/login-action
+# note: no docs.docker.com page names `DOCKERHUB_TOKEN`; the Docker-published login action uses it as the PAT supplied in place of a password.
+# note: the docs state no PAT format, so the shape is generic; `hub.docker.com` is the token-exchange host and `auth.docker.io` the registry token server.
+
+[providers.doppler]
+env = ["DOPPLER_TOKEN"]
+hosts = ["https://api.doppler.com"]
+pattern = "dp.st.{base62:3}.{base62:24}"
+# source: https://docs.doppler.com/docs/service-tokens
+# source: https://docs.doppler.com/docs/cli
+# note: docs show `dp.st.prd.xxxx` / `dp.st.dev.fHhinxK...`; the middle segment is the config slug (e.g. `prd`, `dev`) and segment lengths are not stated, so the pattern approximates.
+
+[providers.drone]
+env = ["DRONE_TOKEN"]
+pattern = "eyJ{base62:32}.{base62:32}.{base62:32}"
+# source: https://0-8-0.docs.drone.io/cli-authentication/
+# note: the page documents `export DRONE_TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` alongside `DRONE_SERVER`; the token is a personal access token from the user profile screen, so the pattern approximates a JWT.
+# note: the cited page is Drone's versioned 0.8 CLI-authentication documentation; the current site no longer serves that path (`docs.drone.io/cli/authentication/` returns 404).
+# note: Drone control planes are self-hosted (`DRONE_SERVER`, e.g. `http://drone.mycompany.com`); rules carry explicit allow entries.
+
+[providers.drun]
+env = ["DRUN_API_KEY"]
+hosts = ["https://chat.d.run"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.ebcloud]
+env = ["EBCLOUD_API_KEY"]
+hosts = ["https://maas-api.ebcloud.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.echo]
+env = ["ECHO_API_KEY"]
+hosts = ["https://echo.tracerml.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.eden-ai]
+env = ["EDENAI_API_KEY", "EDEN_AI_API_KEY"]
+hosts = ["https://api.edenai.run"]
+pattern = "{base62:32}"
+# source: https://www.edenai.co/docs/v3/quickstart/first-llm-call.md
+# source: https://www.edenai.co/docs/v3/integrations/langchain.md
+# source: https://www.edenai.co/docs/v3/integrations/any-llm.md
+# note: the quickstart documents only `Authorization: Bearer`; the LangChain guide names `EDEN_AI_API_KEY` while the any-llm guide names `EDENAI_API_KEY`, and no token format is stated.
+
+[providers.empiriolabs]
+env = ["EMPIRIOLABS_API_KEY"]
+hosts = ["https://api.empiriolabs.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.evroc]
+env = ["EVROC_API_KEY"]
+hosts = ["https://models.think.evroc.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.fastly]
+env = ["FASTLY_API_TOKEN"]
+hosts = ["https://api.fastly.com", "https://rt.fastly.com"]
+pattern = "{base62:32}"
+# source: https://www.fastly.com/documentation/help/cli/cli-auth/
+# source: https://www.fastly.com/documentation/reference/api/
+# source: https://www.fastly.com/documentation/reference/api/auth-tokens/
+# note: the API reference documents the `Fastly-Key` header and the `rt.fastly.com` stats domain; the CLI page names `FASTLY_API_TOKEN`.
+# note: no Fastly page states a token format; `{base62:32}` approximates the documented token strings.
+
+[providers.fastrouter]
+env = ["FASTROUTER_API_KEY"]
+hosts = ["https://go.fastrouter.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.fireworks]
+env = ["FIREWORKS_API_KEY"]
+hosts = ["https://api.fireworks.ai"]
+pattern = "{base62:32}"
+# source: https://docs.fireworks.ai/getting-started/quickstart
+# note: the quickstart documents the variable and host; the key format is not stated.
+
 [providers.fly]
 env = ["FLY_API_TOKEN"]
 hosts = ["https://api.machines.dev"]
 pattern = "{base62:32}"
 # source: https://fly.io/docs/machines/api/working-with-machines-api/
+
+[providers.freemodel]
+env = ["FREEMODEL_API_KEY"]
+hosts = ["https://cc.freemodel.dev"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.friendli]
+env = ["FRIENDLI_TOKEN"]
+hosts = ["https://api.friendli.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.frogbot]
+env = ["FROGBOT_API_KEY"]
+hosts = ["https://app.frogbot.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.gandi]
+env = ["GANDI_API_KEY"]
+hosts = ["https://api.gandi.net", "https://api.sandbox.gandi.net"]
+pattern = "{base62:40}"
+# source: https://api.gandi.net/docs/authentication/
+# source: https://api.gandi.net/docs/reference/
+# source: https://news.gandi.net/en/2023/09/pat-jetons-acces-personnels-api-gandi/
+# note: Gandi documents only the `Authorization: Bearer <PAT>` header (and the deprecated `Apikey` scheme), no environment variable; `GANDI_API_KEY` is a conventional name, not a documented one.
+# note: no Gandi page states a PAT or API-key format; `{base62:40}` approximates it.
 
 [providers.gcp]
 env = ["GOOGLE_APPLICATION_CREDENTIALS"]
@@ -73,6 +664,15 @@ env = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
 hosts = ["https://generativelanguage.googleapis.com"]
 pattern = "{base62:32}"
 # source: https://ai.google.dev/gemini-api/docs/api-key
+
+[providers.gitea]
+env = ["GITEA_TOKEN"]
+hosts = ["https://gitea.com"]
+pattern = "{hex:40}"
+# source: https://docs.gitea.com/usage/actions/token-permissions/
+# source: https://docs.gitea.com/development/api-usage/
+# note: `GITEA_TOKEN` is documented as the Actions job token (`${{ secrets.GITEA_TOKEN }}`); the API-usage page shows tokens as 40-char lowercase hex (`sha1`).
+# note: Gitea instances are typically self-hosted; `gitea.com` is the vendor SaaS host — add explicit allow entries for your instances in rules.d.
 
 [providers.github]
 env = ["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"]
@@ -90,6 +690,25 @@ pattern = "glpat-{base62:32}"
 # source: https://docs.gitlab.com/security/tokens/
 # note: self-managed instances are per tenant; `gitlab.com` is the documented SaaS host.
 
+[providers.gmicloud]
+env = ["GMICLOUD_API_KEY"]
+hosts = ["https://api.gmi-serving.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.google-vertex]
+env = ["GOOGLE_VERTEX_LOCATION"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.google]
+env = ["GOOGLE_GENERATIVE_AI_API_KEY"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
 [providers.grafana]
 env = ["GRAFANA_API_KEY", "GRAFANA_SERVICE_ACCOUNT_TOKEN"]
 hosts = ["https://*.grafana.net"]
@@ -98,6 +717,28 @@ pattern = "{hex:32}"
 # source: https://grafana.com/docs/grafana/latest/developer-resources/mcp/set-up/client-configuration-examples/
 # source: https://grafana.com/docs/grafana-cloud/developer-resources/api-reference/cloud-api/
 # note: `GRAFANA_API_KEY` is documented as deprecated in favor of `GRAFANA_SERVICE_ACCOUNT_TOKEN`; stack instances are `<STACK_SLUG>.grafana.net`.
+
+[providers.greenpt]
+env = ["GREENPT_API_KEY"]
+hosts = ["https://api.greenpt.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.groq]
+env = ["GROQ_API_KEY"]
+hosts = ["https://api.groq.com"]
+pattern = "{base62:32}"
+# source: https://console.groq.com/docs/quickstart
+# source: https://console.groq.com/docs/openai
+# note: the quickstart documents `GROQ_API_KEY`; the OpenAI-compatibility page documents the `https://api.groq.com/openai/v1` base URL. The key format is not stated.
+
+[providers.helicone]
+env = ["HELICONE_API_KEY"]
+hosts = ["https://gateway.helicone.ai"]
+pattern = "sk-{base62:32}"
+# source: https://docs.helicone.ai/helicone-headers/helicone-auth
+# note: read keys start `sk-`, write keys `pk-`, and EU keys `eu-`; the page shows the key embedded in the gateway URL as `[HELICONE_API_KEY]` and states no length.
 
 [providers.heroku]
 env = ["HEROKU_API_KEY"]
@@ -113,11 +754,335 @@ pattern = "{hex:64}"
 # source: https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/
 # note: docs.hetzner.com shows `$API_TOKEN` in its examples; `HCLOUD_TOKEN` is the hcloud CLI name, not stated on the cited pages.
 
+[providers.hex]
+env = ["HEX_API_KEY"]
+hosts = ["https://hex.pm", "https://repo.hex.pm"]
+pattern = "{hex:32}"
+# source: https://hex.pm/docs/publish
+# source: https://hex.pm/docs/mirrors
+# note: `{hex:32}` matches the key the publish page shows (`f48ac236bca15c3271e077c15c5320c4`); the docs state no format.
+
+[providers.hpc-ai]
+env = ["HPC_AI_API_KEY"]
+hosts = ["https://api.hpc-ai.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
 [providers.huggingface]
 env = ["HF_TOKEN"]
 hosts = ["https://huggingface.co"]
 pattern = "hf_{base62:32}"
 # source: https://huggingface.co/docs/hub/security-tokens
+
+[providers.hyper]
+env = ["HYPER_API_KEY"]
+hosts = ["https://hyper.charm.land"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.iflowcn]
+env = ["IFLOW_API_KEY"]
+hosts = ["https://apis.iflow.cn"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.impossibl]
+env = ["IMPOSSIBL_API_KEY"]
+hosts = ["https://api.impossibl.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.inception]
+env = ["INCEPTION_API_KEY"]
+hosts = ["https://api.inceptionlabs.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.inceptron]
+env = ["INCEPTRON_API_KEY"]
+hosts = ["https://api.inceptron.io"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.inference]
+env = ["INFERENCE_API_KEY"]
+hosts = ["https://inference.net"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.inferx]
+env = ["INFERX_API_KEY"]
+hosts = ["https://model.inferx.net"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.infisical]
+env = ["INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET", "INFISICAL_TOKEN"]
+hosts = ["https://app.infisical.com", "https://eu.infisical.com"]
+pattern = "{base62:64}"
+# source: https://infisical.com/docs/documentation/platform/identities/universal-auth
+# source: https://infisical.com/docs/cli/usage
+# note: `INFISICAL_TOKEN` is the machine-identity access/service token the CLI reads; the universal-auth page calls it a JWT, which the pattern approximates.
+# note: the Client Secret format and length are not stated in the docs; the pattern is generic.
+# note: US Cloud defaults to `app.infisical.com`, EU Cloud to `eu.infisical.com`; self-hosted instances are configured via `INFISICAL_DOMAIN`.
+
+[providers.infomaniak]
+env = ["INFOMANIAK_PRODUCT_ID"]
+hosts = ["https://api.infomaniak.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.io-net]
+env = ["IOINTELLIGENCE_API_KEY"]
+hosts = ["https://api.intelligence.io.solutions"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.iteracompute]
+env = ["ITERACOMPUTE_API_KEY"]
+hosts = ["https://api.iteracompute.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.jalapeno]
+env = ["JALAPENO_API_KEY"]
+hosts = ["https://api.jalapeno-cloud.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.jiekou]
+env = ["JIEKOU_API_KEY"]
+hosts = ["https://api.jiekou.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.kenari]
+env = ["KENARI_API_KEY"]
+hosts = ["https://kenari.id"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.keptn]
+env = ["KEPTN_API_TOKEN"]
+pattern = "{base62:45}"
+# source: https://v1.keptn.sh/docs/1.0.x/operate/api_token/
+# source: https://v1.keptn.sh/docs/install/authenticate-cli-bridge/
+# note: Keptn v1 reached EOL on 2023-12-22; the entry covers the v1 control plane's `keptn auth --endpoint=$KEPTN_ENDPOINT --api-token=$KEPTN_API_TOKEN` flow.
+# note: the token is user-generated and stored in the cluster secret `keptn-api-token`; the docs' command emits 45 characters from `a-zA-Z0-9`, which the pattern follows.
+# note: the control plane is self-hosted (`KEPTN_ENDPOINT`); rules carry explicit allow entries.
+
+[providers.kilo]
+env = ["KILO_API_KEY"]
+hosts = ["https://api.kilo.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.klokintegration]
+env = ["KLOKINTEGRATION_API_KEY"]
+hosts = ["https://api-gw.klok.ipaas.se"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.kosmik]
+env = ["KOSMIK_API_KEY"]
+hosts = ["https://api.koscompute.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.koyeb]
+env = ["KOYEB_TOKEN"]
+hosts = ["https://app.koyeb.com"]
+pattern = "{base62:32}"
+# source: https://www.koyeb.com/docs/integrations/infrastructure-as-code/terraform
+# source: https://www.koyeb.com/docs/build-and-deploy/cli/reference
+# note: `KOYEB_TOKEN` is documented for the Terraform/Pulumi provider flows; the CLI API default URL is `https://app.koyeb.com`. No token format is stated, so the shape is generic.
+
+[providers.kuae-cloud-coding-plan]
+env = ["KUAE_API_KEY"]
+hosts = ["https://coding-plan-endpoint.kuaecloud.net"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.lilac]
+env = ["LILAC_API_KEY"]
+hosts = ["https://api.getlilac.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.linear]
+env = ["LINEAR_API_KEY"]
+hosts = ["https://api.linear.app", "https://uploads.linear.app"]
+pattern = "lin_api_{hex:40}"
+# source: https://linear.app/developers/graphql
+# source: https://linear.app/developers/file-storage-authentication
+# source: https://linear.app/changelog/2021-08-19-github-secret-scanning
+# note: the changelog documents the `lin_api_` prefix; no cited page states the body length, and the file-storage page's access-token example is 64 hex characters.
+
+[providers.linode]
+env = ["LINODE_CLI_TOKEN"]
+hosts = ["https://api.linode.com", "https://login.linode.com"]
+pattern = "{base62:64}"
+# source: https://techdocs.akamai.com/linode-api/reference/get-started
+# source: https://www.linode.com/docs/products/tools/linode-api/guides/get-access-token/
+# source: https://github.com/linode/action-linode-cli
+# note: `LINODE_CLI_TOKEN` is documented by Akamai's Linode CLI tooling; the API pages show `Authorization: Bearer <token>`.
+# note: no page states a personal-access-token format, so the pattern approximates it.
+
+[providers.llama]
+env = ["LLAMA_API_KEY"]
+hosts = ["https://api.llama.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.llmgateway]
+env = ["LLMGATEWAY_API_KEY"]
+hosts = ["https://api.llmgateway.io"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.llmtech]
+env = ["LLMTECH_API_KEY"]
+hosts = ["https://api.llmtech.eu"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.llmtr]
+env = ["LLMTR_API_KEY"]
+hosts = ["https://llmtr.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.lmstudio]
+env = ["LMSTUDIO_API_KEY"]
+hosts = ["http://127.0.0.1:1234"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.longcat]
+env = ["LONGCAT_API_KEY"]
+hosts = ["https://api.longcat.chat"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.lucidquery]
+env = ["LUCIDQUERY_API_KEY"]
+hosts = ["https://api.lucidquery.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.lynkr]
+env = ["LYNKR_API_KEY"]
+hosts = ["http://127.0.0.1:8081"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.mailgun]
+env = ["MAILGUN_API_KEY"]
+hosts = ["https://api.mailgun.net"]
+pattern = "{base62:32}"
+# source: https://documentation.mailgun.com/docs/mailgun/mcp
+# source: https://documentation.mailgun.com/docs/mailgun/user-manual/mg_security
+# note: the MCP page documents `MAILGUN_API_KEY` plus `MAILGUN_API_REGION` (`us` or `eu`); the key-management page states no key format, so the pattern is generic.
+# note: EU-region accounts use a regional API host that the cited pages do not name.
+
+[providers.meganova]
+env = ["MEGANOVA_API_KEY"]
+hosts = ["https://api.meganova.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.merge-gateway]
+env = ["MERGE_GATEWAY_API_KEY"]
+hosts = ["https://api-gateway.merge.dev"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.meta]
+env = ["META_MODEL_API_KEY"]
+hosts = ["https://api.meta.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.minimax]
+env = ["MINIMAX_API_KEY"]
+hosts = ["https://api.minimax.io", "https://api.minimaxi.com"]
+pattern = "{base62:32}"
+# source: https://platform.minimax.io/docs/guides/quickstart-preparation
+# source: https://raw.githubusercontent.com/MiniMax-AI/MiniMax-MCP/main/README.md
+# note: the quickstart recommends exporting the key via the compatibility variables `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` with a MiniMax base URL; `MINIMAX_API_KEY` is the vendor's own MCP/tooling variable.
+# note: keys and hosts are region-locked — global `api.minimax.io`, mainland China `api.minimaxi.com`; the key format is not stated, so the pattern is generic.
+
+[providers.mistral]
+env = ["MISTRAL_API_KEY"]
+hosts = ["https://api.mistral.ai"]
+pattern = "{base62:32}"
+# source: https://docs.mistral.ai/api
+# note: the API-reference chat example names the variable and host; the key format is not stated.
+
+[providers.mixlayer]
+env = ["MIXLAYER_API_KEY"]
+hosts = ["https://models.mixlayer.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.modal]
+env = ["MODAL_PROXY_TOKEN"]
+hosts = ["https://inference.us-west.modal.direct"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.model-oracle-ai]
+env = ["MODEL_ORACLE_API_KEY"]
+hosts = ["https://api.modeloracle.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.modelis]
+env = ["MODELIS_API_KEY"]
+hosts = ["https://modelishub.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.modelscope]
+env = ["MODELSCOPE_API_KEY"]
+hosts = ["https://api-inference.modelscope.cn"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
 
 [providers.mongodb-atlas]
 env = ["MONGODB_ATLAS_PRIVATE_API_KEY"]
@@ -127,12 +1092,111 @@ pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
 # source: https://www.mongodb.com/docs/atlas/cli/current/atlas-cli-env-variables/
 # note: the Atlas CLI docs name the key `MONGODB_ATLAS_PRIVATE_API_KEY`, not `MONGODB_ATLAS_PRIVATE_KEY`; private keys are UUID-shaped.
 
+[providers.moonshot]
+env = ["MOONSHOT_API_KEY"]
+hosts = ["https://api.moonshot.ai", "https://api.moonshot.cn"]
+pattern = "{base62:32}"
+# source: https://platform.kimi.ai/docs/overview
+# source: https://platform.moonshot.cn/docs/api/chat
+# note: the quickstart documents `export MOONSHOT_API_KEY`; the global platform calls `https://api.moonshot.ai/v1` and the China platform `https://api.moonshot.cn/v1` with `Authorization: Bearer`.
+# note: the docs state no key format; the pattern is generic.
+
+[providers.morph]
+env = ["MORPH_API_KEY"]
+hosts = ["https://api.morphllm.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.nan]
+env = ["NAN_API_KEY"]
+hosts = ["https://api.nan.builders"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.nano-gpt]
+env = ["NANO_GPT_API_KEY"]
+hosts = ["https://nano-gpt.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.nearai]
+env = ["NEARAI_API_KEY"]
+hosts = ["https://cloud-api.near.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.nebius]
+env = ["NEBIUS_API_KEY"]
+hosts = ["https://api.tokenfactory.nebius.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.neon]
+env = ["NEON_API_KEY"]
+hosts = ["https://console.neon.tech"]
+pattern = "{base62:64}"
+# source: https://neon.com/docs/manage/api-keys
+# note: the docs call the key "a randomly-generated 64-bit token" and show no prefix; the pattern approximates the alphanumeric shape.
+
+[providers.neosmith]
+env = ["NEOSMITH_API_KEY"]
+hosts = ["https://router.neosmith.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
 [providers.netlify]
 env = ["NETLIFY_AUTH_TOKEN"]
 hosts = ["https://api.netlify.com"]
 pattern = "{hex:32}"
 # source: https://docs.netlify.com/api/get-started/
 # source: https://docs.netlify.com/api-and-cli-guides/cli-guides/get-started-with-cli/
+
+[providers.neuralwatt]
+env = ["NEURALWATT_API_KEY"]
+hosts = ["https://api.neuralwatt.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.northflank]
+env = ["NORTHFLANK_API_TOKEN"]
+hosts = ["https://api.northflank.com"]
+pattern = "{base62:32}"
+# source: https://northflank.com/docs/v1/api/use-the-api
+# source: https://northflank.com/docs/v1/application/secure/grant-api-access
+# note: API tokens are JWTs per the grant-api-access page; `{base62:32}` approximates a JWT. The name comes from the API docs' example code (`Bearer ${NORTHFLANK_API_TOKEN}`).
+
+[providers.notion]
+env = ["NOTION_TOKEN", "NOTION_PAT"]
+hosts = ["https://api.notion.com"]
+pattern = "ntn_{base62:32}"
+# source: https://developers.notion.com/guides/get-started/authorization
+# source: https://developers.notion.com/guides/get-started/personal-access-tokens
+# source: https://developers.notion.com/page/changelog
+# note: the authorization page reads `process.env.NOTION_TOKEN`; the personal-access-token page reads `process.env.NOTION_PAT`.
+# note: the changelog documents the `ntn_` prefix (replacing `secret_`) but not the body length, so `{base62:32}` approximates it.
+
+[providers.nova]
+env = ["NOVA_API_KEY"]
+hosts = ["https://api.nova.amazon.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.novita]
+env = ["NOVITA_API_KEY"]
+hosts = ["https://api.novita.ai"]
+pattern = "sk_{base62:32}"
+# source: https://novita.ai/docs/guides/llm-api-keys
+# source: https://novita.ai/docs/guides/llm-api
+# source: https://novita.ai/docs/guides/sandbox-your-first-agent-sandbox
+# note: the keys page states every key begins with `sk_`; the length is not documented.
 
 [providers.npm]
 env = ["NPM_TOKEN"]
@@ -141,6 +1205,54 @@ pattern = "{hex:36}"
 # source: https://docs.npmjs.com/about-access-tokens
 # source: https://docs.npmjs.com/using-private-packages-in-a-ci-cd-workflow/
 # note: the token length is not stated in the docs; `{hex:36}` matches npm's hexadecimal token shape.
+
+[providers.nuget]
+env = ["NUGET_API_KEY"]
+hosts = ["https://api.nuget.org"]
+pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
+# source: https://learn.microsoft.com/en-us/nuget/reference/cli-reference/cli-ref-setapikey
+# source: https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-nuget-push
+# note: `NUGET_API_KEY` is documented for NuGet 7.6 and later; no cited page states the shape nuget.org issues, and both push examples use a GUID-shaped key, which the pattern follows.
+
+[providers.nvidia]
+env = ["NVIDIA_API_KEY"]
+hosts = ["https://integrate.api.nvidia.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.oci]
+env = ["OCI_CLI_USER", "OCI_CLI_TENANCY"]
+hosts = ["https://*.oraclecloud.com"]
+pattern = "ocid1.{base62:60}"
+# source: https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/clienvironmentvariables.htm
+# source: https://docs.oracle.com/en-us/iaas/Content/API/Concepts/sdkconfig.htm
+# note: OCI has no single API-token variable; the documented credential variables are OCIDs, and the actual secret is PEM key material (`OCI_CLI_KEY_CONTENT` or `key_file`), which the pattern cannot express.
+# note: the pattern covers the documented OCID shape (`ocid1.user.oc1..<unique_ID>`); the middle segments vary by resource type, and `OCI_CLI_FINGERPRINT` is colon-separated hex, so it is omitted here.
+
+[providers.ofox]
+env = ["OFOX_API_KEY"]
+hosts = ["https://api.ofox.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.ollama-cloud]
+env = ["OLLAMA_API_KEY"]
+hosts = ["https://ollama.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.onepassword]
+env = ["OP_SERVICE_ACCOUNT_TOKEN"]
+hosts = ["https://api.1password.com", "https://api.1password.ca", "https://api.1password.eu"]
+pattern = "ops_{base62:256}"
+# source: https://developer.1password.com/docs/service-accounts/use-with-1password-cli/
+# source: https://www.1password.dev/service-accounts/security
+# source: https://developer.1password.com/docs/users-api/request-access-token
+# note: the security page documents the `ops_` prefix and that the token is a serialized, Base64-encoded JWT, so the pattern approximates both encoding and length.
+# note: the base URLs are the documented regional API endpoints (`1Password.com`/`.ca`/`.eu` accounts); the CLI selects the region from the token.
 
 [providers.openai]
 env = ["OPENAI_API_KEY"]
@@ -151,6 +1263,135 @@ contains = ["openai"]
 # source: https://platform.openai.com/docs/quickstart
 # note: the API-reference page returns 403 to fetchers; the quickstart documents the names and host.
 
+[providers.openbao]
+env = ["BAO_TOKEN"]
+pattern = "s.{base62:24}"
+# source: https://openbao.org/docs/commands/
+# source: https://openbao.org/docs/concepts/tokens/
+# note: the endpoint is self-hosted (`BAO_ADDR`, e.g. `https://127.0.0.1:8200/`); rules carry explicit allow entries.
+# note: the CLI prefers the `BAO_` prefix but falls back to `VAULT_` env vars if present.
+# note: the tokens page documents tokens as `[sbr]\.[a-zA-Z0-9]{24,}` (service `s.`, batch `b.`, recovery `r.`); the pattern keeps the common `s.` service-token prefix.
+
+[providers.opencode]
+env = ["OPENCODE_API_KEY"]
+hosts = ["https://opencode.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.openreason]
+env = ["OPENREASON_API_KEY"]
+hosts = ["https://api.openreason.app"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.openrouter]
+env = ["OPENROUTER_API_KEY"]
+hosts = ["https://openrouter.ai"]
+pattern = "{base62:32}"
+# source: https://openrouter.ai/docs/quickstart
+# note: the quickstart uses `Bearer $OPENROUTER_API_KEY` against `https://openrouter.ai/api/v1`; the key format is not stated.
+
+[providers.opper]
+env = ["OPPER_API_KEY"]
+hosts = ["https://api.opper.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.orcarouter]
+env = ["ORCAROUTER_API_KEY"]
+hosts = ["https://api.orcarouter.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.ovhcloud]
+env = ["OVHCLOUD_API_KEY"]
+hosts = ["https://oai.endpoints.kepler.ai.cloud.ovh.net"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.packagist]
+env = ["COMPOSER_AUTH"]
+hosts = ["https://packagist.org", "https://repo.packagist.org"]
+pattern = "{base62:32}"
+# source: https://packagist.org/apidoc
+# source: https://getcomposer.org/doc/articles/authentication-for-private-packages.md
+# note: Packagist documents `Authorization: Bearer [username]:[apiToken]` and profile-page tokens, not a token environment variable; `COMPOSER_AUTH` is Composer's documented environment variable for credentials.
+# note: the docs state no token format; the pattern approximates a Packagist API token.
+
+[providers.pendra]
+env = ["PENDRA_API_KEY"]
+hosts = ["https://api.pendra.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.perplexity]
+env = ["PERPLEXITY_API_KEY"]
+hosts = ["https://api.perplexity.ai"]
+pattern = "{base62:32}"
+# source: https://docs.perplexity.ai/getting-started/quickstart
+# note: the quickstart documents the variable and `https://api.perplexity.ai` base URLs; the key format is not stated.
+
+[providers.pioneer]
+env = ["PIONEER_API_KEY"]
+hosts = ["https://api.pioneer.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.pipecd]
+env = ["PIPECD_API_KEY"]
+pattern = "{base62:32}"
+# source: https://pipecd.dev/docs-v1.0.x/user-guide/terraform-provider-pipecd/
+# source: https://pipecd.dev/docs-v0.58.x/user-guide/command-line-tool/
+# note: the Terraform-provider page documents `PIPECD_API_KEY` (with `PIPECD_HOST`) as the environment fallback for `pipecd_api_key`; pipectl itself documents only the `--api-key`/`--api-key-file` flags and no environment variable.
+# note: the control plane is self-hosted (`--address`); rules carry explicit allow entries.
+# note: no cited page states the API-key format; the shape is generic.
+
+[providers.planetscale]
+env = ["PLANETSCALE_SERVICE_TOKEN", "PLANETSCALE_SERVICE_TOKEN_ID"]
+hosts = ["https://api.planetscale.com"]
+pattern = "{base62:32}"
+# source: https://planetscale.com/docs/api/service-tokens
+# note: the token is used with its ID as `Authorization: <SERVICE_TOKEN_ID>:<SERVICE_TOKEN>`; the docs state no token format.
+
+[providers.poe]
+env = ["POE_API_KEY"]
+hosts = ["https://api.poe.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.poolside]
+env = ["POOLSIDE_API_KEY"]
+hosts = ["https://inference.poolside.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.portkey]
+env = ["PORTKEY_API_KEY"]
+hosts = ["https://api.portkey.ai"]
+pattern = "{base62:32}"
+# source: https://portkey.ai/docs/api-reference/sdk/python
+# source: https://portkey.ai/docs/api-reference/admin-api/control-plane/api-keys/retrieve-an-api-key
+# note: the SDK page names `PORTKEY_API_KEY` as the environment variable; no key format is documented.
+
+[providers.posit]
+env = ["PACKAGEMANAGER_TOKEN"]
+hosts = ["https://packagemanager.posit.co"]
+pattern = "{base62:32}"
+# source: https://docs.posit.co/rspm/admin/admin-cli.html
+# source: https://docs.posit.co/rspm/admin/authentication/token-authentication.html
+# source: https://docs.posit.co/rspm/admin/repositories.html
+# note: `PACKAGEMANAGER_TOKEN` is documented for remote CLI and authenticated-repository access; the docs state no token format.
+# note: `packagemanager.posit.co` is the public instance the docs name; self-hosted installs use the customer's own domain (`packagemanager.example.com` in the docs' examples).
+
 [providers.postmark]
 env = ["POSTMARK_SERVER_TOKEN"]
 hosts = ["https://api.postmarkapp.com"]
@@ -159,6 +1400,13 @@ pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
 # source: https://postmarkapp.com/support/article/1008-what-are-the-account-and-server-api-tokens
 # note: no cited page shows `POSTMARK_SERVER_TOKEN`; the developer overview documents the `X-Postmark-Server-Token` header instead.
 # note: the token article describes the server token as "a randomly generated alphanumeric string"; the pattern is UUID-shaped.
+
+[providers.privatemode-ai]
+env = ["PRIVATEMODE_ENDPOINT"]
+hosts = ["http://localhost:8080"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
 
 [providers.pypi]
 env = ["PYPI_TOKEN"]
@@ -169,6 +1417,72 @@ pattern = "pypi-{base62:32}"
 # source: https://docs.pypi.org/trusted-publishers/using-a-publisher/
 # note: no PyPI page documents `PYPI_TOKEN` as an environment variable; the help page documents the `pypi-` token prefix.
 
+[providers.qihang-ai]
+env = ["QIHANG_API_KEY"]
+hosts = ["https://api.qhaigc.net"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.qiniu-ai]
+env = ["QINIU_API_KEY"]
+hosts = ["https://api.qnaigc.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.qvac]
+env = ["QVAC_API_KEY"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.railway]
+env = ["RAILWAY_TOKEN", "RAILWAY_API_TOKEN"]
+hosts = ["https://backboard.railway.com"]
+pattern = "{base62:32}"
+# source: https://docs.railway.com/guides/cli
+# source: https://docs.railway.com/integrations/api
+# note: `RAILWAY_TOKEN` is project-scoped, `RAILWAY_API_TOKEN` account/workspace-scoped (CLI docs). No token format is stated, so the shape is generic.
+
+[providers.redis-cloud]
+env = ["REDISCLOUD_ACCESS_KEY", "REDISCLOUD_SECRET_KEY"]
+hosts = ["https://api.redislabs.com"]
+pattern = "{base62:32}"
+# source: https://redis.io/docs/latest/integrate/terraform-provider-for-redis-cloud/get-started/
+# source: https://redis.io/docs/latest/operate/rc/api/get-started/
+# source: https://redis.io/docs/latest/operate/rc/api/get-started/use-rest-api/
+# note: requests pair the account key (`x-api-key`) with a user key (`x-api-secret-key`); the docs state no key format, so the pattern approximates both.
+
+[providers.regolo-ai]
+env = ["REGOLO_API_KEY"]
+hosts = ["https://api.regolo.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.render]
+env = ["RENDER_API_KEY"]
+hosts = ["https://api.render.com"]
+pattern = "rnd_{base62:32}"
+# source: https://render.com/docs/cli
+# source: https://api-docs.render.com/reference/authentication
+# note: the `rnd_` prefix appears in the CLI docs example (`export RENDER_API_KEY=rnd_RUExip…`); the key length is not stated, so `{base62:32}` approximates it.
+
+[providers.replicate]
+env = ["REPLICATE_API_TOKEN"]
+hosts = ["https://api.replicate.com"]
+pattern = "r8_{base62:32}"
+# source: https://replicate.com/docs/reference/http
+# note: the HTTP API page shows `Bearer r8_Hw***` in its authentication example; the exact length after the prefix is not stated.
+
+[providers.requesty]
+env = ["REQUESTY_API_KEY"]
+hosts = ["https://router.requesty.ai"]
+pattern = "sk-{base62:32}"
+# source: https://docs.requesty.ai/quickstart
+# note: the quickstart example exports the key as `sk-...`; the length is not stated.
+
 [providers.resend]
 env = ["RESEND_API_KEY"]
 hosts = ["https://api.resend.com"]
@@ -176,12 +1490,100 @@ pattern = "re_{base62:32}"
 # source: https://resend.com/docs/api-reference/introduction
 # source: https://resend.com/docs/create-an-api-key
 
+[providers.routing-run]
+env = ["ROUTING_RUN_API_KEY"]
+hosts = ["https://api.routing.run"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.rubygems]
+env = ["GEM_HOST_API_KEY"]
+hosts = ["https://rubygems.org"]
+pattern = "rubygems_{hex:48}"
+# source: https://guides.rubygems.org/api-key-scopes/
+# note: the page shows `GEM_HOST_API_KEY=rubygems_123456` and a credentials file holding `rubygems_` plus 48 hex; the exact length is not stated.
+
+[providers.runinfra]
+env = ["RUNINFRA_GATEWAY_KEY"]
+hosts = ["https://api.runinfra.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.sakana]
+env = ["SAKANA_API_KEY"]
+hosts = ["https://api.sakana.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.salad-cloud]
+env = ["SALAD_CLOUD_API_KEY"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.sap-ai-core]
+env = ["AICORE_SERVICE_KEY"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.sarvam]
+env = ["SARVAM_API_KEY"]
+hosts = ["https://api.sarvam.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.scaleway]
+env = ["SCW_ACCESS_KEY", "SCW_SECRET_KEY"]
+hosts = ["https://api.scaleway.com"]
+pattern = "{hex:8}-{hex:4}-{hex:4}-{hex:4}-{hex:12}"
+# source: https://www.scaleway.com/en/developers/api/secret-manager
+# source: https://www.scaleway.com/en/docs/scaleway-cli/reference-content/environment-variables/
+# source: https://www.scaleway.com/en/docs/scaleway-cli/reference-content/scaleway-configuration-file/
+# source: https://www.scaleway.com/en/docs/iam/how-to-create-api-keys/
+# note: `api_url` defaults to `https://api.scaleway.com`; the config-file example shows masked UUID-shaped keys, and no page states the format, so the pattern approximates a UUID.
+
+[providers.scnet-token-plan]
+env = ["SCNET_API_KEY"]
+hosts = ["https://api.scnet.cn"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.screwdriver-cd]
+env = ["SD_TOKEN"]
+hosts = ["https://api.screwdriver.cd"]
+pattern = "eyJ{base62:32}.{base62:32}.{base62:32}"
+# source: https://docs.screwdriver.cd/user-guide/tokens
+# source: https://docs.screwdriver.cd/user-guide/api
+# note: the docs document `$SD_TOKEN` as the JWT a build generates; a user or pipeline access token has no documented env name — it is passed as the `api_token` query parameter (the API page's Python example reads it from `environ['SD_KEY']`) and exchanged for a JWT at `/v4/auth/token`.
+# note: `api.screwdriver.cd` is the hosted API the docs' examples call; self-hosted clusters use their own `<API URL>`.
+# note: the pattern approximates a JWT.
+
+[providers.scx-ai]
+env = ["SCX_API_KEY"]
+hosts = ["https://api.scx.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
 [providers.sendgrid]
 env = ["SENDGRID_API_KEY"]
 hosts = ["https://api.sendgrid.com"]
 pattern = "{base62:32}"
 # source: https://www.twilio.com/docs/sendgrid/ui/account-and-settings/api-keys
 # note: the page names no token prefix, so the shape is generic.
+
+[providers.sensenova]
+env = ["SENSENOVA_API_KEY"]
+hosts = ["https://token.sensenova.cn"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
 
 [providers.sentry]
 env = ["SENTRY_AUTH_TOKEN"]
@@ -199,12 +1601,75 @@ pattern = "shpat_{hex:32}"
 # source: https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/generate-app-access-tokens-admin
 # note: Admin API examples use `SHOP_TOKEN` and `shpat_`; every store is `{shop}.myshopify.com`.
 
+[providers.shortcut]
+env = ["SHORTCUT_API_TOKEN"]
+hosts = ["https://api.app.shortcut.com"]
+pattern = "{base62:32}"
+# source: https://developer.shortcut.com/api/rest/v3
+# note: no cited page states a token format, so the pattern is generic.
+
+[providers.siliconflow-cn]
+env = ["SILICONFLOW_CN_API_KEY"]
+hosts = ["https://api.siliconflow.cn"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.siliconflow]
+env = ["SILICONFLOW_API_KEY"]
+hosts = ["https://api.siliconflow.com", "https://api.siliconflow.cn"]
+pattern = "{base62:32}"
+# source: https://docs.siliconflow.com/en/userguide/quickstart
+# source: https://docs.siliconflow.cn/docs/userguide/quickstart
+# source: https://docs.siliconflow.cn/docs/usercases/use-siliconcloud-in-DB-GPT
+# note: the platform quickstarts use an inline key placeholder; `SILICONFLOW_API_KEY` comes from the vendor's DB-GPT guide, which reads it via `os.getenv` for SiliconFlow's own client.
+
 [providers.slack]
 env = ["SLACK_TOKEN", "SLACK_BOT_TOKEN"]
 hosts = ["https://slack.com", "https://api.slack.com"]
 pattern = "xoxb-{d:10}-{d:11}-{hex:24}"
 contains = ["slack", "xox"]
 # source: https://api.slack.com/authentication/token-types
+
+[providers.snowflake-cortex]
+env = ["SNOWFLAKE_CORTEX_PAT"]
+hosts = ["https://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.spinnaker]
+env = ["ACCESS_TOKEN", "REFRESH_TOKEN"]
+pattern = "eyJ{base62:32}.{base62:32}.{base62:32}"
+# source: https://spinnaker.io/docs/setup/other_config/spin/
+# source: https://github.com/spinnaker/spinnaker/issues/3558
+# note: spin's config substitutes `${ACCESS_TOKEN}`/`${REFRESH_TOKEN}` into the `cachedToken` block; the docs' own example acquires them with `gcloud auth print-access-token`.
+# note: the names are unprefixed and collision-prone across tools; scope rules to the Gate host tightly.
+# note: Gate (the API server) is self-hosted (`--gate-endpoint`); rules carry explicit allow entries.
+# note: issue #3558 reports env substitution broken in some spin versions; the cached-token config file is the fallback.
+# note: tokens are OAuth2 access/refresh pairs, commonly JWTs; the pattern approximates a JWT.
+
+[providers.stackit]
+env = ["STACKIT_API_KEY"]
+hosts = ["https://api.openai-compat.model-serving.eu01.onstackit.cloud"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.standardcompute]
+env = ["STANDARDCOMPUTE_API_KEY"]
+hosts = ["https://api.stdcmpt.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.stepfun]
+env = ["STEP_API_KEY"]
+hosts = ["https://api.stepfun.com"]
+pattern = "{base62:32}"
+# source: https://platform.stepfun.com/docs/zh/step-plan/integrations/reasoning-api
+# note: the Step Plan guide's curl example reads `Authorization: Bearer $STEP_API_KEY` against `https://api.stepfun.com/step_plan/v1`, and the docs fix the domain as `https://api.stepfun.com` for all requests.
+# note: no cited page states a key format; the pattern is generic.
 
 [providers.stripe]
 env = ["STRIPE_SECRET_KEY"]
@@ -214,6 +1679,20 @@ pattern = "sk_live_{base62:32}"
 # source: https://docs.stripe.com/api
 # note: the keys page says only "use an environment variable"; `sk_live_` and `sk_test_` prefixes are documented.
 
+[providers.subconscious]
+env = ["SUBCONSCIOUS_API_KEY"]
+hosts = ["https://api.subconscious.dev"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.submodel]
+env = ["SUBMODEL_INSTAGEN_ACCESS_KEY"]
+hosts = ["https://llm.submodel.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
 [providers.supabase]
 env = ["SUPABASE_SERVICE_ROLE_KEY"]
 hosts = ["https://*.supabase.co"]
@@ -221,11 +1700,176 @@ pattern = "{base62:32}"
 # source: https://supabase.com/docs/guides/api/api-keys
 # note: every project is `<project-ref>.supabase.co`; the service-role key is a JWT, which the pattern approximates.
 
+[providers.synthetic]
+env = ["SYNTHETIC_API_KEY"]
+hosts = ["https://api.synthetic.new"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.tencent]
+env = ["HUNYUAN_API_KEY"]
+hosts = ["https://api.hunyuan.cloud.tencent.com"]
+pattern = "{base62:32}"
+# source: https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanVision/main/README.md
+# note: no fetched Tencent page names a Hunyuan environment variable — `HUNYUAN_API_KEY` is a conventional name — and the official HunyuanVision quickstart passes the Tencent Cloud API key inline as the OpenAI SDK `api_key` against `https://api.hunyuan.cloud.tencent.com/v1`.
+# note: the key format is not stated in the cited source; the pattern is generic.
+
+[providers.tensorx]
+env = ["TENSORX_API_KEY"]
+hosts = ["https://api.tensorx.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.terraform-cloud]
+env = ["TFE_TOKEN", "TF_TOKEN_app_terraform_io"]
+hosts = ["https://app.terraform.io", "https://app.eu.terraform.io"]
+pattern = "{base62:14}.atlasv1.{base62:67}"
+# source: https://raw.githubusercontent.com/hashicorp/terraform-provider-tfe/main/website/docs/index.html.markdown
+# source: https://developer.hashicorp.com/terraform/cli/config/config-file
+# source: https://developer.hashicorp.com/terraform/cloud-docs/api-docs/user-tokens
+# note: `TFE_TOKEN` is the tfe provider's documented env var; `TF_TOKEN_app_terraform_io` is the Terraform CLI's documented host-specific credential variable (`TF_TOKEN_` plus the hostname with periods encoded as underscores), which the CLI prefers over stored credentials.
+# note: the pattern follows the documented user-token example `6tL24nM38M7XWQ.atlasv1.KmWckRfzeNmUVFNvpvwUEChKaLGznCSD6fPf3VPzqMMVzmSxFU0p2Ibzpo2h5…` (example redacted); no cited page states the shape of the team, group, or organization token types.
+# note: HCP Terraform also answers at its historical hostname `atlas.hashicorp.com`; HCP Europe organizations use `app.eu.terraform.io`, whose CLI variable would be `TF_TOKEN_app_eu_terraform_io`. Terraform Enterprise is self-hosted and takes a per-hostname `TF_TOKEN_*` variable.
+
+[providers.the-grid-ai]
+env = ["THEGRID_API_KEY"]
+hosts = ["https://api.thegrid.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.thinkingmachines]
+env = ["TINKER_API_KEY"]
+hosts = ["https://tinker.thinkingmachines.dev"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.tinfoil]
+env = ["TINFOIL_API_KEY"]
+hosts = ["https://inference.tinfoil.sh"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.together]
+env = ["TOGETHER_API_KEY"]
+hosts = ["https://api.together.ai"]
+pattern = "{base62:32}"
+# source: https://docs.together.ai/docs/quickstart
+# note: the quickstart documents the variable and the `https://api.together.ai/v1` base URL; the key format is not stated.
+
+[providers.tokengo]
+env = ["TOKENGO_API_KEY"]
+hosts = ["https://api.tokengo.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.tokenrouter]
+env = ["TOKENROUTER_API_KEY"]
+hosts = ["https://api.tokenrouter.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.trello]
+env = ["TRELLO_API_KEY", "TRELLO_TOKEN"]
+hosts = ["https://api.trello.com"]
+pattern = "{base62:32}"
+# source: https://developer.atlassian.com/cloud/trello/guides/rest-api/api-introduction/
+# source: https://developer.atlassian.com/cloud/trello/guides/rest-api/authorization/
+# source: https://support.atlassian.com/trello/docs/getting-started-with-trello-rest-api/
+# note: no cited page names an environment variable; Trello's docs pass `key` and `token` as query parameters, or `oauth_consumer_key`/`oauth_token` in the Authorization header.
+# note: the support page describes the token only as "a unique combination of letters and numbers", so the pattern is generic.
+
+[providers.trustedrouter]
+env = ["TRUSTEDROUTER_API_KEY"]
+hosts = ["https://api.trustedrouter.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.turso]
+env = ["TURSO_PLATFORM_TOKEN"]
+hosts = ["https://api.turso.tech"]
+pattern = "{base62:32}"
+# source: https://docs.turso.tech/api-reference/authentication
+# source: https://docs.turso.tech/api-reference/introduction
+# source: https://docs.turso.tech/api-reference/quickstart
+# note: the HTTP auth page names no variable; `TURSO_PLATFORM_TOKEN` is the name in the official SDK quickstart samples.
+# note: the docs state no token format; the pattern approximates.
+
 [providers.twilio]
 env = ["TWILIO_AUTH_TOKEN"]
 hosts = ["https://api.twilio.com"]
 pattern = "{hex:32}"
 # source: https://www.twilio.com/docs/iam/api/account
+
+[providers.umans-ai-coding-plan]
+env = ["UMANS_AI_CODING_PLAN_API_KEY"]
+hosts = ["https://api.code.umans.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.umans-ai]
+env = ["UMANS_AI_API_KEY"]
+hosts = ["https://api.code.umans.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.unorouter]
+env = ["UNOROUTER_API_KEY"]
+hosts = ["https://api.unorouter.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.upstage]
+env = ["UPSTAGE_API_KEY"]
+hosts = ["https://api.upstage.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.upstash]
+env = ["UPSTASH_API_KEY"]
+hosts = ["https://api.upstash.com"]
+pattern = "{base62:32}"
+# source: https://upstash.com/docs/devops/developer-api/authentication
+# source: https://upstash.com/docs/agent-resources/cli
+# note: the Developer API uses HTTP Basic auth with the account email as username; `UPSTASH_EMAIL` holds that non-secret username.
+# note: the docs state no key format; the pattern approximates.
+
+[providers.v0]
+env = ["V0_API_KEY"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.vancine]
+env = ["VANCINE_API_KEY"]
+hosts = ["https://vancine.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.vault]
+env = ["VAULT_TOKEN"]
+pattern = "hvs.{base62:22}"
+# source: https://developer.hashicorp.com/vault/docs/commands
+# note: the endpoint is self-hosted (`VAULT_ADDR`, default `https://127.0.0.1:8200`); rules carry explicit allow entries.
+# note: the `hvs.` prefix and body length come from the docs' `VAULT_TOKEN` example (`hvs.CvmS4c0DPTvHv5eJgXWM…`, example redacted); the length is not otherwise stated.
+
+[providers.venice]
+env = ["VENICE_API_KEY"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
 
 [providers.vercel]
 env = ["VERCEL_TOKEN", "VERCEL_ACCESS_TOKEN"]
@@ -234,3 +1878,123 @@ pattern = "{base62:32}"
 # source: https://vercel.com/docs/rest-api
 # source: https://vercel.com/docs/cli/tokens
 # source: https://vercel.com/docs/accounts/access-tokens
+
+[providers.vivgrid]
+env = ["VIVGRID_API_KEY"]
+hosts = ["https://api.vivgrid.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.vultr]
+env = ["VULTR_API_KEY"]
+hosts = ["https://api.vultr.com"]
+pattern = "{base62:36}"
+# source: https://github.com/vultr/vultr-cli
+# source: https://github.com/vultr/govultr
+# source: https://docs.vultr.com/support/platform/api/where-should-i-store-api-keys-securely
+# source: https://docs.vultr.com/platform/other/api/faq
+# note: `VULTR_API_KEY` comes from the official CLI and Go-client READMEs; the Go client's `SetBaseURL("https://api.vultr.com")` supplies the host.
+# note: no Vultr page states a key format; `{base62:36}` approximates the alphanumeric key the console issues.
+# note: `https://www.vultr.com/api/` returns 403 to fetchers, so its examples were not read directly.
+
+[providers.wafer-ai]
+env = ["WAFER_API_KEY"]
+hosts = ["https://pass.wafer.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.wandb]
+env = ["WANDB_API_KEY"]
+hosts = ["https://api.wandb.ai"]
+pattern = "{base62:32}"
+# source: https://docs.wandb.ai/quickstart
+# source: https://docs.wandb.ai/ref/cli/wandb-login
+# note: the quickstart and CLI reference name the variable; the login page gives `https://api.wandb.ai` as the public-cloud server. The key format is not stated.
+
+[providers.watsonx]
+env = ["WATSONX_AI_PROJECT_ID"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.woodpecker]
+env = ["WOODPECKER_TOKEN"]
+pattern = "{base62:32}"
+# source: https://woodpecker-ci.org/docs/cli
+# note: the CLI page documents `WOODPECKER_TOKEN` as the env counterpart of `--token` (and `WOODPECKER_SERVER` for `--server`); tokens are kept in the OS keyring, not in the contexts file.
+# note: no cited page states the token format; the shape is generic.
+# note: Woodpecker control planes are self-hosted (`WOODPECKER_SERVER`); rules carry explicit allow entries.
+
+[providers.xai]
+env = ["XAI_API_KEY"]
+hosts = ["https://api.x.ai"]
+pattern = "{base62:32}"
+# source: https://docs.x.ai/docs/quickstart
+# note: the quickstart documents the variable and `https://api.x.ai/v1` base URL; the key format is not stated.
+
+[providers.xata]
+env = ["XATA_API_KEY"]
+hosts = ["https://api.xata.tech", "https://api.xata.io"]
+pattern = "{base62:32}"
+# source: https://xata.io/docs/api-reference
+# source: https://xata.io/docs/cli
+# note: the current API reference shows `api.xata.tech`; older docs used `api.xata.io` as the core-API host with per-workspace `https://*.*.xata.sh` endpoints.
+# note: the docs state no key format; the pattern approximates.
+
+[providers.xiaomi]
+env = ["MIMO_API_KEY"]
+hosts = ["https://api.xiaomimimo.com"]
+pattern = "sk-{base62:32}"
+# source: https://mimo.mi.com/docs/en-US/quick-start/faq/api-integration
+# note: the MiMo FAQ documents the `api-key: $MIMO_API_KEY` (or `Authorization: Bearer`) header against `https://api.xiaomimimo.com/v1`; pay-as-you-go keys are `sk-xxxxx` and Token Plan keys `tp-xxxxx`, so the pattern keeps the `sk-` prefix only.
+# note: the key body length is not stated; `{base62:32}` approximates it.
+
+[providers.xpersona]
+env = ["XPERSONA_API_KEY"]
+hosts = ["https://www.xpersona.co"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.youtrack]
+env = ["YOUTRACK_TOKEN"]
+hosts = ["https://*.youtrack.cloud"]
+pattern = "perm:{base62:8}.{base62:8}.{base62:32}"
+# source: https://www.jetbrains.com/help/youtrack/devportal/authentication-with-permanent-token.html
+# source: https://junie.jetbrains.com/docs/youtrack-integration.html
+# note: `YOUTRACK_TOKEN` is named on JetBrains' Junie page as the workflow secret holding the permanent token, not as a shell variable.
+# note: tokens are `perm:<base64>.<base64>.<base64>`; the docs' samples differ in segment length and may contain base64 `+`, `/`, and `=`, so the pattern approximates.
+# note: the docs show Cloud instances as `<tenant>.youtrack.cloud` and self-hosted instances on user-chosen hosts (e.g. `https://youtrack.example.com`), which no host pattern covers.
+
+[providers.zai]
+env = ["ZAI_API_KEY", "ZHIPUAI_API_KEY"]
+hosts = ["https://api.z.ai", "https://open.bigmodel.cn"]
+pattern = "{base62:32}"
+# source: https://docs.z.ai/guides/develop/python/introduction
+# source: https://docs.z.ai/guides/overview/quick-start
+# source: https://pypi.org/project/zhipuai/
+# note: Z.AI's docs read `ZAI_API_KEY` (`export ZAI_API_KEY=your-api-key`) for the global platform (`https://api.z.ai/api/paas/v4`); the legacy China SDK reads `ZHIPUAI_API_KEY` for Zhipu BigModel (`https://open.bigmodel.cn/api/paas/v4`).
+# note: the SDK's direct-set example shows keys shaped `abc123.def456` (dot-separated id and secret) but states no length; `{base62:32}` approximates the whole key.
+
+[providers.zeldoc]
+env = ["ZELDOC_API_KEY"]
+hosts = ["https://api.zeldoc.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.zenifra]
+env = ["ZENIFRA_AI_KEY"]
+hosts = ["https://ai.zenifra.com"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.
+
+[providers.zenmux]
+env = ["ZENMUX_API_KEY"]
+hosts = ["https://zenmux.ai"]
+pattern = "{base62:32}"
+# source: https://models.dev/api.json (curated provider catalog)
+# note: no vendor page states a key format; the shape is generic.

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the transparent bwrap (no docker) integration demo"
+#MISE depends=["build:release"]
+#USAGE flag "--use-sudo" help="Skip the gum escalation prompt and go straight to sudo"
+
+proj_dir=$(git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+set -euo pipefail
+
+# build:release (task dependency) builds as the current user so target/
+# stays user-owned. Only the demo script needs root: netns, veth, host NAT,
+# and the transparent listener.
+if [ "${usage_use_sudo:-false}" = "true" ]; then
+  sudo bash integration/bwrap/run.sh
+else
+  if ! gum confirm "The bwrap demo needs root (netns, veth, nft); escalate with sudo?"; then
+    echo "escalation declined; built binary: target/release/hodor" >&2
+    exit 1
+  fi
+  sudo bash integration/bwrap/run.sh
+fi

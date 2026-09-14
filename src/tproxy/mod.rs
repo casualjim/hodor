@@ -11,6 +11,7 @@ mod route;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::AsRawFd as _;
+use std::path::Path;
 use std::sync::Arc;
 
 use netlink_packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage, NetlinkPayload};
@@ -90,10 +91,17 @@ fn netns_inode(path: &str) -> eyre::Result<u64> {
 }
 
 /// True when our network namespace differs from PID 1's: `ip netns`,
-/// bubblewrap `--unshare-net`, or a container with its own netns. The root
-/// netns of a VM or bare host reads false, which is the point.
+/// bubblewrap `--unshare-net`, or a VM. The root netns of a bare host reads
+/// false, which is the point.
 fn netns_isolated() -> eyre::Result<bool> {
-  Ok(netns_inode("/proc/self/ns/net")? != netns_inode("/proc/1/ns/net")?)
+  Ok(netns_inode("/proc/self/ns/net")? != netns_inode("/proc/1/ns/net")? || in_container())
+}
+
+/// Container runtimes leave marker files; a container's default network is
+/// its own namespace, so unscoped capture stays inside it. `network_mode:
+/// host` opts out of that isolation explicitly and must not rely on markers.
+fn in_container() -> bool {
+  Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
 }
 
 fn assert_unscoped_capture_allowed(options: &Options) -> eyre::Result<()> {
@@ -361,7 +369,7 @@ mod tests {
   }
 
   #[tokio::test]
-  #[ignore = "needs root + HODOR_TEST_TPROXY=1 (mutates host nft rules and routes)"]
+  #[ignore = "needs root (mutates host nft rules and routes)"]
   #[expect(clippy::too_many_lines, reason = "linear live-test script, split would obscure the flow")]
   async fn tproxy_live_tcp_mitm_substitutes() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

@@ -1,3 +1,12 @@
+## [0.1.14] - 2026-09-14
+
+### 🚀 Features
+
+- *(confine)* Compose-based workspace lifecycle
+
+### 🐛 Bug Fixes
+
+- Recover bwrap demo, docs, and image base lost in rebase
 ## [0.1.13] - 2026-09-13
 
 ### 🚀 Features
@@ -7,6 +16,8 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(mise)* Restructure task files into namespaced dirs
+- Update changelog for v0.1.13 [ci skip]
+- Release hodor version 0.1.13
 ## [0.1.12] - 2026-09-12
 
 ### 🐛 Bug Fixes

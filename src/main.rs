@@ -8,6 +8,7 @@
 mod ca;
 mod compose;
 mod config;
+mod fnox_layers;
 mod grants;
 mod proxy;
 mod secrets;

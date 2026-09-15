@@ -24,22 +24,27 @@ No `tests/` or `scripts/`. All logic in `src/*.rs`:
 - `src/sni.rs` — `extract_sni`, `MAX_HELLO` 16K
 
 - `src/tproxy/` — Linux TPROXY: `IP_TRANSPARENT` listener, nft rules over netfilter netlink (`nft.rs`), policy routes (`route.rs`)
-- `.mise/tasks/` — ops scripts (`format`, `build`, `test/_default`, `test/rust`, `test/tproxy`, `demo`)
+- `.mise/tasks/` — the tasks themselves, as executable files (`format`, `clean`, `build/{_default,debug,release}`, `test/{_default,rust,tproxy}`, `demo/{_default,bwrap}`); not configured in `mise.toml`
 - `integration/` — transparent docker compose demo: client shares hodor's netns (`--tproxy` capture, no proxy knowledge, fake-only) + bun api (real-token validation, RFC1918 subnet to prove LAN capture); `mise run demo` builds the runtime image and asserts all four substitution/splice scenarios
 
 - `.github/workflows/` — `ci.yml` (format/clippy/nextest gates), `release.yml` (cargo-dist, generated — do not hand-edit), `release-cut.yml` (version bump + git-cliff + cargo-release), `container.yml` (reusable workflow called by release.yml via `post-announce-jobs`; packs release tarballs into runtime-only image)
 
 ## Development Commands
 
-Sanctioned path is mise (runs both feature sets):
+**START HERE: `mise tasks`. That command lists every available task — run it first, always, before anything else. It is the entry point to this repo: never guess a task name, never reach past it to raw `cargo`.**
+
+**Mise tasks only — never run raw `cargo` (no `cargo build`, `cargo check`, `cargo clippy`, `cargo nextest`, no single-test runs). The one and only verification is `mise run format`, run bare: no pipes, no redirection, no `tail`, nothing chained, no other gate before or after it.**
+
+**Tasks are executable files under `.mise/tasks/` (nested dirs make namespaced subcommands, e.g. `.mise/tasks/test/rust` → `mise run test:rust`); `mise.toml` holds only tools, env, and settings — no task bodies. So a proposal is a proposal to add one executable file at a specific `.mise/tasks/...` path; make it executable, keep the shebang, and follow the existing files' header/error style.**
+
+**If the task you need does not exist in `mise tasks`, propose it. Say what it would run, which file it would live at, why it is needed, and stop there — do not create the file, do not add it to `mise.toml`, do not work around it with a raw command. Wait for approval.**
 
 ```sh
-mise run format   # hk run fix --all, must be green
+mise tasks        # FIRST: list every available task
+mise run format   # the one gate: hk run fix --all, must be green
 mise run test     # nextest, default features only
 mise run test:tproxy # live TPROXY only: needs root, serial
 mise run demo      # docker compose integration demo (builds image, needs docker)
-cargo nextest run substitute::tests::raw_mode_skips_unequal_length  # single test
-cargo build --release --target <triple>  # release build shape (CI builds once; Dockerfile never compiles)
 hodor serve [--tproxy] [--listen 127.0.0.1:8080] [--ca-file ...]  # serve is default
 hodor fake <ENV> [--pattern '{hex:32}']  # deterministic fake
 hodor ca  # generate/load CA, print cert PEM (trust anchor for workload containers)
@@ -66,7 +71,7 @@ Config precedence: CLI > env (`HODOR_*`) > project (`<root>/.config/hodor.toml`)
 | `src/proxy.rs`, `src/substitute.rs` | proxy core, substitution engine (largest module) |
 | `src/ca.rs`, `src/sni.rs`, `src/tproxy/` | PKI + `DashMap` leaf cache, SNI parse, kernel TPROXY capture |
 | `rules/registry.toml` | bundled known-host and token-shape registry, overridable per entry |
-| `mise.toml`, `mise.lock` | pinned toolchain (rust stable, nextest, hk, pkl, hadolint, shellcheck, cargo-sort) |
+| `.mise/tasks/`, `mise.toml`, `mise.lock` | tasks as executable files under `.mise/tasks/`; `mise.toml`/`mise.lock` only pin toolchain + env (rust stable, nextest, hk, pkl, hadolint, shellcheck, cargo-sort) |
 | `hk.pkl`, `rustfmt.toml`, `.config/nextest.toml` | lint pipeline, format, nextest (retries=3, slow-timeout 30s) |
 | `Dockerfile` | runtime-only `ghcr.io/casualjim/bare:libcxx-ssl` + prebuilt binary (no build stage); multi-arch via per-platform digests + manifest merge in `container.yml` |
 | `dist-workspace.toml`, `.git-cliff.toml` | cargo-dist release targets (linux amd64+arm64), changelog config |
@@ -78,4 +83,4 @@ Rust-only repo (no Node/Bun). Toolchain Rust 1.98.1 stable via mise; `CARGO_HOME
 
 ## Testing & QA
 
-Framework: `cargo-nextest` over inline `#[cfg(test)] mod tests` per file; `tokio::test` for async; helpers co-located (`MitmFixture` in `proxy.rs`, `lock_env`+`tempdir` in `config.rs`); deps `pretty_assertions`, `tempfile` only. No `tests/` dir, no snapshots, no coverage tooling. Live TPROXY tests are `#[ignore]`, run explicitly via `mise run test:tproxy` (root + `--test-threads=1`); closest end-to-end proof is `tproxy_live_tcp_mitm_substitutes` (fake→real→fake).
+Framework: `cargo-nextest` over inline `#[cfg(test)] mod tests` per file (invoked through `mise run test`, never raw `cargo nextest`); `tokio::test` for async; helpers co-located (`MitmFixture` in `proxy.rs`, `lock_env`+`tempdir` in `config.rs`); deps `pretty_assertions`, `tempfile` only. No `tests/` dir, no snapshots, no coverage tooling, no single-test runs. Live TPROXY tests are `#[ignore]`, run explicitly via `mise run test:tproxy` (root + `--test-threads=1`); closest end-to-end proof is `tproxy_live_tcp_mitm_substitutes` (fake→real→fake).

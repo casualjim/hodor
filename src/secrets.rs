@@ -232,39 +232,71 @@ impl Registry {
   }
 }
 
-/// Opened fnox handle plus the names it declares.
+/// Merged fnox config plus the profiles and names it declares.
 #[derive(Clone, Debug)]
 pub(crate) struct FnoxSource {
-  fnox: fnox_core::Fnox,
+  config: fnox_core::config::Config,
+  profiles: Vec<String>,
   declared: BTreeSet<String>,
 }
 
 /// Map a discovery failure with no config found to `None`; other errors stay.
-fn discovered_or_none(found: fnox_core::Result<fnox_core::Fnox>) -> eyre::Result<Option<fnox_core::Fnox>> {
+fn discovered_or_none(found: fnox_core::Result<fnox_core::config::Config>) -> eyre::Result<Option<fnox_core::config::Config>> {
   match found {
-    Ok(fnox) => Ok(Some(fnox)),
+    Ok(config) => Ok(Some(config)),
     Err(fnox_core::FnoxError::ConfigNotFound { .. }) => Ok(None),
     Err(err) => Err(err).wrap_err("fnox discovery failed"),
   }
 }
 
+/// The profile stack the chain loaded with, expanded through inheritance the
+/// way `load_with_recursion` does, so lookup sees the same stack.
+fn active_profiles(config: &fnox_core::config::Config) -> eyre::Result<Vec<String>> {
+  config
+    .resolve_profiles(&fnox_core::config::Config::get_profiles(&[]))
+    .wrap_err("fnox profiles")
+}
+
+/// Names a config declares under the active profiles.
+fn declared_names(config: &fnox_core::config::Config, profiles: &[String]) -> eyre::Result<BTreeSet<String>> {
+  // Same setting value() reads through get_secret, so the declared set and the
+  // resolved value cannot disagree about whether top-level secrets count.
+  let no_defaults = fnox_core::settings::Settings::get().no_defaults;
+  Ok(
+    config
+      .get_secrets_with_no_defaults(profiles, no_defaults)
+      .wrap_err("fnox: cannot list secrets")?
+      .into_keys()
+      .collect(),
+  )
+}
+
 impl FnoxSource {
-  /// Open fnox via its own discovery, or `None` when no config exists.
+  /// Open the discovered chain, or `None` when no config exists.
   pub(crate) fn open() -> eyre::Result<Option<Self>> {
-    let fnox = discovered_or_none(fnox_core::Fnox::discover())?;
-    let Some(fnox) = fnox else {
+    let Some(config) = discovered_or_none(crate::fnox_layers::discover())? else {
       return Ok(None);
     };
-    let declared = fnox.list().wrap_err("fnox: cannot list secrets")?.into_iter().collect();
-    Ok(Some(Self { fnox, declared }))
+    let profiles = active_profiles(&config)?;
+    let declared = declared_names(&config, &profiles)?;
+    Ok(Some(Self {
+      config,
+      profiles,
+      declared,
+    }))
   }
 
-  /// Open fnox at an explicit config path; test injection point.
+  /// Open one explicit config file; test injection point.
   #[cfg(test)]
   fn open_at(path: &Path) -> eyre::Result<Self> {
-    let fnox = fnox_core::Fnox::open(path).wrap_err_with(|| format!("fnox config {}", path.display()))?;
-    let declared = fnox.list().wrap_err("fnox: cannot list secrets")?.into_iter().collect();
-    Ok(Self { fnox, declared })
+    let config = crate::fnox_layers::load(path).wrap_err_with(|| format!("fnox config {}", path.display()))?;
+    let profiles = active_profiles(&config)?;
+    let declared = declared_names(&config, &profiles)?;
+    Ok(Self {
+      config,
+      profiles,
+      declared,
+    })
   }
 
   /// Names fnox declares, sorted.
@@ -278,7 +310,17 @@ impl FnoxSource {
     if !self.declared.contains(key) {
       return Ok(None);
     }
-    let Some(value) = self.fnox.get(key).await.wrap_err_with(|| format!("fnox secret `{key}`"))? else {
+    let Some(secret) = self
+      .config
+      .get_secret(&self.profiles, key)
+      .wrap_err_with(|| format!("fnox secret `{key}`"))?
+    else {
+      eyre::bail!("fnox key `{key}` is declared but resolves to no value");
+    };
+    let resolved = fnox_core::secret_resolver::resolve_secret(&self.config, &self.profiles, key, secret)
+      .await
+      .wrap_err_with(|| format!("fnox secret `{key}`"))?;
+    let Some(value) = resolved else {
       eyre::bail!("fnox key `{key}` is declared but resolves to no value");
     };
     eyre::ensure!(!value.is_empty(), "fnox key `{key}` is declared but resolves to an empty value");
@@ -740,6 +782,7 @@ hosts = ["https://api.example/path"]
       },
       workspace: crate::config::WorkspaceCfg::default(),
       rules: BTreeMap::new(),
+      agents: BTreeMap::new(),
     };
     config.rules.insert(label.to_string(), rule);
     config

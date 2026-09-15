@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+#MISE description="Clean all the generated files in the project"
+
+proj_dir=$(git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+set -euo pipefail
+
+cargo clean

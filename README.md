@@ -169,7 +169,7 @@ hosts = ["https://ghe.corp.example"]
 
 When a rule has no inline `value`, hodor resolves it through [fnox](https://fnox.jdx.dev), which reaches age, 1Password, AWS Secrets Manager, Vault, Bitwarden, the OS keychain, and the rest of its provider catalog. hodor embeds `fnox-core`; no fnox binary is needed.
 
-The fnox source is whatever fnox's own discovery finds from the working directory: an upward `fnox.toml` walk layered over fnox's global config, per workspace. A key fnox does not declare follows the rule's `if_missing`; a key it declares but cannot resolve is a startup error.
+The fnox source is fnox's own discovery chain with one level added. Values resolve from least to most specific: fnox's global config (`$FNOX_CONFIG_DIR/config.toml`), then `<config-dir>/hodor/fnox.toml`, then the upward `fnox.toml` walk, per workspace. The middle level belongs to hodor, for secrets that are global here but not global for fnox. It reads `fnox.local.toml` when no profile is active and `fnox.<profile>.toml` per active profile otherwise, so `$FNOX_PROFILE` picks the file standing in for the local slot. A key fnox does not declare follows the rule's `if_missing`; a key it declares but cannot resolve is a startup error.
 
 Embedding `fnox-core` brings rustls's `ring` feature into the build, so both crypto backends are compiled and `ClientConfig::builder()` can no longer select a provider on its own. Any new entry point must call `ca::install_crypto_provider()` first, exactly as `main` does.
 
@@ -208,6 +208,21 @@ hodor finds the workspace root by walking up from the working directory. `--conf
 | `pattern` | no | Decoy pattern, overriding the registry. |
 | `registry` | no | Whether this rule uses registry hosts. Default `true`. |
 | `if_missing` | no | `error` (default), `warn`, or `ignore`. |
+
+`[agents.<name>]`:
+
+Every directory under `<config-dir>/hodor/agents/` mounts into the agent container at the location that agent reads its own configuration from by default, so nothing has to set a config-directory variable. The built-in table covers `amazon-q`, `amp`, `auggie`, `claude`, `cline`, `codebuddy`, `codebuff`, `codex`, `continue`, `copilot`, `crush`, `cursor`, `deepagents`, `droid`, `dsh`, `forge`, `gemini`, `goose`, `gptme`, `grok`, `hermes`, `iflow`, `junie`, `kilo`, `kimi`, `kimi-code`, `kiro`, `mimo-code`, `muse-code`, `omp`, `open-interpreter`, `openclaw`, `openhands`, `opencode`, `pi`, `qoder`, `qwen`, `roo`, `trae`, `vibe`, and `warp`. A directory whose name no entry covers mounts nothing. Entries also carry the common CLI-name spellings, so `claude-code`, `codex-cli`, `gemini-cli`, `grok-build`, `muse`, `qwen-code`, `roo-code`, `mimo`, `factory`, `augment`, `workbuddy`, and `kiro-cli` all resolve.
+
+| Key | Required | Purpose |
+| --- | --- | --- |
+| `config_dir` | yes | Container path the directory mounts at. `{home}` expands to `[workspace] home`. |
+
+```toml
+[agents.trae]
+config_dir = "{home}/.trae"
+```
+
+An entry overrides a built-in path for that name, or adds a name the table does not carry. The mount is writable, so what the agent writes there lands under `<config-dir>/hodor/agents/<name>` on the host.
 
 `HODOR_*` environment variables:
 

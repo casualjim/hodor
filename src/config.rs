@@ -30,6 +30,22 @@ pub struct AppConfig {
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
   pub rules: BTreeMap<String, RuleCfg>,
+  /// Agent config mounts by directory name; extends or overrides the built-in
+  /// table.
+  #[config(default = {})]
+  #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+  pub agents: BTreeMap<String, AgentCfg>,
+}
+
+/// One agent config mount: the directory of this name under
+/// `<config-dir>/agents/` mounts at `config_dir` inside the agent container,
+/// so the agent finds its own configuration where it looks by default.
+#[derive(confique::Config, Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCfg {
+  /// Container path the directory mounts at; `{home}` expands to
+  /// `[workspace] home`.
+  pub config_dir: String,
 }
 
 /// Extra host paths the generated agent service mounts, translated into the

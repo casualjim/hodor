@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "hodor"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "base62",
  "base64 0.22.1",

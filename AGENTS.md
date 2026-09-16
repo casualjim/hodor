@@ -2,12 +2,12 @@
 
 ## Project Overview
 
-Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certs, swaps format-valid decoy fakes for real secrets only on URI-grant match (`scheme://host[:port]`), redacts real values back to fakes on responses. Non-matching traffic splices byte-identical. Linux TPROXY adds kernel-transparent capture (always compiled in on Linux).
+Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certs, swaps format-valid decoy fakes for real secrets only on URI-grant match (`scheme://host[:port]`), redacts real values back to fakes on responses. Non-matching traffic splices byte-identical. Linux has two peer transparent-capture backends behind `--proxy-backend`: `tproxy` (kernel, always compiled in) and `tun` (userspace stack, behind the `tun` feature).
 
 ## Architecture & Data Flow
 
-Startup: `main.rs` → `config::load` (4-layer overlay) → `secrets::resolve` (registry hosts, decoy shapes, fnox values) → `grants::resolve` → `ca::load_or_generate` → `ProxyState::new` (pre-gens leaf certs for exact hosts + one wildcard leaf per `*.`-grant) → `proxy::serve` + optional `tproxy::run_tproxy`.
-Per-connection: accept → httparse head → `intercept_candidate(host,port)` gates MITM vs splice → SNI sniff (`sni.rs` hand-rolled ClientHello parse) → lock-free leaf-cert lookup (expired rotates on next lookup) → `peek_mode` (HTTP/1 vs H2 preface vs raw) → `relay_guarded` pumps guest chunks through request machine (fake→real) and server chunks through response machine (real→fake). TPROXY path reuses `serve_candidate_stream`; UDP passes through unintercepted (QUIC :443 dropped via nft rule).
+Startup: `main.rs` → `config::load` (4-layer overlay) → `secrets::resolve` (registry hosts, decoy shapes, fnox values) → `grants::resolve` → `ca::load_or_generate` → `ProxyState::new` (pre-gens leaf certs for exact hosts + one wildcard leaf per `*.`-grant) → `proxy::serve` + the backend `--proxy-backend` selected: `tproxy::run_tproxy`, `tun::run_tun` (with the `tun` feature), or neither.
+Per-connection: accept → httparse head → `intercept_candidate(host,port)` gates MITM vs splice → SNI sniff (`sni.rs` hand-rolled ClientHello parse) → lock-free leaf-cert lookup (expired rotates on next lookup) → `peek_mode` (HTTP/1 vs H2 preface vs raw) → `relay_guarded` pumps guest chunks through request machine (fake→real) and server chunks through response machine (real→fake). Both capture backends reuse `serve_candidate_stream`, and both treat the captured destination as the identity. UDP: `tproxy` passes it through (QUIC :443 dropped via nft rule); `tun` runs it through `tun::udp` (DNS to the system resolver, QUIC dropped, others relayed).
 Concurrency: `ProxyState` behind plain `Arc` (write-once, no reload); cert cache is a `DashMap` — keygen on caller, never under lock; per-connection `tokio::spawn`; 10s total pre-auth/dial budgets; `SO_MARK` fwmark capture-loop exclusion.
 
 ## Key Directories
@@ -23,9 +23,10 @@ No `tests/` or `scripts/`. All logic in `src/*.rs`:
 - `src/ca.rs` — `CertAuthority`, `CertCache` (`DashMap`, lazy expiry rotation), `upstream_connector`
 - `src/sni.rs` — `extract_sni`, `MAX_HELLO` 16K
 
-- `src/tproxy/` — Linux TPROXY: `IP_TRANSPARENT` listener, nft rules over netfilter netlink (`nft.rs`), policy routes (`route.rs`)
-- `.mise/tasks/` — the tasks themselves, as executable files (`format`, `clean`, `build/{_default,debug,release}`, `test/{_default,rust,tproxy}`, `demo/{_default,bwrap}`); not configured in `mise.toml`
-- `integration/` — transparent docker compose demo: client shares hodor's netns (`--tproxy` capture, no proxy knowledge, fake-only) + bun api (real-token validation, RFC1918 subnet to prove LAN capture); `mise run demo` builds the runtime image and asserts all four substitution/splice scenarios
+- `src/tproxy/` — `tproxy` backend: `IP_TRANSPARENT` listener, nft rules over netfilter netlink (`nft.rs`), policy routes (`route.rs`)
+- `src/tun/` — `tun` backend (Linux, `tun` feature): TUN device + userspace smoltcp stack (`mod.rs`), packet classify (`classify.rs`), device plumbing (`phy.rs`), TCP tracker (`tracker.rs`), UDP relay (`udp.rs`), stream adapter (`chan.rs`), policy routes (`route.rs`)
+- `.mise/tasks/` — the tasks themselves, as executable files (`format`, `clean`, `build/{_default,debug,release}`, `test/{_default,rust,tun,tproxy}`, `demo/{_default,bwrap}`); not configured in `mise.toml`
+- `integration/` — transparent docker compose demo: client shares hodor's netns (`--proxy-backend tproxy`, no proxy knowledge, fake-only) + bun api (real-token validation, RFC1918 subnet to prove LAN capture); `mise run demo` builds the runtime image and asserts all four substitution/splice scenarios
 
 - `.github/workflows/` — `ci.yml` (format/clippy/nextest gates), `release.yml` (cargo-dist, generated — do not hand-edit), `release-cut.yml` (version bump + git-cliff + cargo-release), `container.yml` (reusable workflow called by release.yml via `post-announce-jobs`; packs release tarballs into runtime-only image)
 
@@ -42,39 +43,40 @@ No `tests/` or `scripts/`. All logic in `src/*.rs`:
 ```sh
 mise tasks        # FIRST: list every available task
 mise run format   # the one gate: hk run fix --all, must be green
-mise run test     # nextest, default features only
+mise run test     # nextest, default features then --features tun
+mise run test:tun  # live TUN only: needs root, serial
 mise run test:tproxy # live TPROXY only: needs root, serial
 mise run demo      # docker compose integration demo (builds image, needs docker)
-hodor serve [--tproxy] [--listen 127.0.0.1:8080] [--ca-file ...]  # serve is default
+hodor serve [--proxy-backend tun|tproxy|none] [--listen 127.0.0.1:8080] [--ca-file ...]  # serve is default
 hodor fake <ENV> [--pattern '{hex:32}']  # deterministic fake
 hodor ca  # generate/load CA, print cert PEM (trust anchor for workload containers)
 ```
 
-Config precedence: CLI > env (`HODOR_*`) > project (`<root>/.config/hodor.toml`) > global (`$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`). `--tproxy`/`HODOR_TPROXY` is CLI/env only by design.
+Config precedence: CLI > env (`HODOR_*`) > project (`<root>/.config/hodor.toml`) > global (`$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`). `--proxy-backend`/`HODOR_PROXY_BACKEND` is CLI/env only by design.
 
 ## Code Conventions & Common Patterns
 
 - Format: rustfmt edition 2024, `max_width=140`, `tab_spaces=2`, `merge_derives=false`; `cargo sort --grouped` for `Cargo.toml`.
-- Lints: `missing_docs` warn (every pub item documented); clippy pedantic/perf/cargo warn; `#[allow]` must carry `reason=`; gate is `hk.pkl`: sort → rustfmt → `cargo-check` → `clippy --all-targets -- -D warnings`.
+- Lints: `missing_docs` warn (every pub item documented); clippy pedantic/perf/cargo warn; `#[allow]` must carry `reason=`; gate is `hk.pkl`: sort → rustfmt → `cargo-check` → clippy, each run for the default and the `tun` feature set.
 - Errors: `eyre::Result` everywhere with context strings (`bail!`/`ensure!`); malformed client traffic closes quietly (`Ok(())`), never errors. Framing uncertainty degrades to opaque scan-and-forward, never blocks.
 - Async: tokio multi-thread; `tokio::select!` in relay/UDP pumps; `DashMap` cert cache (lock-free reads, keygen on caller); `socket2` for `SO_MARK`.
 - Secrets: `secrecy::SecretString`; log label + `Location::{Header,BasicAuth,Body}` only, never values. Test fakes look like `$$_CREDENTIAL_XXX:L`.
-- Naming: `snake_case` behavior-descriptive tests (no `test_` prefix, e.g. `precedence_cli_beats_env_beats_project_beats_global`); live tests `tproxy_live_*`; scenario modules `h2_tests`, `stack_tests`.
+- Naming: `snake_case` behavior-descriptive tests (no `test_` prefix, e.g. `precedence_cli_beats_env_beats_project_beats_global`); live tests `tun_live_*`/`tproxy_live_*`; scenario modules `h2_tests`, `stack_tests`.
 - Grants: `scheme://host[:port]` (`http`/`https`/`tcp`; tcp needs port; hosts exact/`*.`-wildcard/`*`, ASCII case-insensitive).
 
 ## Important Files
 
 | Path | Role |
 | --- | --- |
-| `Cargo.toml` | single crate `hodor`, edition 2024; no cargo features |
+| `Cargo.toml` | single crate `hodor`, edition 2024; sole feature `tun` |
 | `src/main.rs`, `src/config.rs`, `src/grants.rs` | entry, config overlay, grant model |
 | `src/proxy.rs`, `src/substitute.rs` | proxy core, substitution engine (largest module) |
-| `src/ca.rs`, `src/sni.rs`, `src/tproxy/` | PKI + `DashMap` leaf cache, SNI parse, kernel TPROXY capture |
+| `src/ca.rs`, `src/sni.rs`, `src/tproxy/`, `src/tun/` | PKI + `DashMap` leaf cache, SNI parse, the `tproxy` and `tun` capture backends |
 | `rules/registry.toml` | bundled known-host and token-shape registry, overridable per entry |
 | `.mise/tasks/`, `mise.toml`, `mise.lock` | tasks as executable files under `.mise/tasks/`; `mise.toml`/`mise.lock` only pin toolchain + env (rust stable, nextest, hk, pkl, hadolint, shellcheck, cargo-sort) |
 | `hk.pkl`, `rustfmt.toml`, `.config/nextest.toml` | lint pipeline, format, nextest (retries=3, slow-timeout 30s) |
 | `Dockerfile` | runtime-only `ghcr.io/casualjim/bare:libcxx-ssl` + prebuilt binary (no build stage); multi-arch via per-platform digests + manifest merge in `container.yml` |
-| `dist-workspace.toml`, `.git-cliff.toml` | cargo-dist release targets (linux amd64+arm64), changelog config |
+| `dist-workspace.toml`, `.git-cliff.toml` | cargo-dist release targets (linux amd64+arm64, `--features tun`), changelog config |
 | `README.md` | purpose + sanctioned tasks + release flow + acceptance pointer |
 
 ## Runtime/Tooling Preferences
@@ -83,4 +85,4 @@ Rust-only repo (no Node/Bun). Toolchain Rust 1.98.1 stable via mise; `CARGO_HOME
 
 ## Testing & QA
 
-Framework: `cargo-nextest` over inline `#[cfg(test)] mod tests` per file (invoked through `mise run test`, never raw `cargo nextest`); `tokio::test` for async; helpers co-located (`MitmFixture` in `proxy.rs`, `lock_env`+`tempdir` in `config.rs`); deps `pretty_assertions`, `tempfile` only. No `tests/` dir, no snapshots, no coverage tooling, no single-test runs. Live TPROXY tests are `#[ignore]`, run explicitly via `mise run test:tproxy` (root + `--test-threads=1`); closest end-to-end proof is `tproxy_live_tcp_mitm_substitutes` (fake→real→fake).
+Framework: `cargo-nextest` over inline `#[cfg(test)] mod tests` per file (invoked through `mise run test`, never raw `cargo nextest`); `tokio::test` for async; helpers co-located (`MitmFixture` in `proxy.rs`, `make_tun` in `tun/`, `lock_env`+`tempdir` in `config.rs`); deps `pretty_assertions`, `tempfile` only. No `tests/` dir, no snapshots, no coverage tooling, no single-test runs. Live capture tests are `#[ignore]`, run explicitly via `mise run test:tun` / `mise run test:tproxy` (root + `--test-threads=1`); closest end-to-end proofs are `tun_live_tcp_mitm_substitutes` and `tproxy_live_tcp_mitm_substitutes` (fake→real→fake).

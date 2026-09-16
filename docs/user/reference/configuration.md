@@ -5,7 +5,7 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 ## Layers
 
 1. CLI flags: `--listen`, `--ca-file`, `--config`.
-2. Environment variables: `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_TPROXY`, `HODOR_TPROXY_ALLOW_ROOT_NETNS`.
+2. Environment variables: `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_PROXY_BACKEND`, `HODOR_TPROXY_ALLOW_ROOT_NETNS`.
 3. The project file at `<workspace root>/.config/hodor.toml`. The workspace root is found by walking up from the working directory.
 4. The global file at `$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`.
 
@@ -69,7 +69,7 @@ An entry overrides a built-in path for that name or adds a name the table does n
 | `HODOR_LISTEN` | Sets `[proxy] listen`. |
 | `HODOR_CA_FILE` | Sets `[proxy] ca_file`. |
 | `HODOR_CONFIG` | Sets the global config file path. |
-| `HODOR_TPROXY` | Same as `--tproxy`. CLI and environment only. |
+| `HODOR_PROXY_BACKEND` | Same as `--proxy-backend`. CLI and environment only. |
 | `HODOR_TPROXY_ALLOW_ROOT_NETNS` | Same as `--tproxy-allow-root-netns`. |
 
 ## Validation

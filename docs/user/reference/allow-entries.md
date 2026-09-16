@@ -43,4 +43,4 @@ Consequences worth knowing:
 
 - Only an `https://` entry makes a host TLS-eligible. A `tcp://host:443` entry alone captures the connection but never terminates its TLS.
 - hodor matches the request authority, not the path. A grant to `https://api.example.com` also permits `https://api.example.com/admin`.
-- Under TPROXY capture, a raw TCP connection has no SNI: the destination address is the identity, so a `tcp://` entry must name the literal dialled address.
+- Under transparent capture, a raw TCP connection has no SNI: the destination address is the identity, so a `tcp://` entry must name the literal dialled address.

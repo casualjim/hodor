@@ -4,8 +4,10 @@ import "package://github.com/jdx/hk/releases/download/v1.19.0/hk@1.19.0#/Builtin
 local rust_steps = new Mapping<String, Step> {
 
   ["cargo-check"] = (Builtins.cargo_check) {
-    check = "cargo check --all-targets"
-    fix = "cargo check --all-targets"
+    // Both feature sets: `tun` is optional, so the code it gates is unchecked
+    // by the default build, and the no-feature arms are unchecked by it.
+    check = "cargo check --all-targets && cargo check --all-targets --features tun"
+    fix = "cargo check --all-targets && cargo check --all-targets --features tun"
     depends = "rustfmt"
     check_first = true
   }
@@ -13,8 +15,8 @@ local rust_steps = new Mapping<String, Step> {
   ["cargo-clippy"] = new Step {
     glob = List("**/*.rs")
     stage = List("**/*.rs")
-    check = "cargo clippy --all-targets -- -D warnings"
-    fix = "cargo clippy --all-targets --fix --allow-dirty --allow-staged -- -D warnings"
+    check = "cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features tun -- -D warnings"
+    fix = "cargo clippy --all-targets --fix --allow-dirty --allow-staged -- -D warnings && cargo clippy --all-targets --features tun --fix --allow-dirty --allow-staged -- -D warnings"
     check_first = true
     depends = "cargo-check"
   }

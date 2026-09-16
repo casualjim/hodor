@@ -19,6 +19,9 @@ publish = false
 allow-branch = ["main"]
 pre-release-commit-message = "chore: Release {{crate_name}} version {{version}}"
 
+[features]
+tun = ["smoltcp", "dep:tun"]
+
 [dependencies]
 base62 = "2.0"
 base64 = "0.22"
@@ -51,6 +54,7 @@ secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_norway = "0.9"
 sha2 = "0.10"
+smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp", "std"], optional = true }
 socket2 = "0.6"
 time = "=0.3.47" # pinned: rama main requires exactly 0.3.47; bump together with Cargo.lock's rama rev
 tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt-multi-thread", "sync", "time"] }
@@ -60,6 +64,7 @@ toml = "0.8"
 toml_edit = { version = "0.25", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tun = { version = "0.7", features = ["async"], optional = true }
 url = "2"
 
 [dev-dependencies]

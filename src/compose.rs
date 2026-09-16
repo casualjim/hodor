@@ -320,7 +320,7 @@ pub(crate) fn compose_yaml(
      \x20 hodor:\n\
      \x20   image: ${{HODOR_IMAGE:-ghcr.io/casualjim/hodor:latest}}\n\
      \x20   working_dir: \"{root}\"\n\
-     \x20   command: [\"serve\", \"--tproxy\"]\n\
+     \x20   command: [\"serve\", \"--proxy-backend\", \"tproxy\"]\n\
      \x20   environment:\n\
      \x20     RUST_LOG: info\n\
      \x20     HODOR_CA_FILE: /certs/ca.pem\n\

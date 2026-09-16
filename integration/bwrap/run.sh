@@ -85,7 +85,7 @@ ip netns exec "$NS" env HODOR_REAL="$REAL" CERT_DIR="$certs" \
 api_pid=$!
 
 # hodor with kernel TPROXY inside the same namespace.
-ip netns exec "$NS" RUST_LOG=info "$binary" serve --tproxy --config "$work/hodor.toml" >"$work/hodor.log" 2>&1 &
+ip netns exec "$NS" RUST_LOG=info "$binary" serve --proxy-backend tproxy --config "$work/hodor.toml" >"$work/hodor.log" 2>&1 &
 hodor_pid=$!
 
 # Sandbox wrapper: bwrap shares the netns (no --unshare-net) but isolates

@@ -2,7 +2,7 @@
 
 hodor is a grant-scoped MITM proxy that swaps a workload's format-valid decoy credential for the real value only on hosts you allow.
 
-A workload points its HTTP proxy setting at hodor, or hodor captures its traffic with `--tproxy`. Either way the workload holds a decoy credential, never the real one. The decoy is format-valid, so a tool that checks the shape of a token accepts it.
+A workload points its HTTP proxy setting at hodor, or hodor captures its traffic transparently with `--proxy-backend`. Two backends, peers, chosen by mechanism: `tproxy` lets the kernel redirect TCP (nftables plus policy routing; UDP passes through) and `tun` runs a TUN device and an in-process TCP/IP stack, which also relays UDP itself. Either way the workload holds a decoy credential, never the real one. The decoy is format-valid, so a tool that checks the shape of a token accepts it.
 
 When a connection's host and port match an allow entry, hodor terminates TLS with a per-domain leaf certificate signed by its own CA. It replaces each decoy with its real value in headers, in basic auth, and in bodies, for both HTTP/1 and HTTP/2. On the response, it replaces real values with the decoy again, so the client sees only the decoy.
 
@@ -33,12 +33,12 @@ Or download a tarball from [the releases page](https://github.com/casualjim/hodo
 docker run --rm ghcr.io/casualjim/hodor:latest fake GH_TOKEN
 ```
 
-**From source**: clone, then build with a recent stable Rust toolchain (the crate uses edition 2024; transparent capture is compiled in on Linux, no cargo feature needed):
+**From source**: clone, then build with a recent stable Rust toolchain (the crate uses edition 2024; kernel TPROXY capture is compiled in on Linux, and the optional `tun` capture mode is behind the `tun` feature):
 
 ```sh
 git clone https://github.com/casualjim/hodor
 cd hodor
-cargo build --release
+cargo build --release --features tun
 ```
 
 ## Try it in ten minutes
@@ -81,7 +81,7 @@ Two runnable examples ship in the repository:
 
 ## Where the limits are
 
-hodor matches the request authority, not the path. A workload that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust hodor's CA to reach a granted HTTPS host. Transparent capture needs root and `CAP_NET_ADMIN`, Linux only. [The security model](docs/user/explanation/security-model.md) states each of these with its consequence.
+hodor matches the request authority, not the path. A workload that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust hodor's CA to reach a granted HTTPS host. Transparent capture needs root and Linux; the `tproxy` backend needs `CAP_NET_ADMIN`, the `tun` backend a TUN device. [The security model](docs/user/explanation/security-model.md) states each of these with its consequence.
 
 ## Contributing
 

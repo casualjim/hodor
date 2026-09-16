@@ -1,5 +1,5 @@
-// Demo client. Shares hodor's network namespace; hodor's TUN capture takes
-// every connection transparently. The client knows nothing about the proxy:
+// Demo client. Shares hodor's network namespace; hodor's transparent capture
+// takes every connection. The client knows nothing about the proxy:
 // it just talks to api by hostname. It holds ONLY the fake token; every
 // passing scenario proves hodor swapped it for the real one (and redacted
 // replies). Hard bounds everywhere: 5s per network await, 20s per scenario,

@@ -70,7 +70,7 @@ pub struct ConfineArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConfineAction {
   /// Generate the workspace stack into
-  /// `<state-dir>/hodor/ws/<slug>/stack.yml` if absent; existing files are
+  /// `<state-dir>/hodor/ws/<slug>/compose.yml` if absent; existing files are
   /// left untouched so edits survive.
   Init,
   /// Start the layered compose project from the files on disk.

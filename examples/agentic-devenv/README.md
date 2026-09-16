@@ -1,110 +1,94 @@
-# Agentic devenv with hodor
+# Confined agent workspace
 
-One hodor container gives an agent container fake credentials, TLS interception, and transparent capture. The agent needs no proxy setting and holds no real secret.
+This is a workspace you can confine. `.config/hodor.toml` is the whole input, and `hodor confine init` turns it into a two-service docker compose stack: hodor, and the agent.
+
+The agent container holds decoy credentials and shares hodor's network namespace, so every connection it makes is captured, with no proxy setting to find and no way around the proxy. hodor swaps a decoy for the real value only on the hosts your rules allow, and puts the decoy back on the response.
 
 ## What the two services do
 
 | Service | Job |
 | --- | --- |
-| `hodor` | Terminates TLS on a grant match, swaps decoys for real values, and captures egress with TUN. |
-| `agent` | Runs the agent. It shares hodor's network namespace and holds only decoys. |
+| `hodor` | Captures egress with TPROXY, terminates TLS on a grant match, swaps decoys for real values, redacts them back on the response. Holds the CA, and resolves real values from fnox itself. |
+| `agent` | Runs the agent behind an entrypoint that trusts hodor's CA, which is all it takes to make a confined agent work. Holds decoys only. |
 
 ## Topology
 
 ```text
   agent            shares hodor's network namespace, no proxy setting
     |
-    |  every connection, captured by TUN policy routing
+    |  every connection, captured by TPROXY in the shared namespace
     v
-  hodor            terminates TLS on a grant match and swaps the decoy
+  hodor            grant match: terminate TLS, swap the decoy for the real value
     |
-    +--> api.anthropic.com   grant matched, real key on the wire
-    +--> anything else       spliced byte for byte, decoy untouched
+    +--> api.anthropic.com   grant matched, the real key goes on the wire
+    +--> anything else       spliced byte for byte, the decoy stays on the wire
 ```
+
+## Before you start
+
+- docker with compose, and hodor on `PATH`.
+- The secrets this workspace uses, declared to fnox under the names in `.config/hodor.toml`.
+- Your fnox setup readable by the hodor container: the stack mounts your fnox config directory and hodor's fnox files read-only, and forwards the provider credentials in your environment, so a value that resolves here resolves there.
 
 ## Run it
 
-The two images come from the registry, so nothing compiles locally. Both are private, so run `docker login ghcr.io` first if you have not.
-
-Create your config from the template, then put the real values in it.
+From this directory:
 
 ```sh
-cp examples/agentic-devenv/hodor.toml.example examples/agentic-devenv/hodor.toml
-$EDITOR examples/agentic-devenv/hodor.toml
+hodor rules            # fnox declarations ∩ registry, as [rules.*] blocks
+hodor confine init     # write the stack, the CA, and the entrypoint
+hodor confine up       # start both services
+hodor confine shell    # a shell in the agent, at the workspace path
+hodor confine down     # stop both
 ```
 
-Generate the CA. One `hodor ca` run writes `ca.pem` with the certificate and the private key, and writes `ca.crt` and `ca.key` beside it.
+`init` writes three things, and never overwrites one that already exists:
 
-```sh
-mkdir -p examples/agentic-devenv/certs
-docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$PWD/examples/agentic-devenv/certs:/certs" \
-  -e HODOR_CA_FILE=/certs/ca.pem \
-  ghcr.io/casualjim/hodor:main ca
-```
+| Path | What it is |
+| --- | --- |
+| `<state-dir>/hodor/ws/<slug>/compose.yml` | the generated stack, which is yours to edit (`<state-dir>` is `~/.local/state` on Linux) |
+| `~/.config/hodor/ca.pem` | hodor's CA, with `ca.crt` and `ca.key` written beside it |
+| `~/.config/hodor/proxy-entrypoint.sh` | the agent's entrypoint |
 
-Start it.
-
-```sh
-docker compose -f examples/agentic-devenv/compose.yaml up -d
-```
+`up` merges three compose layers, later winning: `<config-dir>/hodor/compose.yml`, the generated file above, then this workspace's `.config/hodor.compose.yaml` if you create one.
 
 ## Where the secrets live
 
-`hodor.toml` holds the real values and is mounted into the hodor container only. It is gitignored.
-
-The agent container holds decoys. A decoy is deterministic for its env name, so it is safe to commit, and it is the value the agent sends.
+The real values stay in fnox; the hodor service resolves them itself when a request matches a grant. The agent gets one deterministic decoy per rule, shaped by that rule's pattern:
 
 ```sh
-docker run --rm ghcr.io/casualjim/hodor:main fake ANTHROPIC_API_KEY
-docker run --rm ghcr.io/casualjim/hodor:main fake GH_TOKEN
+hodor fake ANTHROPIC_API_KEY    # what the agent sends
+hodor fake GH_TOKEN
 ```
 
-The decoy follows the env name, so renaming an env var changes its decoy. Regenerate the values in the `agent` service when you rename one, or substitution stops matching.
-
-A decoy is shaped like a real key, which is why tools accept it, so a secret scanner can flag it. GitHub push protection allowed the two decoys in this example. A pattern that mimics a provider's live key format is more likely to be blocked.
-
-## How the CA reaches the agent
-
-One `hodor ca` run writes three files into `examples/agentic-devenv/certs`. `ca.pem` holds the certificate and the private key and is what hodor reads. `ca.crt` and `ca.key` are the same certificate and key on their own, which is what makes the two mounts below possible. hodor mounts `ca.pem`, and the agent mounts `ca.crt` alone. An agent holding `ca.key` could mint its own leaf certificates and intercept its own traffic.
-
-The agent reads the certificate through the variables the common toolchains use, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO`. If your image installs a system trust store instead, mount the certificate there and drop those variables.
-
-## Restart and reset
-
-Recreate hodor and the agent together with `docker compose -f examples/agentic-devenv/compose.yaml up -d`. The agent shares hodor's network namespace, so recreating the hodor service alone leaves the agent attached to a dead namespace and its DNS stops resolving.
-
-The CA is a file on your machine, so it survives `up` and `down`, and a certificate you install elsewhere keeps working. To rotate it, delete `examples/agentic-devenv/certs`, run `hodor ca` again, and recreate both services.
+A decoy follows the env name, so renaming a variable changes its decoy and substitution stops matching until you regenerate. A rule whose key fnox does not declare produces no decoy at all.
 
 ## Check that it works
 
-Run a request inside the agent container. It has no proxy setting, so the request is captured on the way out.
-
 ```sh
-docker compose -f examples/agentic-devenv/compose.yaml exec agent bash -lc \
-  'curl -sS https://api.anthropic.com/v1/models -H "x-api-key: $ANTHROPIC_API_KEY"'
+hodor confine shell
+curl -sS https://api.anthropic.com/v1/models -H "x-api-key: $ANTHROPIC_API_KEY"
 ```
 
-The upstream answers `401` because the key in `hodor.toml` is still a placeholder. The request reaching it is the point. It proves capture, TLS termination with hodor's CA, and substitution.
+No proxy variable is set anywhere: the connection is captured on its way out. `api.anthropic.com` is a grant, so hodor terminates TLS with its own CA and the upstream sees your real key rather than the decoy.
 
-To watch the swap, set `RUST_LOG: debug` on the hodor service and read its log.
+To watch the swap, set `RUST_LOG: debug` on the hodor service in the generated compose file and read its log. The matching lines name the label and the location, never a value:
 
 ```sh
-docker compose -f examples/agentic-devenv/compose.yaml logs hodor | grep substituted
+docker compose -f ~/.local/state/hodor/ws/<slug>/compose.yml logs hodor | grep substituted
 ```
 
 ```text
 substituted label=anthropic location=Header
 ```
 
-The line carries the label and the location. It never carries a value.
-
 ## Notes
 
 - Capture covers every destination in the namespace, LAN included. A connection with no matching grant is spliced byte for byte, so nothing on your network breaks.
-- UDP is relayed directly. DNS goes to the system resolver and QUIC on port 443 is dropped, so clients fall back to TCP.
-- Keep your own mounts, devices, and environment on the `agent` service. Only the network namespace and the credentials change.
-- `HODOR_IMAGE` and `AGENT_IMAGE` override the two images. Both defaults are private. `:main` follows the branch, and a release publishes `:<version>` and `:latest`.
-- The listener is on loopback in the shared namespace. If you would rather not rely on capture, set `HTTPS_PROXY=http://127.0.0.1:8080` on the agent and both paths work at once.
+- UDP is passed through. DNS goes to the system resolver, and QUIC on port 443 is dropped, so clients fall back to TCP.
+- The listener is on loopback in the shared namespace, so `HTTPS_PROXY=http://127.0.0.1:8080` works as a fallback if you would rather not rely on capture. Both paths can be live at once.
+- Keep your own mounts, devices, and environment on the `agent` service: the generated file is a normal compose file for you to edit. `HODOR_IMAGE` and `AGENT_IMAGE` override the two images.
+- Every directory under `~/.config/hodor/agents/` mounts into the agent at that agent's default config location, writable.
+- Recreate the two services together. The agent shares hodor's network namespace, so recreating hodor alone leaves it attached to a dead namespace and its DNS stops resolving.
 
-[The main README](../../README.md) covers allow entries, decoy patterns, and the rest of the configuration.
+[How to confine a workspace](../../docs/user/how-to/confine-a-workspace.md) covers the whole flow, and the [main README](../../README.md) covers allow entries, decoy patterns, and the rest of the configuration.

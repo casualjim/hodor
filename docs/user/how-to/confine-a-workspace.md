@@ -39,7 +39,7 @@ include = ["~/.config/mise:ro", "../sibling-project"]
 | --- | --- |
 | `home` | `$HOME` inside the agent container. Required for stack generation. Host paths under your home directory translate into this prefix; other paths mount at their own location. |
 | `shell` | Shell invoked by `hodor confine shell`. Defaults to `sh`. |
-| `include` | Extra host paths the agent service mounts. `~` expands; relative paths resolve against the workspace root. A trailing `:ro` or `:rw` sets the mount mode, `rw` by default. |
+| `include` | Extra host paths the agent service mounts. `~` expands; relative paths resolve against the workspace root. A trailing `:ro` or `:rw` sets the mount mode, `rw` by default. Every path must exist: generation stops rather than let docker mount an empty directory in its place. |
 | `name` | Compose project name. Defaults to a slug of the workspace path. |
 
 The workspace root itself is always mounted, at its translated path.
@@ -63,33 +63,23 @@ config_dir = "{home}/.my-agent"
 
 The mounts are writable. Whatever the agent writes lands under `<config-dir>/hodor/agents/<name>` on the host.
 
-## 4. Provide the agent entrypoint
+## 4. The entrypoint and the CA
 
-The generated agent service runs `~/.config/hodor/proxy-entrypoint.sh` as its entrypoint and mounts `~/.config/hodor/ca.crt` into the system CA location. The entrypoint is yours to own; its job is to make the hodor CA trusted inside the container before handing off to the command. A minimal version:
+`init` writes both files the generated stack mounts, when they are missing:
 
-```sh
-#!/bin/sh
-set -e
-CA_SRC=/usr/local/share/ca-certificates/hodor-ca.crt
-if [ "$(id -u)" = "0" ] && command -v update-ca-certificates >/dev/null 2>&1; then
-  update-ca-certificates >/dev/null 2>&1 || true
-fi
-BUNDLE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hodor"
-mkdir -p "$BUNDLE_DIR" 2>/dev/null || true
-if cat /etc/ssl/certs/ca-certificates.crt "$CA_SRC" >"$BUNDLE_DIR/ca-bundle.pem" 2>/dev/null; then
-  export SSL_CERT_FILE="$BUNDLE_DIR/ca-bundle.pem"
-  export REQUESTS_CA_BUNDLE="$BUNDLE_DIR/ca-bundle.pem"
-  export NODE_EXTRA_CA_CERTS="$BUNDLE_DIR/ca-bundle.pem"
-fi
-exec "$@"
-```
+| File | What it is |
+| --- | --- |
+| `~/.config/hodor/ca.pem` | hodor's CA, with `ca.crt` and `ca.key` written beside it. Delete the three to rotate; `init` and `up` create them again. |
+| `~/.config/hodor/proxy-entrypoint.sh` | The agent's entrypoint. It installs the mounted `ca.crt` into the container's system store with `update-ca-certificates`, then `exec`s the command. That needs root, directly or through passwordless `sudo`; without either it prints a warning and the container's tools do not trust hodor. |
 
-Set `HODOR_ENTRYPOINT` on `confine up` to point somewhere else. See [how to trust the CA](trust-the-ca.md) for the full range of options.
+Both are yours after that: nothing existing is overwritten, so edit the entrypoint freely and your version keeps running. Set `HODOR_ENTRYPOINT` to mount a different script, `HODOR_CA` and `HODOR_CA_CRT` to point at a CA somewhere else. See [how to trust the CA](trust-the-ca.md) for the full range of options. Every mount the stack adds is conditional on the host path existing, because a bind mount of a missing path makes docker create a directory in its place.
+
+Node and Python's `requests` read their own bundle instead of the system store, so the generated stack also points `NODE_EXTRA_CA_CERTS` and `REQUESTS_CA_BUNDLE` at the system bundle the entrypoint refreshes.
 
 ## 5. Generate, start, enter, stop
 
 ```sh
-hodor confine init     # generate the stack once, as an editable file
+hodor confine init     # generate the stack, the CA, and the entrypoint once, as editable files
 hodor confine up       # start it
 hodor confine shell    # shell into the agent, in the workspace directory
 hodor confine down     # stop it
@@ -105,7 +95,7 @@ hodor confine down     # stop it
 
 ## What the generated stack does
 
-The hodor service runs `serve --tproxy`, so the agent container, which shares hodor's network namespace, has every outbound connection captured with no proxy setting and no way around the proxy. It holds the CA (`HODOR_CA_FILE=/certs/ca.pem`) and mounts your fnox age identity read-only (`~/.config/fnox/age.txt`), so it can resolve real values itself.
+The hodor service runs `serve --tproxy`, so the agent container, which shares hodor's network namespace, has every outbound connection captured with no proxy setting and no way around the proxy. It holds the CA (`HODOR_CA_FILE=/certs/ca.pem`) and resolves the real values itself: your fnox config directory is mounted read-only at `/root/.config/fnox`, hodor's own fnox files at `/root/.config/hodor`, and the provider credentials present in the environment that ran `confine up` are forwarded by name. A provider token fnox itself declares is resolved inside the container, the way `fnox exec` would.
 
 The agent service holds only decoys, one environment variable per rule, and runs behind your entrypoint. It mounts the same workspace paths plus the agent config mounts from step 3.
 
@@ -114,6 +104,9 @@ Two environment overrides tune the images: `HODOR_IMAGE` (default `ghcr.io/casua
 ## When it breaks
 
 - `no compose layers for ...` — run `hodor confine init` first, or create one of the layer files.
+- `[workspace] include ... does not exist` — fix or drop the entry. Docker would mount an empty directory in its place, so generation stops instead.
+- `warning: could not prepare …ca.pem` — `[proxy] ca_file` points at a container path. That is fine when you mount the CA yourself: set `HODOR_CA` to the host file and `HODOR_CA_CRT` to the certificate the agent should trust.
+- `hodor: not root and no passwordless sudo` — the entrypoint could not refresh the system store, so nothing in the agent trusts hodor. Run the agent service as root (`user: "0"` in one of your compose layers), give that user passwordless sudo, or bake the certificate into the image — see [how to trust the CA](trust-the-ca.md).
 - `[workspace] home is required` — add the `home` key from step 2.
 - A decoy does not get swapped — the decoy was generated with a different pattern than the rule's. `confine init` derives each decoy from its rule's `pattern` for exactly this reason; if you hand-edit the compose file, regenerate decoys with `hodor fake <ENV>` after changing a pattern.
 - DNS stops resolving in the agent after recreating only the hodor service — the agent shares hodor's network namespace, so recreate both: `hodor confine up` again.

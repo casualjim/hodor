@@ -108,27 +108,99 @@ fn split_mode(entry: &Path) -> (PathBuf, bool) {
 /// Generate the stack for a workspace directory: decoys for every
 /// fnox-declared name the registry knows (same selection as `hodor rules`)
 /// plus the translated mounts from `[workspace]`.
+/// What the hodor service mounts and forwards so the container's fnox resolves
+/// what the host's does: its config directory (identity, providers, config),
+/// hodor's own fnox level, and the provider credentials the shell already has.
+#[derive(Default)]
+pub(crate) struct FnoxBinds {
+  mounts: Vec<Mount>,
+  env: Vec<String>,
+}
+
+/// The fnox config directory fnox itself resolves: `FNOX_CONFIG_DIR`, else
+/// `<config-dir>/fnox`.
+fn fnox_config_dir(host_home: Option<&Path>) -> Option<PathBuf> {
+  if let Some(dir) = std::env::var_os("FNOX_CONFIG_DIR") {
+    return Some(PathBuf::from(dir));
+  }
+  dirs::config_dir()
+    .or_else(|| host_home.map(|home| home.join(".config")))
+    .map(|dir| dir.join("fnox"))
+}
+
+/// Bind mounts and environment the hodor service needs to act like fnox does.
+/// Every mount is conditional on the host path existing: docker turns a bind of
+/// a missing path into a directory, which is never what we want. Container paths
+/// are what fnox and hodor look at inside, where the home is `/root`.
+fn fnox_binds(fnox_dir: Option<&Path>, config_dir: Option<&Path>) -> FnoxBinds {
+  let env = crate::secrets::FNOX_ENV
+    .iter()
+    .filter(|name| std::env::var_os(name).is_some())
+    .map(|name| (*name).to_string())
+    .collect();
+  let mut binds = FnoxBinds { mounts: Vec::new(), env };
+  if let Some(dir) = fnox_dir.filter(|dir| dir.is_dir()) {
+    binds.mounts.push(Mount {
+      host: dir.to_path_buf(),
+      container: PathBuf::from("/root/.config/fnox"),
+      ro: true,
+    });
+  }
+  let mut levels = config_dir
+    .and_then(|dir| std::fs::read_dir(dir).ok())
+    .into_iter()
+    .flatten()
+    .flatten()
+    .map(|entry| entry.path())
+    .filter(|path| {
+      path.is_file()
+        && path.file_name().is_some_and(|name| {
+          let name = name.to_string_lossy();
+          name.starts_with("fnox") && name.ends_with(".toml")
+        })
+    })
+    .collect::<Vec<_>>();
+  levels.sort();
+  for path in levels {
+    binds.mounts.push(Mount {
+      container: Path::new("/root/.config/hodor").join(path.file_name().unwrap_or_default()),
+      host: path,
+      ro: true,
+    });
+  }
+  binds
+}
+
+/// Mount entries for the workspace root and `[workspace] include`, ordered the
+/// way `covering` wants them: parents first, so a covering mount wins and
+/// covered paths drop out. A path that is not there is an error rather than a
+/// warning, because docker mounts an empty directory in its place.
+fn include_entries(root: &Path, includes: &[PathBuf], host_home: Option<&Path>) -> eyre::Result<Vec<(PathBuf, bool)>> {
+  let mut entries = vec![(root.to_path_buf(), false)];
+  for entry in includes {
+    let (path, ro) = split_mode(entry);
+    let host = expand(&path, root, host_home);
+    eyre::ensure!(
+      host.exists(),
+      "[workspace] include `{}` does not exist; docker would mount an empty directory in its place",
+      entry.display()
+    );
+    entries.push((host, ro));
+  }
+  entries.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+  Ok(entries)
+}
+
 fn generate_stack(root: &Path) -> eyre::Result<String> {
   let registry = generation_registry()?;
-  let project = root.join(".config").join("hodor.toml");
-  let cli = crate::Cli {
-    config: project.is_file().then_some(project),
-    command: None,
-  };
-  let (config, _) = crate::config::load(&cli)?;
+  let config = workspace_config(root)?;
   let home = config
     .workspace
     .home
     .clone()
     .ok_or_else(|| eyre::eyre!("[workspace] home is required for stack generation"))?;
   let host_home = dirs::home_dir();
-  let mut entries = vec![(root.to_path_buf(), false)];
-  for entry in &config.workspace.include {
-    let (path, ro) = split_mode(entry);
-    entries.push((expand(&path, root, host_home.as_deref()), ro));
-  }
-  // Parents first so a covering mount wins and covered paths drop out.
-  entries.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+  let entries = include_entries(root, &config.workspace.include, host_home.as_deref())?;
   let mounts = covering(
     entries
       .into_iter()
@@ -141,9 +213,21 @@ fn generate_stack(root: &Path) -> eyre::Result<String> {
   );
   let decoys = with_rule_patterns(select(open_fnox()?.as_ref(), &registry), &registry, &config.rules);
   let agent_configs = agent_config_mounts(crate::config::config_dir().as_deref(), &config.agents, &home)?;
+  let fnox = fnox_binds(
+    fnox_config_dir(host_home.as_deref()).as_deref(),
+    crate::config::config_dir().as_deref(),
+  );
   let root_container = translate(root, host_home.as_deref(), &home);
   let project = config.workspace.name.clone().unwrap_or_else(|| workspace_slug(root));
-  Ok(compose_yaml(&decoys, &project, &root_container, &home, &mounts, &agent_configs))
+  Ok(compose_yaml(
+    &decoys,
+    &project,
+    &root_container,
+    &home,
+    &mounts,
+    &agent_configs,
+    &fnox,
+  ))
 }
 
 /// `[rules.*]` TOML for the selection: env names only, values resolve from
@@ -222,6 +306,7 @@ pub(crate) fn compose_yaml(
   home: &str,
   mounts: &[Mount],
   agent_configs: &[Mount],
+  fnox: &FnoxBinds,
 ) -> String {
   let mut out = String::new();
   let _ = write!(
@@ -239,21 +324,31 @@ pub(crate) fn compose_yaml(
      \x20   environment:\n\
      \x20     RUST_LOG: info\n\
      \x20     HODOR_CA_FILE: /certs/ca.pem\n\
-     \x20   cap_add:\n\
+     \x20     # Provider credentials fnox reads, taken from the environment\n\
+     \x20     # this stack starts in; a token fnox itself declares is resolved\n\
+     \x20     # inside the container instead.\n",
+    root = root_container.display()
+  );
+  for name in &fnox.env {
+    let _ = writeln!(out, "      {name}: \"${{{name}}}\"");
+  }
+  out.push_str(
+    "     \x20   cap_add:\n\
      \x20     - NET_ADMIN\n\
      \x20   stop_grace_period: 1s\n\
      \x20   volumes:\n",
-    root = root_container.display()
   );
   for mount in mounts {
     let mode = if mount.ro { "ro" } else { "rw" };
     let _ = writeln!(out, "      - {}:{}:{mode}", mount.host.display(), mount.container.display());
   }
+  out.push_str("      - ${HODOR_CA:-~/.config/hodor/ca.pem}:/certs/ca.pem\n");
+  for mount in &fnox.mounts {
+    let _ = writeln!(out, "      - {}:{}:ro", mount.host.display(), mount.container.display());
+  }
   let _ = write!(
     out,
-    "      - ${{HODOR_CA:-~/.config/hodor/ca.pem}}:/certs/ca.pem\n\
-     \x20     - ~/.config/fnox/age.txt:/root/.config/fnox/age.txt:ro\n\
-     \n\
+    "\n\
      \x20 agent:\n\
      \x20   image: ${{AGENT_IMAGE:-ghcr.io/casualjim/devenv:omp}}\n\
      \x20   # docker-init (tini) as pid 1: signal handling and child reaping\n\
@@ -264,6 +359,8 @@ pub(crate) fn compose_yaml(
      \x20   entrypoint: [\"{home}/.config/hodor/proxy-entrypoint.sh\"]\n\
      \x20   command: [\"sleep\", \"infinity\"]\n\
      \x20   environment:\n\
+     \x20     # The entrypoint installs the CA into the system store. Node and\n\
+     \x20     # Python's requests read their own bundle, so point them at it.\n\
      \x20     NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt\n\
      \x20     REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt\n\
      \x20     # decoys — one per declared rule, swapped by hodor on grant match\n",
@@ -483,6 +580,86 @@ fn workspace_slug(root: &Path) -> String {
   slug.join("-")
 }
 
+/// The workspace's own config, as generation and support-file setup read it:
+/// the project layer at `<root>/.config/hodor.toml` when it exists.
+fn workspace_config(root: &Path) -> eyre::Result<crate::config::AppConfig> {
+  let project = root.join(".config").join("hodor.toml");
+  let cli = crate::Cli {
+    config: project.is_file().then_some(project),
+    command: None,
+  };
+  Ok(crate::config::load(&cli)?.0)
+}
+
+/// The entrypoint the generated agent service runs: it makes hodor's CA trusted
+/// inside the container before handing off to the command, by installing it into
+/// the system store every tool already reads. `confine init` writes it when
+/// absent, so an edited copy survives regeneration.
+const ENTRYPOINT_SCRIPT: &str = r#"#!/bin/sh
+set -e
+# The compose file mounts hodor's certificate at the system CA location, so
+# refreshing the store is the whole job. That needs root: run the agent service
+# as root, or grant it passwordless sudo (devcontainer images usually do).
+if [ "$(id -u)" = "0" ]; then
+  update-ca-certificates >/dev/null 2>&1 || true
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  sudo -n update-ca-certificates >/dev/null 2>&1 || true
+else
+  echo "hodor: not root and no passwordless sudo, so the CA is not in the system store;" >&2
+  echo "hodor: run the agent as root or bake the certificate into the image" >&2
+  echo "hodor: https://github.com/casualjim/hodor/blob/main/docs/user/how-to/trust-the-ca.md" >&2
+fi
+exec "$@"
+"#;
+
+/// Create the host files the generated stack mounts, when they are missing: the
+/// CA at `<dir>/ca.pem` (`ca.crt` and `ca.key` come with it, and the stack
+/// mounts `ca.pem` for hodor and `ca.crt` for the agent) and the agent
+/// entrypoint. Nothing existing is overwritten, so an edited entrypoint or a CA
+/// you installed elsewhere survives. The directory is the hodor config
+/// directory, which is what the compose defaults point at, not `[proxy]
+/// ca_file`: that describes a host-run hodor, not the container's mount.
+fn ensure_support_files(dir: &Path) -> eyre::Result<Vec<(PathBuf, bool)>> {
+  let ca = dir.join("ca.pem");
+  let entrypoint = dir.join("proxy-entrypoint.sh");
+  let mut files = Vec::new();
+  let created = !ca.exists();
+  match crate::ca::load_or_generate(&ca) {
+    Ok(_) => files.push((ca, created)),
+    // A read-only or unwritable config directory only warns: the stack still
+    // starts when HODOR_CA points at a CA made with `hodor ca`.
+    Err(err) => println!("warning: could not prepare {}: {err}", dir.join("ca.pem").display()),
+  }
+  files.push((entrypoint.clone(), write_entrypoint(&entrypoint)?));
+  Ok(files)
+}
+
+/// Write the agent entrypoint when absent. Executable: docker runs it directly.
+fn write_entrypoint(path: &Path) -> eyre::Result<bool> {
+  use std::os::unix::fs::PermissionsExt as _;
+  if path.exists() {
+    return Ok(false);
+  }
+  std::fs::write(path, ENTRYPOINT_SCRIPT).wrap_err_with(|| format!("write {}", path.display()))?;
+  std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).wrap_err_with(|| format!("chmod {}", path.display()))?;
+  Ok(true)
+}
+
+/// Resolve the config directory, then create what the stack mounts there.
+fn prepare_support_files() -> eyre::Result<Vec<(PathBuf, bool)>> {
+  let dir = crate::config::config_dir().ok_or_else(|| eyre::eyre!("unable to resolve the hodor config directory"))?;
+  ensure_support_files(&dir)
+}
+
+/// Report the files the call actually created; absent ones are already there.
+fn report_created(files: &[(PathBuf, bool)]) {
+  for (path, created) in files {
+    if *created {
+      println!("wrote {}", path.display());
+    }
+  }
+}
+
 /// `hodor confine <action>`: generate-once-then-edit, start, and stop the
 /// layered compose project. `init` generates the workspace stack into
 /// `<state-dir>/hodor/ws/<slug>/compose.yml` only when absent — the same
@@ -504,6 +681,7 @@ pub(crate) fn confine_command(action: &crate::ConfineAction, workspace: &Path) -
   match action {
     crate::ConfineAction::Init => {
       std::fs::create_dir_all(&state_ws).wrap_err_with(|| format!("create {}", state_ws.display()))?;
+      report_created(&prepare_support_files()?);
       if ws_compose.is_file() {
         println!("exists, left untouched: {}", ws_compose.display());
         return Ok(());
@@ -536,12 +714,7 @@ pub(crate) fn confine_command(action: &crate::ConfineAction, workspace: &Path) -
       }
       let status = match action {
         crate::ConfineAction::Shell => {
-          let project = root.join(".config").join("hodor.toml");
-          let cli = crate::Cli {
-            config: project.is_file().then_some(project),
-            command: None,
-          };
-          let (config, _) = crate::config::load(&cli)?;
+          let config = workspace_config(&root)?;
           let home = config
             .workspace
             .home
@@ -564,7 +737,10 @@ pub(crate) fn confine_command(action: &crate::ConfineAction, workspace: &Path) -
             .arg(shell)
             .status()
         }
-        crate::ConfineAction::Up => command.arg("up").arg("-d").status(),
+        crate::ConfineAction::Up => {
+          report_created(&prepare_support_files()?);
+          command.arg("up").arg("-d").status()
+        }
         _ => command.arg("down").status(),
       }
       .wrap_err("spawn docker compose")?;
@@ -597,6 +773,17 @@ mod tests {
       container: PathBuf::from(container),
       ro,
     }
+  }
+
+  /// Test-only env write and removal, so the unsafe call lives in one place.
+  fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+    // SAFETY: test-only mutation, and nextest runs one test per process.
+    unsafe { std::env::set_var(key, value) };
+  }
+
+  fn unset_env(key: &str) {
+    // SAFETY: test-only mutation, and nextest runs one test per process.
+    unsafe { std::env::remove_var(key) };
   }
 
   #[test]
@@ -723,7 +910,15 @@ mod tests {
       ]
     );
 
-    let yaml = compose_yaml(&decoys(), "hodor", Path::new("/home/eng/github/hodor"), "/home/eng", &[], &mounts);
+    let yaml = compose_yaml(
+      &decoys(),
+      "hodor",
+      Path::new("/home/eng/github/hodor"),
+      "/home/eng",
+      &[],
+      &mounts,
+      &FnoxBinds::default(),
+    );
     assert!(
       yaml.contains(&format!("- {}:/home/eng/.pi:rw", agents.join("pi").display())),
       "{yaml}"
@@ -782,14 +977,23 @@ mod tests {
       mount("/home/ivan/github/hodor", "/home/eng/github/hodor", false),
       mount("/home/ivan/.config/mise", "/home/eng/.config/mise", true),
     ];
-    let yaml = compose_yaml(&decoys(), "hodor", Path::new("/home/eng/github/hodor"), "/home/eng", &mounts, &[]);
+    let yaml = compose_yaml(
+      &decoys(),
+      "hodor",
+      Path::new("/home/eng/github/hodor"),
+      "/home/eng",
+      &mounts,
+      &[],
+      &FnoxBinds::default(),
+    );
     assert!(yaml.contains("name: hodor\nservices:"), "{yaml}");
     assert!(yaml.contains("working_dir: \"/home/eng/github/hodor\""), "{yaml}");
     assert!(yaml.contains("- /home/ivan/github/hodor:/home/eng/github/hodor:rw"), "{yaml}");
     assert!(yaml.contains("- /home/ivan/.config/mise:/home/eng/.config/mise:ro"), "{yaml}");
     assert!(yaml.contains("/home/eng/.config/hodor/proxy-entrypoint.sh:ro"), "{yaml}");
     assert!(yaml.contains("network_mode: \"service:hodor\""), "{yaml}");
-    assert!(yaml.contains("- ~/.config/fnox/age.txt:/root/.config/fnox/age.txt:ro"), "{yaml}");
+    assert!(yaml.contains("- ${HODOR_CA:-~/.config/hodor/ca.pem}:/certs/ca.pem"), "{yaml}");
+    assert!(!yaml.contains("/root/.config/fnox"), "no fnox mount without binds to mount: {yaml}");
     assert!(yaml.contains("init: true"), "{yaml}");
     assert!(
       yaml.contains("GITHUB_TOKEN: \"ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3\""),
@@ -801,6 +1005,149 @@ mod tests {
   fn workspace_slug_uses_path_segments() {
     assert_eq!(workspace_slug(Path::new("/home/ivan/github/hodor")), "home-ivan-github-hodor");
     assert_eq!(workspace_slug(Path::new("/srv/My_Project")), "srv-my-project");
+  }
+
+  #[test]
+  fn the_example_workspace_loads_and_inherits_registry_hosts() {
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/agentic-devenv/.config/hodor.toml");
+    let cli = crate::Cli {
+      config: Some(example.clone()),
+      command: None,
+    };
+    let (config, _) = crate::config::load(&cli).unwrap_or_else(|err| panic!("{} does not load: {err}", example.display()));
+    assert_eq!(config.workspace.home.as_deref(), Some("/home/eng"));
+    assert_eq!(config.workspace.shell.as_deref(), Some("bash"));
+    let registry = generation_registry().unwrap();
+    for (label, env) in [("anthropic", "ANTHROPIC_API_KEY"), ("github", "GH_TOKEN")] {
+      let rule = config
+        .rules
+        .get(label)
+        .unwrap_or_else(|| panic!("`{label}` missing from {}", example.display()));
+      assert_eq!(rule.env, env);
+      assert!(rule.value.is_none(), "`{label}` must resolve from fnox, not carry a value");
+      assert!(!registry.hosts_for(rule).is_empty(), "`{label}` needs hosts from the registry");
+    }
+  }
+
+  #[test]
+  fn includes_that_are_not_there_are_rejected() {
+    let host_home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let sibling = root.path().join("sibling");
+    std::fs::create_dir_all(&sibling).unwrap();
+
+    let entries = include_entries(root.path(), &[PathBuf::from("sibling:ro")], Some(host_home.path())).unwrap();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(entries.iter().any(|(path, ro)| path == &sibling && *ro), "{entries:?}");
+
+    let err = include_entries(root.path(), &[PathBuf::from("missing")], Some(host_home.path())).unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err:?}");
+    assert!(err.to_string().contains("missing"), "{err:?}");
+  }
+
+  #[test]
+  fn fnox_binds_mount_only_what_exists_and_forward_present_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let fnox_dir = home.path().join(".config").join("fnox");
+    std::fs::create_dir_all(&fnox_dir).unwrap();
+    std::fs::write(fnox_dir.join("age.txt"), "AGE-SECRET-KEY-1\n").unwrap();
+    std::fs::write(
+      config_dir.path().join("fnox.toml"),
+      "[secrets.X]\nprovider = \"plain\"\nvalue = \"x\"\n",
+    )
+    .unwrap();
+    std::fs::write(config_dir.path().join("config.toml"), "[proxy]\n").unwrap();
+
+    let binds = fnox_binds(Some(&fnox_dir), Some(config_dir.path()));
+    let rendered: Vec<String> = binds
+      .mounts
+      .iter()
+      .map(|entry| format!("{}:{}:ro", entry.host.display(), entry.container.display()))
+      .collect();
+    assert_eq!(
+      rendered,
+      vec![
+        format!("{}:/root/.config/fnox:ro", fnox_dir.display()),
+        format!("{}:/root/.config/hodor/fnox.toml:ro", config_dir.path().join("fnox.toml").display()),
+      ],
+      "the fnox config directory and hodor's own fnox level, and not the host's hodor config.toml"
+    );
+
+    let empty = tempfile::tempdir().unwrap();
+    assert!(
+      fnox_binds(Some(&empty.path().join("missing")), Some(empty.path()))
+        .mounts
+        .is_empty(),
+      "a path that is not there is never mounted: docker would create a directory in its place"
+    );
+
+    // Credentials the shell has are forwarded by name, so no value lands in the file.
+    let key = "BWS_ACCESS_TOKEN";
+    let previous = std::env::var_os(key);
+    set_env(key, "0.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let binds = fnox_binds(None, None);
+    assert!(binds.env.iter().any(|name| name == key), "{:?}", binds.env);
+    let yaml = compose_yaml(&decoys(), "hodor", Path::new("/home/eng"), "/home/eng", &[], &[], &binds);
+    assert!(yaml.contains(&format!("{key}: \"${{{key}}}\"")), "{yaml}");
+    assert!(
+      !yaml.contains("0.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      "the value must not be written"
+    );
+    match previous {
+      Some(value) => set_env(key, value),
+      None => unset_env(key),
+    }
+  }
+
+  #[test]
+  fn support_files_are_written_when_absent_and_never_overwritten() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let entrypoint = dir.path().join("proxy-entrypoint.sh");
+
+    let files = ensure_support_files(dir.path()).unwrap();
+    assert!(files.iter().all(|(_, created)| *created), "{files:?}");
+    let pem = std::fs::read_to_string(dir.path().join("ca.pem")).unwrap();
+    let crt = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+    let key = std::fs::read_to_string(dir.path().join("ca.key")).unwrap();
+    assert!(dir.path().join("proxy-entrypoint.sh").is_file());
+    // `ca.pem` is what hodor reads; `ca.crt` is the certificate alone, which is
+    // what the agent gets. A clean system needs both.
+    assert!(
+      pem.contains("BEGIN CERTIFICATE") && pem.contains("PRIVATE KEY"),
+      "ca.pem carries both halves"
+    );
+    assert!(
+      crt.contains("BEGIN CERTIFICATE") && !crt.contains("PRIVATE KEY"),
+      "ca.crt carries the certificate only"
+    );
+    assert!(
+      key.contains("PRIVATE KEY") && !key.contains("CERTIFICATE"),
+      "ca.key carries the key only"
+    );
+    let script = std::fs::read_to_string(&entrypoint).unwrap();
+    assert!(
+      script.contains("update-ca-certificates"),
+      "the entrypoint installs the CA into the system store"
+    );
+    assert!(script.contains("exec \"$@\""), "the entrypoint hands off to the command");
+    assert_ne!(
+      std::fs::metadata(&entrypoint).unwrap().permissions().mode() & 0o111,
+      0,
+      "the agent runs the entrypoint directly, so it must be executable"
+    );
+
+    std::fs::write(&entrypoint, "#!/bin/sh\necho mine\n").unwrap();
+    std::fs::remove_file(dir.path().join("ca.pem")).unwrap();
+    let files = ensure_support_files(dir.path()).unwrap();
+    let created: BTreeMap<&str, bool> = files
+      .iter()
+      .map(|(path, created)| (path.file_name().unwrap().to_str().unwrap(), *created))
+      .collect();
+    assert_eq!(created.get("proxy-entrypoint.sh"), Some(&false), "an edited entrypoint survives");
+    assert_eq!(created.get("ca.pem"), Some(&true), "a deleted CA comes back");
+    assert_eq!(std::fs::read_to_string(&entrypoint).unwrap(), "#!/bin/sh\necho mine\n");
   }
 
   #[test]

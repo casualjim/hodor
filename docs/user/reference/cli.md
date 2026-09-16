@@ -41,8 +41,8 @@ Confine a workspace: generate its stack once as an editable file, then start and
 
 | Action | Meaning |
 | --- | --- |
-| `init` | Generate `<state-dir>/hodor/ws/<slug>/compose.yml` if absent. Existing files are left untouched so edits survive. |
-| `up` | Start the layered compose project from the files on disk. |
+| `init` | Generate `<state-dir>/hodor/ws/<slug>/compose.yml` if absent, and write the CA and agent entrypoint the stack mounts when they are missing. Existing files are left untouched so edits survive. |
+| `up` | Start the layered compose project from the files on disk, creating the CA and entrypoint if they are still missing. |
 | `down` | Stop the layered compose project. |
 | `shell` | Exec the configured shell in the agent container at the translated workspace directory. |
 

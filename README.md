@@ -19,6 +19,12 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/casualjim/hodor/releases/latest/download/hodor-installer.sh | sh
 ```
 
+**With mise**, which installs the release tarball for your platform:
+
+```sh
+mise use github:casualjim/hodor
+```
+
 Or download a tarball from [the releases page](https://github.com/casualjim/hodor/releases) and put `hodor` on your `PATH`.
 
 **As a container**: `ghcr.io/casualjim/hodor`. The image is runtime-only, entrypoint `hodor`, default command `serve`.
@@ -70,7 +76,7 @@ Everything lives under [docs/user](docs/user/README.md), arranged by what you ne
 
 Two runnable examples ship in the repository:
 
-- [examples/agentic-devenv](examples/agentic-devenv/README.md) — one hodor container gives an agent container decoy credentials, TLS interception, and transparent capture; the real secret values live in a file the agent never reads.
+- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to confine with `hodor confine`: one hodor container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
 - [integration](integration/README.md) — the compose demo behind `mise run demo`, asserting four substitution scenarios and one splice scenario.
 
 ## Where the limits are

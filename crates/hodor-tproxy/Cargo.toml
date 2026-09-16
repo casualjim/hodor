@@ -1,0 +1,33 @@
+[package]
+name = "hodor-tproxy"
+version = "0.1.16"
+edition = "2024"
+description = "grant-scoped MITM proxy: kernel TPROXY capture backend"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/hodor"
+publish = false
+
+[dependencies]
+eyre = "0.6"
+futures-util = "0.3.34"
+hodor-config = { path = "../hodor-config" }
+hodor-pki = { path = "../hodor-pki" }
+hodor-proxy = { path = "../hodor-proxy" }
+libc = "0.2"
+netlink-packet-core = "0.9"
+netlink-packet-netfilter = "0.4"
+netlink-sys = "0.8"
+rama = { git = "https://github.com/plabayo/rama", default-features = false, features = ["tcp"] }
+rtnetlink = "0.23.0"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+secrecy = { version = "0.10", features = ["serde"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
+tracing = "0.1"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

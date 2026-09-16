@@ -71,6 +71,7 @@ An entry overrides a built-in path for that name or adds a name the table does n
 | `HODOR_CONFIG` | Sets the global config file path. |
 | `HODOR_PROXY_BACKEND` | Same as `--proxy-backend`. CLI and environment only. |
 | `HODOR_TPROXY_ALLOW_ROOT_NETNS` | Same as `--tproxy-allow-root-netns`. |
+| `HODOR_EBPF_CGROUP` | Same as `--ebpf-cgroup`. CLI and environment only. |
 
 ## Validation
 

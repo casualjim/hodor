@@ -1,0 +1,28 @@
+[package]
+name = "hodor-fnox"
+version = "0.1.16"
+edition = "2024"
+description = "grant-scoped MITM proxy: fnox value resolution and discovery layers"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/hodor"
+publish = false
+
+[dependencies]
+eyre = "0.6"
+fnox-core = "1.33"
+hodor-config = { path = "../hodor-config" }
+miette = { version = "7", features = ["fancy"] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+toml = "0.8"
+toml_edit = { version = "0.25", features = ["serde"] }
+tracing = "0.1"
+
+[dev-dependencies]
+miette = { version = "7", features = ["fancy"] }
+pretty_assertions = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

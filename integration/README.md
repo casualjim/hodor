@@ -7,6 +7,11 @@ any proxy. hodor runs `serve --proxy-backend tproxy` and installs its nft rules 
 policy routing inside the shared netns, so every client connection is
 captured on the way out.
 
+This demo pins `tproxy` because the eBPF backend captures by cgroup
+membership, and a compose service's cgroup path is not something the demo
+can fix. For the same scenarios over eBPF, run the docker-free
+[bwrap demo](bwrap/README.md) with `HODOR_BACKEND=ebpf`.
+
 Topology:
 
 - `client` — `network_mode: service:hodor`; talks to `api` by plain
@@ -30,7 +35,7 @@ Topology:
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
-(`src/tproxy/mod.rs` `tproxy_conn_task`). Scenario 5 is the fail-closed control: without a grant
+(`crates/hodor-tproxy/src/tproxy.rs` `tproxy_conn_task`). Scenario 5 is the fail-closed control: without a grant
 hodor splices TLS byte-identical, so no secret can leak and the server
 refuses the fake.
 

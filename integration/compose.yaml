@@ -5,6 +5,10 @@ name: hodor-integration
 # policy routing inside that shared netns, so every client connection is
 # captured without any proxy configuration on the client — LAN included.
 # hodor's marked upstream dials bypass the capture (fwmark rule).
+#
+# tproxy, not ebpf: the eBPF backend captures by cgroup membership, and a
+# compose service's cgroup path is not something this file can pin. Use
+# `HODOR_BACKEND=ebpf mise run demo:bwrap` for the same scenarios over eBPF.
 services:
   certs:
     image: oven/bun:1

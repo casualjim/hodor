@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Transparent-capture demo without docker: a network namespace, a veth up
-# to the host, and hodor's self-installed TPROXY rules inside the netns.
+# to the host, and hodor capturing the client's egress inside the netns.
 # The client runs under bwrap (filesystem-sandboxed) while sharing the
 # netns, so it is captured like any proxy-unaware workload.
+#
+# Set HODOR_BACKEND=ebpf to capture with the cgroup eBPF backend instead of
+# TPROXY; the scenarios asserted are identical either way.
 #
 # Requires: sudo (netns, veth, host nft), iproute2, nft, openssl, bun, curl, bwrap.
 # Run: mise run demo:bwrap (builds as you, escalates only this script)
@@ -18,6 +21,12 @@ API_IP=10.99.0.20
 GW_IP=10.99.0.1
 REAL=ghp_deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 NAT_TABLE=hodor_bwrap_nat
+# `tproxy` (default) or `ebpf`. Both capture kernel-side; eBPF needs its
+# workload in a cgroup and uses no netfilter at all.
+BACKEND=${HODOR_BACKEND:-tproxy}
+# cgroup the client is placed in when BACKEND=ebpf. hodor itself stays in the
+# root cgroup, so its own upstream dials are never captured.
+EBPF_CGROUP=/sys/fs/cgroup/hodor-bwrap
 
 fail() {
   echo "FAIL: $*" >&2
@@ -25,6 +34,10 @@ fail() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "run as root (sudo)"
+case "$BACKEND" in
+tproxy | ebpf) ;;
+*) fail "HODOR_BACKEND must be tproxy or ebpf, got '$BACKEND'" ;;
+esac
 for tool in ip nft openssl bun curl bwrap; do
   command -v "$tool" >/dev/null || fail "missing tool: $tool"
 done
@@ -42,6 +55,9 @@ cleanup() {
   rm -rf "$work"
   ip netns del "$NS" 2>/dev/null || true
   nft delete table inet "$NAT_TABLE" 2>/dev/null || true
+  # Only the ebpf backend creates this; the client is gone by now, so the
+  # empty cgroup can be removed.
+  rmdir "$EBPF_CGROUP" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -84,14 +100,10 @@ ip netns exec "$NS" env HODOR_REAL="$REAL" CERT_DIR="$certs" \
   bun run "$proj_dir/integration/api/server.ts" >"$work/api.log" 2>&1 &
 api_pid=$!
 
-# hodor with kernel TPROXY inside the same namespace.
-ip netns exec "$NS" RUST_LOG=info "$binary" serve --proxy-backend tproxy --config "$work/hodor.toml" >"$work/hodor.log" 2>&1 &
-hodor_pid=$!
-
 # Sandbox wrapper: bwrap shares the netns (no --unshare-net) but isolates
 # the filesystem; the client needs /certs for the CA and nothing else.
-client() {
-  ip netns exec "$NS" bwrap \
+sandbox() {
+  bwrap \
     --ro-bind /usr /usr \
     --symlink usr/bin /bin \
     --symlink usr/lib /lib \
@@ -103,6 +115,32 @@ client() {
     --setenv PATH /usr/bin:/bin \
     "$@"
 }
+export -f sandbox
+
+case "$BACKEND" in
+tproxy)
+  # hodor with kernel TPROXY inside the same namespace.
+  ip netns exec "$NS" RUST_LOG=info "$binary" serve --proxy-backend tproxy --config "$work/hodor.toml" >"$work/hodor.log" 2>&1 &
+  client() { ip netns exec "$NS" sandbox "$@"; }
+  ;;
+ebpf)
+  # cgroup holding only the client. Membership is what scopes capture: hodor
+  # itself stays in the root cgroup, so its upstream dials are never
+  # redirected back into it.
+  mkdir -p "$EBPF_CGROUP"
+  ip netns exec "$NS" RUST_LOG=info "$binary" serve --proxy-backend ebpf --ebpf-cgroup "$EBPF_CGROUP" --config "$work/hodor.toml" >"$work/hodor.log" 2>&1 &
+  # The client migrates itself before exec'ing the sandbox, so bwrap and
+  # everything it spawns are captured. `$BASHPID` is this child shell's pid;
+  # it must be read by the child, so the script is passed with the cgroup as
+  # a positional argument rather than interpolated here. SC2016 is that
+  # intent, not an oversight.
+  # shellcheck disable=SC2016
+  client() {
+    ip netns exec "$NS" bash -c 'echo "$BASHPID" >"$1/cgroup.procs"; shift; sandbox "$@"' hodor-client "$EBPF_CGROUP" "$@"
+  }
+  ;;
+esac
+hodor_pid=$!
 
 wait_port() {
   for _ in $(seq 1 50); do

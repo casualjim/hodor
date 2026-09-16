@@ -47,6 +47,46 @@ version = "2.1.4"
 backend = "cargo:cargo-sort"
 specifiers = ["latest"]
 
+[[tools."github:aya-rs/bpf-linker"]]
+version = "0.11.1"
+backend = "github:aya-rs/bpf-linker"
+specifiers = ["0.11.1"]
+
+[tools."github:aya-rs/bpf-linker"."platforms.linux-arm64"]
+checksum = "sha256:341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380"
+url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-aarch64-unknown-linux-musl.tar.zst"
+url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788687"
+
+[tools."github:aya-rs/bpf-linker"."platforms.linux-arm64-musl"]
+checksum = "sha256:341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380"
+url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-aarch64-unknown-linux-musl.tar.zst"
+url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788687"
+
+[tools."github:aya-rs/bpf-linker"."platforms.linux-x64"]
+checksum = "sha256:e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8"
+url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788789"
+
+[tools."github:aya-rs/bpf-linker"."platforms.linux-x64-musl"]
+checksum = "sha256:e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8"
+url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788789"
+
+[tools."github:aya-rs/bpf-linker"."platforms.macos-arm64"]
+checksum = "sha256:39e4fca00117e74a834d9904283500e3b00213ce745df448b4757fc375544018"
+url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-aarch64-apple-darwin.tar.zst"
+url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788654"
+
+[tools."github:aya-rs/bpf-linker"."platforms.macos-x64"]
+checksum = "sha256:7771c941196dbb699df285737f9c954fafdda8b560fe5c3726d1a2872e3eacab"
+url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-apple-darwin.tar.zst"
+url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788710"
+
+[tools."github:aya-rs/bpf-linker"."platforms.windows-x64"]
+checksum = "sha256:0afb407265502082776c1abd24cbafad44e2ac469a9d91b8439ff9f6f80c1d70"
+url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-pc-windows-gnullvm.tar.zst"
+url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788745"
+
 [[tools."github:casualjim/remark"]]
 version = "0.6.2"
 backend = "github:casualjim/remark"

@@ -15,10 +15,22 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # `hodor-ebpf-programs` compiles for the `bpf` target, which the stable
+      # toolchain cannot build: it needs nightly with `-Z build-std` and the
+      # `bpf-linker` linker.
+      - uses: dtolnay/rust-toolchain@nightly
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev zstd
+
+      - name: Install bpf-linker
+        run: |
+          url=https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          curl --proto '=https' --tlsv1.2 -sSfL "$url" -o /tmp/bpf-linker.tar.zst
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
+          sudo install -m 0755 /tmp/bpf-linker /usr/local/bin/bpf-linker
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -26,16 +38,15 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # `--exclude hodor-ebpf-programs`: the BPF program crate is a workspace
+      # member only so `aya-build` can resolve it, and it does not build for the
+      # host. `aya-build` compiles it as part of `hodor-ebpf`, so it is covered.
       - name: Clippy
         run: |
-          cargo clippy --all-targets -- -D warnings
-          cargo clippy --all-targets --features tun -- -D warnings
+          cargo clippy --workspace --exclude hodor-ebpf-programs --all-targets -- -D warnings
 
       - name: Test
-        run: cargo nextest run
-
-      - name: Test (tun)
-        run: cargo nextest run --features tun
+        run: cargo nextest run --workspace --exclude hodor-ebpf-programs
 
   image:
     # Publishes ghcr.io/<repo>:main so the example can pull an image instead of
@@ -52,13 +63,23 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The BPF programs need nightly + the BPF linker, same as the rust job.
+      - uses: dtolnay/rust-toolchain@nightly
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev zstd
+
+      - name: Install bpf-linker
+        run: |
+          url=https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          curl --proto '=https' --tlsv1.2 -sSfL "$url" -o /tmp/bpf-linker.tar.zst
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
+          sudo install -m 0755 /tmp/bpf-linker /usr/local/bin/bpf-linker
 
       - name: Build the release binary
-        run: cargo build --release --features tun
+        run: cargo build --release
 
       - uses: docker/setup-buildx-action@v4
 

@@ -9,4 +9,7 @@ cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
-cargo build --quiet --workspace "$@"
+# `--exclude hodor-ebpf-programs`: it is a workspace member only so `aya-build`
+# can resolve it, and its sources compile for the `bpf` target alone. Every
+# host-wide command has to exclude it.
+cargo build --quiet --workspace --exclude hodor-ebpf-programs "$@"

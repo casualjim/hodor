@@ -1,0 +1,26 @@
+[package]
+name = "hodor-pki"
+version = "0.1.16"
+edition = "2024"
+description = "grant-scoped MITM proxy: signing CA, leaf cache, and SNI extraction"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/hodor"
+publish = false
+
+[dependencies]
+dashmap = "6"
+eyre = "0.6"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls-native-certs = "0.8"
+time = "=0.3.47" # pinned: rama main requires exactly 0.3.47; bump together with Cargo.lock's rama rev
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-rustls = "0.26"
+tracing = "0.1"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

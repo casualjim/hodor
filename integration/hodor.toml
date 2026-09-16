@@ -4,7 +4,7 @@
 # `hodor fake GH_TOKEN`; capture is via TPROXY policy routing.
 #
 # The tcp:// grant host is the literal destination IP: captured raw TCP has no
-# SNI, the dst address is the identity (src/tproxy/mod.rs tproxy_conn_task).
+# SNI, the dst address is the identity (crates/hodor-tproxy/src/tproxy.rs tproxy_conn_task).
 # Hence the static api address in compose.yaml.
 [proxy]
 listen = "0.0.0.0:8080"

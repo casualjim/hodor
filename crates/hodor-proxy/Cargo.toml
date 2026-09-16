@@ -1,0 +1,31 @@
+[package]
+name = "hodor-proxy"
+version = "0.1.16"
+edition = "2024"
+description = "grant-scoped MITM proxy: substitution machines and the relay core"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/hodor"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+dashmap = "6"
+eyre = "0.6"
+hodor-config = { path = "../hodor-config" }
+hodor-pki = { path = "../hodor-pki" }
+httlib-hpack = "0.1.3"
+httparse = "1"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+secrecy = { version = "0.10", features = ["serde"] }
+socket2 = "0.6"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

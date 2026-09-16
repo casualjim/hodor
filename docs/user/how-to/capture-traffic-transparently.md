@@ -4,7 +4,7 @@ This guide shows you how to make hodor capture a workload's connections without 
 
 Explicit-proxy mode (point `HTTPS_PROXY` at hodor) needs none of this. Reach for transparent capture when you cannot or will not configure the client, or when the client must not be able to bypass the proxy.
 
-Transparent capture comes in two backends, chosen with `--proxy-backend`. `tproxy` is the kernel path: nftables rules and policy routes hand TCP to an `IP_TRANSPARENT` listener, and UDP passes through untouched except for the QUIC drop. `tun` is the userspace path: hodor opens a TUN device and runs its own TCP/IP stack, so it relays UDP itself (DNS to the system resolver, QUIC dropped), and it needs a binary built with the `tun` feature. They are peers, not a migration path — pick by mechanism, not by age.
+Transparent capture comes in three backends, chosen with `--proxy-backend`. `tproxy` is the kernel path: nftables rules and policy routes hand TCP to an `IP_TRANSPARENT` listener, and UDP passes through untouched except for the QUIC drop. `tun` is the userspace path: hodor opens a TUN device and runs its own TCP/IP stack, so it relays UDP itself (DNS to the system resolver, QUIC dropped), and it needs root. `ebpf` is the netfilter-free kernel path: cgroup socket hooks rewrite destinations to hodor's loopback listeners, needing a cgroup for the workload. They are peers, not a migration path — pick by mechanism, not by age.
 
 ## 1. Start hodor with a capture backend
 
@@ -12,15 +12,28 @@ Transparent capture comes in two backends, chosen with `--proxy-backend`. `tprox
 sudo hodor serve --proxy-backend tproxy --config hodor.toml
 ```
 
-Or, with a binary built `--features tun`:
+Or, over the userspace stack:
 
 ```sh
 sudo hodor serve --proxy-backend tun --config hodor.toml
 ```
 
-Both install what they need themselves, over netlink: `tproxy` an `IP_TRANSPARENT` listener plus nftables rules and policy routes, `tun` the device plus policy routes. No `nft` or `ip` binary is required. Capture applies to every outbound TCP connection in the network namespace, LAN destinations included.
+Or, naming the cgroup the workload will be placed in:
 
-`HODOR_PROXY_BACKEND=tproxy` and `HODOR_PROXY_BACKEND=tun` are the environment equivalents.
+```sh
+sudo mkdir -p /sys/fs/cgroup/hodor
+sudo hodor serve --proxy-backend ebpf --ebpf-cgroup /sys/fs/cgroup/hodor --config hodor.toml
+```
+
+`tproxy` and `tun` install what they need themselves, over netlink: `tproxy` an `IP_TRANSPARENT` listener plus nftables rules and policy routes, `tun` the device plus policy routes. No `nft` or `ip` binary is required. Either captures every outbound TCP connection in the network namespace, LAN destinations included.
+
+`ebpf` is different in two ways that matter operationally. It touches no netfilter and no routing table: the programs are attached to a cgroup, and hodor loads them itself. And it captures by *cgroup membership*, not by namespace, so the workload has to be moved into `--ebpf-cgroup` — and hodor must stay outside it, or its own upstream dials would be redirected back into it.
+
+```sh
+echo $$ | sudo tee /sys/fs/cgroup/hodor/cgroup.procs
+```
+
+`HODOR_PROXY_BACKEND`, plus `HODOR_EBPF_CGROUP` for the cgroup path, are the environment equivalents.
 
 ## 2. Understand the safety guard
 
@@ -58,11 +71,15 @@ With `--proxy-backend tproxy`:
 
 With `--proxy-backend tun`, the UDP path runs inside hodor instead: DNS is relayed to the system resolver, QUIC on port 443 is dropped, and any other UDP flow is relayed to its original destination.
 
+With `--proxy-backend ebpf`, only *connected* UDP is captured — a socket that called `connect()`, which is what every HTTP/3 stack does. Those datagrams are relayed unchanged, with no substitution, so a captured QUIC flow reaches the real server with its decoy intact and an authenticated request over it will fail. Unconnected `sendto` traffic, typical DNS included, is never captured and passes through untouched.
+
 Either way, connections with no matching grant are spliced byte for byte. The client sees the real upstream certificate and the decoy travels untouched, so nothing on your network breaks.
 
 ## 5. Tear down
 
 Ctrl-C is the normal stop; hodor handles SIGINT at process level, drops the capture task, and the teardown guard removes the nft rules and policy routes. If the process was killed outright before it could clean up, the policy rules remain — under `tproxy` that means no TCP egress until they are removed by hand (the failure mode the root-netns guard exists to prevent), and under `tun` a stale capture-table default route blackholes egress. Reboot or remove them.
+
+`ebpf` has no such residue. The programs and their maps belong to the loading process, so exit detaches them: nothing is written to netfilter, to a routing table, or under `/sys/fs/bpf`. Verify both directions with `bpftool prog list`: the three `hodor-ebpf-programs` entries are attached while hodor runs and gone once it exits.
 
 ## Check it works
 
@@ -75,3 +92,9 @@ mise run demo
 ```
 
 It runs the container image, a client sharing hodor's netns, and an upstream on an RFC1918 subnet, and it asserts four substitution scenarios and one splice scenario. See [integration/README.md](../../../integration/README.md) for the scenario table.
+
+The same scenarios run without docker over the eBPF backend:
+
+```sh
+HODOR_BACKEND=ebpf mise run demo:bwrap
+```

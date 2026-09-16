@@ -1,6 +1,18 @@
 {
   "version": 1,
   "skills": {
+    "ebpf": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/observability/ebpf/SKILL.md",
+      "computedHash": "61520a57fe9a1dff62aca420f4e110560286aeb120fdaf8b7a104c4d263d8052"
+    },
+    "ebpf-rust": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/observability/ebpf-rust/SKILL.md",
+      "computedHash": "201d066ec47162743fa26bb1f62efe65b97cc1494c69e1ea75a6b56cc7267f96"
+    },
     "rust-skills": {
       "source": "leonardomso/rust-skills",
       "sourceType": "github",

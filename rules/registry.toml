@@ -13,6 +13,7 @@ hosts = ["https://api.302.ai"]
 pattern = "{base62:32}"
 # source: https://models.dev/api.json (curated provider catalog)
 # note: no vendor page states a key format; the shape is generic.
+# note: `302AI_API_KEY` is the name 302.AI and its integrations use, but a POSIX shell cannot `export` a name starting with a digit — set it in `.env`, compose, or fnox instead.
 
 [providers.abacus]
 env = ["ABACUS_API_KEY"]
@@ -213,10 +214,10 @@ pattern = "{base62:24}"
 
 [providers.atomic-chat]
 env = ["ATOMIC_CHAT_API_KEY"]
-hosts = ["http://127.0.0.1:1337"]
 pattern = "{base62:32}"
 # source: https://models.dev/api.json (curated provider catalog)
 # note: no vendor page states a key format; the shape is generic.
+# note: the server is local (127.0.0.1:1337) and loopback traffic never reaches the proxy; name the endpoint here if you expose it on another host.
 
 [providers.auriko]
 env = ["AURIKO_API_KEY"]
@@ -492,10 +493,11 @@ pattern = "{base62:32}"
 
 [providers.databricks]
 env = ["DATABRICKS_TOKEN"]
-hosts = ["https://${DATABRICKS_HOST}"]
+hosts = ["https://*.cloud.databricks.com", "https://*.azuredatabricks.net", "https://*.gcp.databricks.com"]
 pattern = "{base62:32}"
-# source: https://models.dev/api.json (curated provider catalog)
-# note: no vendor page states a key format; the shape is generic.
+# source: https://docs.databricks.com/aws/en/workspace/workspace-details + https://learn.microsoft.com/azure/databricks/workspace/per-workspace-urls
+# note: every workspace has its own host — `dbc-<id>.cloud.databricks.com` on AWS, `adb-<id>.<n>.azuredatabricks.net` on Azure, `<n>.gcp.databricks.com` on GCP — so the grant is wildcarded across the three.
+# note: `DATABRICKS_HOST` is the value the SDKs read, not an API key; list the key variable in the rule instead.
 
 [providers.datadog]
 env = ["DD_API_KEY"]
@@ -699,7 +701,7 @@ pattern = "{hex:32}"
 
 [providers.gemini]
 env = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
-hosts = ["https://generativelanguage.googleapis.com"]
+hosts = ["https://generativelanguage.googleapis.com", "https://api.gemini.com", "https://exchange.gemini.com"]
 pattern = "{base62:32}"
 # source: https://ai.google.dev/gemini-api/docs/api-key
 
@@ -749,7 +751,7 @@ pattern = "{base62:32}"
 
 [providers.grafana]
 env = ["GRAFANA_API_KEY", "GRAFANA_SERVICE_ACCOUNT_TOKEN"]
-hosts = ["https://*.grafana.net"]
+hosts = ["https://*.grafana.net", "https://grafana.com"]
 pattern = "{hex:32}"
 # source: https://grafana.com/docs/grafana/latest/developers/http_api/
 # source: https://grafana.com/docs/grafana/latest/developer-resources/mcp/set-up/client-configuration-examples/
@@ -1023,10 +1025,10 @@ pattern = "{base62:32}"
 
 [providers.lmstudio]
 env = ["LMSTUDIO_API_KEY"]
-hosts = ["http://127.0.0.1:1234"]
 pattern = "{base62:32}"
 # source: https://models.dev/api.json (curated provider catalog)
 # note: no vendor page states a key format; the shape is generic.
+# note: the server is local (127.0.0.1:1234) and loopback traffic never reaches the proxy; name the endpoint here if you expose it on another host.
 
 [providers.longcat]
 env = ["LONGCAT_API_KEY"]
@@ -1044,10 +1046,10 @@ pattern = "{base62:32}"
 
 [providers.lynkr]
 env = ["LYNKR_API_KEY"]
-hosts = ["http://127.0.0.1:8081"]
 pattern = "{base62:32}"
 # source: https://models.dev/api.json (curated provider catalog)
 # note: no vendor page states a key format; the shape is generic.
+# note: the server is local (127.0.0.1:8081) and loopback traffic never reaches the proxy; name the endpoint here if you expose it on another host.
 
 [providers.mailgun]
 env = ["MAILGUN_API_KEY"]
@@ -1292,7 +1294,7 @@ pattern = "{base62:32}"
 
 [providers.onepassword]
 env = ["OP_SERVICE_ACCOUNT_TOKEN"]
-hosts = ["https://api.1password.com", "https://api.1password.ca", "https://api.1password.eu"]
+hosts = ["https://api.1password.com", "https://api.1password.ca", "https://api.1password.eu", "https://events.1password.com"]
 pattern = "ops_{base62:256}"
 # source: https://developer.1password.com/docs/service-accounts/use-with-1password-cli/
 # source: https://www.1password.dev/service-accounts/security
@@ -1693,10 +1695,10 @@ contains = ["slack", "xox"]
 
 [providers.snowflake-cortex]
 env = ["SNOWFLAKE_CORTEX_PAT"]
-hosts = ["https://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com"]
+hosts = ["https://*.snowflakecomputing.com"]
 pattern = "{base62:32}"
-# source: https://models.dev/api.json (curated provider catalog)
-# note: no vendor page states a key format; the shape is generic.
+# source: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api
+# note: the host embeds the account identifier (`<account>.snowflakecomputing.com`, underscores written as hyphens) and Cortex REST lives under `/api/v2/cortex/`.
 
 [providers.spinnaker]
 env = ["ACCESS_TOKEN", "REFRESH_TOKEN"]
@@ -1824,8 +1826,8 @@ pattern = "{base62:32}"
 
 [providers.together]
 env = ["TOGETHER_API_KEY"]
-hosts = ["https://api.together.ai"]
-pattern = "{base62:32}"
+hosts = ["https://api.together.ai", "https://api.together.xyz"]
+pattern = "tgp_v1_{base62:43}"
 # source: https://docs.together.ai/docs/quickstart
 # note: the quickstart documents the variable and the `https://api.together.ai/v1` base URL; the key format is not stated.
 
@@ -2540,7 +2542,7 @@ pattern = "{base62:32}"
 
 [providers.bitfinex]
 env = ["BITFINEX_API_KEY", "BITFINEX_API_TOKEN", "BITFINEX_APIKEY", "BITFINEX_TOKEN", "BITFINEX_ACCESS_TOKEN", "BITFINEX_AUTH_TOKEN", "BITFINEX_SECRET", "BITFINEX_SECRET_KEY", "BITFINEX_KEY"]
-hosts = ["https://api.bitfinex.com", "https://medium.com"]
+hosts = ["https://api.bitfinex.com", "https://medium.com", "https://api-pub.bitfinex.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/bitfinex/bitfinex.go
 
@@ -3092,7 +3094,7 @@ pattern = "{base62:32}"
 
 [providers.datagov]
 env = ["DATAGOV_API_KEY", "DATAGOV_API_TOKEN", "DATAGOV_APIKEY", "DATAGOV_TOKEN", "DATAGOV_ACCESS_TOKEN", "DATAGOV_AUTH_TOKEN", "DATAGOV_SECRET", "DATAGOV_SECRET_KEY", "DATAGOV_KEY"]
-hosts = ["https://api.ers.usda.gov"]
+hosts = ["https://api.ers.usda.gov", "https://developer.nrel.gov"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/datagov/datagov.go
 
@@ -3476,7 +3478,7 @@ pattern = "{base62:32}"
 
 [providers.flyio]
 env = ["FLYIO_API_KEY", "FLYIO_API_TOKEN", "FLYIO_APIKEY", "FLYIO_TOKEN", "FLYIO_ACCESS_TOKEN", "FLYIO_AUTH_TOKEN", "FLYIO_SECRET", "FLYIO_SECRET_KEY", "FLYIO_KEY"]
-hosts = ["https://api.machines.dev"]
+hosts = ["https://api.machines.dev", "https://api.fly.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/flyio/flyio.go
 
@@ -3963,7 +3965,7 @@ pattern = "{base62:32}"
 
 [providers.kucoin]
 env = ["KUCOIN_API_KEY", "KUCOIN_API_TOKEN", "KUCOIN_APIKEY", "KUCOIN_TOKEN", "KUCOIN_ACCESS_TOKEN", "KUCOIN_AUTH_TOKEN", "KUCOIN_SECRET", "KUCOIN_SECRET_KEY", "KUCOIN_KEY"]
-hosts = ["https://api.kucoin.com"]
+hosts = ["https://api.kucoin.com", "https://api-broker.kucoin.com", "https://api-futures.kucoin.com", "https://kucoin.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/kucoin/kucoin.go
 
@@ -4737,7 +4739,7 @@ pattern = "{base62:32}"
 
 [providers.poloniex]
 env = ["POLONIEX_API_KEY", "POLONIEX_API_TOKEN", "POLONIEX_APIKEY", "POLONIEX_TOKEN", "POLONIEX_ACCESS_TOKEN", "POLONIEX_AUTH_TOKEN", "POLONIEX_SECRET", "POLONIEX_SECRET_KEY", "POLONIEX_KEY"]
-hosts = ["https://poloniex.com"]
+hosts = ["https://poloniex.com", "https://api.poloniex.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/poloniex/poloniex.go
 
@@ -5355,9 +5357,10 @@ pattern = "{base62:32}"
 
 [providers.solarwindsobservability]
 env = ["SOLARWINDSOBSERVABILITY_API_KEY", "SOLARWINDSOBSERVABILITY_API_TOKEN", "SOLARWINDSOBSERVABILITY_APIKEY", "SOLARWINDSOBSERVABILITY_TOKEN", "SOLARWINDSOBSERVABILITY_ACCESS_TOKEN", "SOLARWINDSOBSERVABILITY_AUTH_TOKEN", "SOLARWINDSOBSERVABILITY_SECRET", "SOLARWINDSOBSERVABILITY_SECRET_KEY", "SOLARWINDSOBSERVABILITY_KEY"]
-hosts = ["https://api."]
+hosts = ["https://*.cloud.solarwinds.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/solarwindsobservability/solarwindsobservability.go
+# note: the API host depends on the organization's data center — trufflehog verifies against `https://api.<dc>.cloud.solarwinds.com/v1/metrics`.
 
 [providers.sourcegraph]
 env = ["SOURCEGRAPH_API_KEY", "SOURCEGRAPH_API_TOKEN", "SOURCEGRAPH_APIKEY", "SOURCEGRAPH_TOKEN", "SOURCEGRAPH_ACCESS_TOKEN", "SOURCEGRAPH_AUTH_TOKEN", "SOURCEGRAPH_SECRET", "SOURCEGRAPH_SECRET_KEY", "SOURCEGRAPH_KEY"]
@@ -6112,10 +6115,1596 @@ pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/zonkafeedback/zonkafeedback.go
 
 # ---------------------------------------------------------------------------
+# betterleaks (gitleaks successor) rule set: vendors the detectors above state
+# no verification endpoint for. Hosts come from each rule's `validate`
+# expression, which calls the vendor's own API; a rule whose regex states a
+# literal prefix gets that prefix in its pattern.
+# Credentials that are only ever used to sign a request (Alibaba Cloud,
+# OVH application secrets) are left out, as AWS is at the top of this file:
+# their value never reaches the wire, so there is nothing to substitute.
+# source: github.com/betterleaks/betterleaks v1.6.1 config/betterleaks.toml
+# ---------------------------------------------------------------------------
+
+[providers.aikido]
+env = ["AIKIDO_CI_TOKEN", "AIKIDO_CLIENT_SECRET", "AIKIDO_API_KEY", "AIKIDO_API_TOKEN", "AIKIDO_APIKEY", "AIKIDO_TOKEN", "AIKIDO_ACCESS_TOKEN", "AIKIDO_AUTH_TOKEN", "AIKIDO_SECRET", "AIKIDO_SECRET_KEY", "AIKIDO_KEY"]
+hosts = ["https://app.aikido.dev"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `aikido-ci-token` — its validate expression calls app.aikido.dev
+# note: the CI token rule states no literal prefix; the client secret gets its `AIK_SECRET_` shape in the alias block.
+
+[providers.amplitude]
+env = ["AMPLITUDE_API_KEY", "AMPLITUDE_SECRET_KEY", "AMPLITUDE_API_TOKEN", "AMPLITUDE_APIKEY", "AMPLITUDE_TOKEN", "AMPLITUDE_ACCESS_TOKEN", "AMPLITUDE_AUTH_TOKEN", "AMPLITUDE_SECRET", "AMPLITUDE_KEY"]
+hosts = ["https://api2.amplitude.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `amplitude-secret-key` — its validate expression calls api2.amplitude.com
+
+[providers.authress]
+env = ["AUTHRESS_SERVICE_CLIENT_ACCESS_KEY", "AUTHRESS_ACCESS_KEY", "AUTHRESS_API_KEY", "AUTHRESS_API_TOKEN", "AUTHRESS_APIKEY", "AUTHRESS_TOKEN", "AUTHRESS_ACCESS_TOKEN", "AUTHRESS_AUTH_TOKEN", "AUTHRESS_SECRET", "AUTHRESS_SECRET_KEY", "AUTHRESS_KEY"]
+hosts = ["https://api.authress.io"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `authress-service-client-access-key` — its validate expression calls api.authress.io
+
+[providers.canva]
+env = ["CANVA_CLIENT_SECRET", "CANVA_CLIENT_ID", "CANVA_API_KEY", "CANVA_API_TOKEN", "CANVA_APIKEY", "CANVA_TOKEN", "CANVA_ACCESS_TOKEN", "CANVA_AUTH_TOKEN", "CANVA_SECRET", "CANVA_SECRET_KEY", "CANVA_KEY"]
+hosts = ["https://api.canva.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `canva-client-secret` — its validate expression calls api.canva.com
+
+[providers.clerk]
+env = ["CLERK_SECRET_KEY", "CLERK_API_KEY", "CLERK_API_TOKEN", "CLERK_APIKEY", "CLERK_TOKEN", "CLERK_ACCESS_TOKEN", "CLERK_AUTH_TOKEN", "CLERK_SECRET", "CLERK_KEY"]
+hosts = ["https://api.clerk.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `clerk-secret-key` — its validate expression calls api.clerk.com
+# note: Clerk documents `sk_test_`/`sk_live_` prefixes; the rule regex matches the body only, so the shape is generic.
+
+[providers.clickhouse]
+env = ["CLICKHOUSE_API_SECRET_KEY", "CLICKHOUSE_CLOUD_API_SECRET_KEY", "CLICKHOUSE_API_KEY", "CLICKHOUSE_API_TOKEN", "CLICKHOUSE_APIKEY", "CLICKHOUSE_TOKEN", "CLICKHOUSE_ACCESS_TOKEN", "CLICKHOUSE_AUTH_TOKEN", "CLICKHOUSE_SECRET", "CLICKHOUSE_SECRET_KEY", "CLICKHOUSE_KEY"]
+hosts = ["https://api.clickhouse.cloud"]
+pattern = "4b1d{base62:38}"
+# source: betterleaks v1.6.1 rule `clickhouse-cloud-api-secret-key` — its validate expression calls api.clickhouse.cloud
+
+[providers.cloudinary]
+env = ["CLOUDINARY_API_SECRET", "CLOUDINARY_URL", "CLOUDINARY_API_KEY", "CLOUDINARY_API_TOKEN", "CLOUDINARY_APIKEY", "CLOUDINARY_TOKEN", "CLOUDINARY_ACCESS_TOKEN", "CLOUDINARY_AUTH_TOKEN", "CLOUDINARY_SECRET", "CLOUDINARY_SECRET_KEY", "CLOUDINARY_KEY"]
+hosts = ["https://api.cloudinary.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `cloudinary-api-secret` — its validate expression calls api.cloudinary.com
+
+[providers.codecov]
+env = ["CODECOV_TOKEN", "CODECOV_ACCESS_TOKEN", "CODECOV_API_KEY", "CODECOV_API_TOKEN", "CODECOV_APIKEY", "CODECOV_AUTH_TOKEN", "CODECOV_SECRET", "CODECOV_SECRET_KEY", "CODECOV_KEY"]
+hosts = ["https://api.codecov.io"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `codecov-access-token` — its validate expression calls api.codecov.io
+
+[providers.configcat]
+env = ["CONFIGCAT_SDK_KEY", "CONFIGCAT_API_KEY", "CONFIGCAT_API_TOKEN", "CONFIGCAT_APIKEY", "CONFIGCAT_TOKEN", "CONFIGCAT_ACCESS_TOKEN", "CONFIGCAT_AUTH_TOKEN", "CONFIGCAT_SECRET", "CONFIGCAT_SECRET_KEY", "CONFIGCAT_KEY"]
+hosts = ["https://cdn-global.configcat.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `configcat-sdk-key` — its validate expression calls cdn-global.configcat.com
+
+[providers.couchbase-capella]
+env = ["COUCHBASE_CAPELLA_API_KEY", "CAPELLA_API_KEY", "COUCHBASE_CAPELLA_API_TOKEN", "COUCHBASE_CAPELLA_APIKEY", "COUCHBASE_CAPELLA_TOKEN", "COUCHBASE_CAPELLA_ACCESS_TOKEN", "COUCHBASE_CAPELLA_AUTH_TOKEN", "COUCHBASE_CAPELLA_SECRET", "COUCHBASE_CAPELLA_SECRET_KEY", "COUCHBASE_CAPELLA_KEY"]
+hosts = ["https://cloudapi.cloud.couchbase.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `couchbase-capella-api-key` — its validate expression calls cloudapi.cloud.couchbase.com
+
+[providers.cursor]
+env = ["CURSOR_API_KEY", "CURSOR_API_TOKEN", "CURSOR_APIKEY", "CURSOR_TOKEN", "CURSOR_ACCESS_TOKEN", "CURSOR_AUTH_TOKEN", "CURSOR_SECRET", "CURSOR_SECRET_KEY", "CURSOR_KEY"]
+hosts = ["https://api.cursor.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `cursor-api-key` — its validate expression calls api.cursor.com
+# note: no source states a Cursor key format; the shape is generic.
+
+[providers.devin]
+env = ["DEVIN_API_KEY", "DEVIN_PERSONAL_API_KEY", "DEVIN_SERVICE_API_KEY", "DEVIN_SERVICE_USER_TOKEN", "DEVIN_API_TOKEN", "DEVIN_APIKEY", "DEVIN_TOKEN", "DEVIN_ACCESS_TOKEN", "DEVIN_AUTH_TOKEN", "DEVIN_SECRET", "DEVIN_SECRET_KEY", "DEVIN_KEY"]
+hosts = ["https://api.devin.ai"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `devin-personal-api-key` — its validate expression calls api.devin.ai
+# note: the rules match `apk_user_`/`apk_`/`cog_` prefixes with variable bodies, so the shape is generic.
+
+[providers.elastic]
+env = ["ELASTIC_CLOUD_API_KEY", "ELASTICSEARCH_API_KEY", "ELASTIC_API_KEY", "ELASTIC_API_TOKEN", "ELASTIC_APIKEY", "ELASTIC_TOKEN", "ELASTIC_ACCESS_TOKEN", "ELASTIC_AUTH_TOKEN", "ELASTIC_SECRET", "ELASTIC_SECRET_KEY", "ELASTIC_KEY"]
+hosts = ["https://api.elastic-cloud.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `elastic-cloud-api-key` — its validate expression calls api.elastic-cloud.com
+# note: the rule matches the `essu_` prefix with a variable body, so the shape is generic.
+
+[providers.etsy]
+env = ["ETSY_API_KEY", "ETSY_OPEN_API_KEY", "ETSY_API_TOKEN", "ETSY_APIKEY", "ETSY_TOKEN", "ETSY_ACCESS_TOKEN", "ETSY_AUTH_TOKEN", "ETSY_SECRET", "ETSY_SECRET_KEY", "ETSY_KEY"]
+hosts = ["https://api.etsy.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `etsy-open-api-key` — its validate expression calls api.etsy.com
+
+[providers.exoscale]
+env = ["EXOSCALE_API_KEY", "EXOSCALE_SECRET_KEY", "EXOSCALE_API_TOKEN", "EXOSCALE_APIKEY", "EXOSCALE_TOKEN", "EXOSCALE_ACCESS_TOKEN", "EXOSCALE_AUTH_TOKEN", "EXOSCALE_SECRET", "EXOSCALE_KEY"]
+hosts = ["https://*.exoscale.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `exoscale-api-key` — its validate expression calls api-ch-gva-2.exoscale.com
+# note: the validation host is zone-specific (`api-ch-gva-2`), so the host pattern covers every zone; the rule states no key prefix.
+
+[providers.freshbooks]
+env = ["FRESHBOOKS_ACCESS_TOKEN", "FRESHBOOKS_API_KEY", "FRESHBOOKS_API_TOKEN", "FRESHBOOKS_APIKEY", "FRESHBOOKS_TOKEN", "FRESHBOOKS_AUTH_TOKEN", "FRESHBOOKS_SECRET", "FRESHBOOKS_SECRET_KEY", "FRESHBOOKS_KEY"]
+hosts = ["https://api.freshbooks.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `freshbooks-access-token` — its validate expression calls api.freshbooks.com
+
+[providers.harness]
+env = ["HARNESS_API_KEY", "HARNESS_PAT", "HARNESS_TOKEN", "HARNESS_API_TOKEN", "HARNESS_APIKEY", "HARNESS_ACCESS_TOKEN", "HARNESS_AUTH_TOKEN", "HARNESS_SECRET", "HARNESS_SECRET_KEY", "HARNESS_KEY"]
+hosts = ["https://app.harness.io"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `harness-api-key` — its validate expression calls app.harness.io
+# note: the rule matches `pat.`/`sat.` prefixed JWTs; a JWT body is not expressible as a shape, so it is generic.
+
+[providers.influxdb]
+env = ["INFLUXDB_TOKEN", "INFLUXDB_API_TOKEN", "INFLUX_TOKEN", "INFLUXDB_API_KEY", "INFLUXDB_APIKEY", "INFLUXDB_ACCESS_TOKEN", "INFLUXDB_AUTH_TOKEN", "INFLUXDB_SECRET", "INFLUXDB_SECRET_KEY", "INFLUXDB_KEY"]
+hosts = ["https://*.influxdata.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `influxdb-api-token` — its validate expression calls us-east-1-1.aws.cloud2.influxdata.com
+# note: the validation host is cluster-specific, so the host pattern covers every region; InfluxDB tokens are opaque, so the shape is generic.
+
+[providers.jumpcloud]
+env = ["JUMPCLOUD_API_KEY", "JUMPCLOUD_API_TOKEN", "JUMPCLOUD_APIKEY", "JUMPCLOUD_TOKEN", "JUMPCLOUD_ACCESS_TOKEN", "JUMPCLOUD_AUTH_TOKEN", "JUMPCLOUD_SECRET", "JUMPCLOUD_SECRET_KEY", "JUMPCLOUD_KEY"]
+hosts = ["https://console.jumpcloud.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `jumpcloud-api-key` — its validate expression calls console.jumpcloud.com
+
+[providers.kagi]
+env = ["KAGI_API_KEY", "KAGI_API_TOKEN", "KAGI_APIKEY", "KAGI_TOKEN", "KAGI_ACCESS_TOKEN", "KAGI_AUTH_TOKEN", "KAGI_SECRET", "KAGI_SECRET_KEY", "KAGI_KEY"]
+hosts = ["https://kagi.com", "https://*.kagi.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `kagi-api-key` — its validate expression calls kagi.com/api/v0/search
+# note: the rule states no key prefix; the second host covers the `api.` subdomain.
+
+[providers.lighton]
+env = ["LIGHTON_API_KEY", "LIGHTON_PARADIGM_API_KEY", "LIGHTON_API_TOKEN", "LIGHTON_APIKEY", "LIGHTON_TOKEN", "LIGHTON_ACCESS_TOKEN", "LIGHTON_AUTH_TOKEN", "LIGHTON_SECRET", "LIGHTON_SECRET_KEY", "LIGHTON_KEY"]
+hosts = ["https://paradigm.lighton.ai"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `lighton-paradigm-api-key` — its validate expression calls paradigm.lighton.ai
+
+[providers.polymarket]
+env = ["POLYMARKET_API_KEY", "POLYMARKET_API_TOKEN", "POLYMARKET_APIKEY", "POLYMARKET_TOKEN", "POLYMARKET_ACCESS_TOKEN", "POLYMARKET_AUTH_TOKEN", "POLYMARKET_SECRET", "POLYMARKET_SECRET_KEY", "POLYMARKET_KEY"]
+hosts = ["https://clob.polymarket.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `polymarket-api-key` — its validate expression calls clob.polymarket.com
+
+
+[providers.upcloud]
+env = ["UPCLOUD_API_TOKEN", "UPCLOUD_TOKEN", "UPCLOUD_API_KEY", "UPCLOUD_APIKEY", "UPCLOUD_ACCESS_TOKEN", "UPCLOUD_AUTH_TOKEN", "UPCLOUD_SECRET", "UPCLOUD_SECRET_KEY", "UPCLOUD_KEY"]
+hosts = ["https://api.upcloud.com"]
+pattern = "{base62:32}"
+# source: betterleaks v1.6.1 rule `upcloud-api-token` — its validate expression calls api.upcloud.com
+# note: the rule matches the `ucat_` prefix with a variable body, so the shape is generic.
+
+[providers.vercel-ai-gateway]
+env = ["AI_GATEWAY_API_KEY", "VERCEL_AI_GATEWAY_KEY", "VERCEL_AI_GATEWAY_API_KEY", "VERCEL_AI_GATEWAY_API_TOKEN", "VERCEL_AI_GATEWAY_APIKEY", "VERCEL_AI_GATEWAY_TOKEN", "VERCEL_AI_GATEWAY_ACCESS_TOKEN", "VERCEL_AI_GATEWAY_AUTH_TOKEN", "VERCEL_AI_GATEWAY_SECRET", "VERCEL_AI_GATEWAY_SECRET_KEY"]
+hosts = ["https://ai-gateway.vercel.sh"]
+pattern = "vck_{base62:56}"
+# source: betterleaks v1.6.1 rule `vercel-ai-gateway-key` — its validate expression calls ai-gateway.vercel.sh
+
+# ---------------------------------------------------------------------------
+# Crypto and exchange APIs. Exchanges come from CCXT, which lists each venue's
+# own API hosts. The key half of a credential travels in the clear
+# (`X-MBX-APIKEY`, `OK-ACCESS-KEY`, `API-Key`, ...), so it substitutes like any
+# other value. The signing half is an HMAC input that never reaches the wire:
+# each venue's secret names live in a hostless `<venue>-secret` entry, which
+# gives the agent a shape-valid decoy without creating a rule that can never
+# fire. `hodor rules` lists them commented. See
+# https://github.com/casualjim/hodor/issues/19.
+# Key formats are vendor-specific and mostly undocumented; patterns are generic
+# unless a rule or a vendor page states one.
+# source: ccxt 4.5.78 — each exchange's `urls.api` map
+# ---------------------------------------------------------------------------
+
+
+[providers.alpaca]
+env = ["ALPACA_ACCESS_KEY", "ALPACA_APIKEY", "ALPACA_API_KEY", "ALPACA_API_TOKEN", "ALPACA_KEY"]
+hosts = ["https://api.alpaca.markets", "https://broker-api.alpaca.markets", "https://data.alpaca.markets"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/alpaca.ts `urls.api`
+
+[providers.apex]
+env = ["APEX_ACCESS_KEY", "APEX_APIKEY", "APEX_API_KEY", "APEX_API_TOKEN", "APEX_KEY"]
+hosts = ["https://omni.apex.exchange"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/apex.ts `urls.api`
+
+[providers.aster]
+env = ["ASTER_ACCESS_KEY", "ASTER_APIKEY", "ASTER_API_KEY", "ASTER_API_TOKEN", "ASTER_KEY"]
+hosts = ["https://fapi.asterdex.com", "https://sapi.asterdex.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/aster.ts `urls.api`
+
+[providers.backpack]
+env = ["BACKPACK_ACCESS_KEY", "BACKPACK_APIKEY", "BACKPACK_API_KEY", "BACKPACK_API_TOKEN", "BACKPACK_KEY"]
+hosts = ["https://api.backpack.exchange"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/backpack.ts `urls.api`
+
+[providers.bequant]
+env = ["BEQUANT_ACCESS_KEY", "BEQUANT_APIKEY", "BEQUANT_API_KEY", "BEQUANT_API_TOKEN", "BEQUANT_KEY"]
+hosts = ["https://api.bequant.io"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bequant.ts `urls.api`
+
+[providers.bigone]
+env = ["BIGONE_ACCESS_KEY", "BIGONE_APIKEY", "BIGONE_API_KEY", "BIGONE_API_TOKEN", "BIGONE_KEY"]
+hosts = ["https://big.one"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bigone.ts `urls.api`
+
+[providers.binance]
+env = ["BINANCE_ACCESS_KEY", "BINANCE_APIKEY", "BINANCE_API_KEY", "BINANCE_API_TOKEN", "BINANCE_KEY"]
+hosts = ["https://api.binance.com", "https://dapi.binance.com", "https://eapi.binance.com", "https://fapi.binance.com", "https://papi.binance.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/binance.ts `urls.api`
+
+[providers.binancecoinm]
+env = ["BINANCECOINM_ACCESS_KEY", "BINANCECOINM_APIKEY", "BINANCECOINM_API_KEY", "BINANCECOINM_API_TOKEN", "BINANCECOINM_KEY"]
+hosts = ["https://api.binance.com", "https://dapi.binance.com", "https://eapi.binance.com", "https://fapi.binance.com", "https://papi.binance.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/binancecoinm.ts `urls.api`
+
+[providers.binanceus]
+env = ["BINANCEUS_ACCESS_KEY", "BINANCEUS_APIKEY", "BINANCEUS_API_KEY", "BINANCEUS_API_TOKEN", "BINANCEUS_KEY"]
+hosts = ["https://api.binance.com", "https://api.binance.us", "https://dapi.binance.com", "https://eapi.binance.com", "https://fapi.binance.com", "https://papi.binance.com", "https://www.binance.us"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/binanceus.ts `urls.api`
+
+[providers.binanceusdm]
+env = ["BINANCEUSDM_ACCESS_KEY", "BINANCEUSDM_APIKEY", "BINANCEUSDM_API_KEY", "BINANCEUSDM_API_TOKEN", "BINANCEUSDM_KEY"]
+hosts = ["https://api.binance.com", "https://dapi.binance.com", "https://eapi.binance.com", "https://fapi.binance.com", "https://papi.binance.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/binanceusdm.ts `urls.api`
+
+[providers.bingx]
+env = ["BINGX_ACCESS_KEY", "BINGX_APIKEY", "BINGX_API_KEY", "BINGX_API_TOKEN", "BINGX_KEY"]
+hosts = ["https://open-api.bingx.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bingx.ts `urls.api`
+
+[providers.bit2c]
+env = ["BIT2C_ACCESS_KEY", "BIT2C_APIKEY", "BIT2C_API_KEY", "BIT2C_API_TOKEN", "BIT2C_KEY"]
+hosts = ["https://bit2c.co.il"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bit2c.ts `urls.api`
+
+[providers.bitbank]
+env = ["BITBANK_ACCESS_KEY", "BITBANK_APIKEY", "BITBANK_API_KEY", "BITBANK_API_TOKEN", "BITBANK_KEY"]
+hosts = ["https://api.bitbank.cc", "https://public.bitbank.cc"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitbank.ts `urls.api`
+
+[providers.bitbns]
+env = ["BITBNS_ACCESS_KEY", "BITBNS_APIKEY", "BITBNS_API_KEY", "BITBNS_API_TOKEN", "BITBNS_KEY"]
+hosts = ["https://api.bitbns.com", "https://bitbns.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitbns.ts `urls.api`
+
+[providers.bitflyer]
+env = ["BITFLYER_ACCESS_KEY", "BITFLYER_APIKEY", "BITFLYER_API_KEY", "BITFLYER_API_TOKEN", "BITFLYER_KEY"]
+hosts = ["https://api.bitflyer.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitflyer.ts `urls.api`
+
+[providers.bitget]
+env = ["BITGET_ACCESS_KEY", "BITGET_APIKEY", "BITGET_API_KEY", "BITGET_API_TOKEN", "BITGET_KEY"]
+hosts = ["https://api.bitget.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitget.ts `urls.api`
+
+[providers.bithumb]
+env = ["BITHUMB_ACCESS_KEY", "BITHUMB_APIKEY", "BITHUMB_API_KEY", "BITHUMB_API_TOKEN", "BITHUMB_KEY"]
+hosts = ["https://api.bithumb.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bithumb.ts `urls.api`
+
+[providers.bitmex]
+env = ["BITMEX_ACCESS_KEY", "BITMEX_APIKEY", "BITMEX_API_KEY", "BITMEX_API_TOKEN", "BITMEX_KEY"]
+hosts = ["https://www.bitmex.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitmex.ts `urls.api`
+
+[providers.bitopro]
+env = ["BITOPRO_ACCESS_KEY", "BITOPRO_APIKEY", "BITOPRO_API_KEY", "BITOPRO_API_TOKEN", "BITOPRO_KEY"]
+hosts = ["https://api.bitopro.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitopro.ts `urls.api`
+
+[providers.bitrue]
+env = ["BITRUE_ACCESS_KEY", "BITRUE_APIKEY", "BITRUE_API_KEY", "BITRUE_API_TOKEN", "BITRUE_KEY"]
+hosts = ["https://fapi.bitrue.com", "https://www.bitrue.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitrue.ts `urls.api`
+
+[providers.bitso]
+env = ["BITSO_ACCESS_KEY", "BITSO_APIKEY", "BITSO_API_KEY", "BITSO_API_TOKEN", "BITSO_KEY"]
+hosts = ["https://bitso.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitso.ts `urls.api`
+
+[providers.bitstamp]
+env = ["BITSTAMP_ACCESS_KEY", "BITSTAMP_APIKEY", "BITSTAMP_API_KEY", "BITSTAMP_API_TOKEN", "BITSTAMP_KEY"]
+hosts = ["https://www.bitstamp.net"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitstamp.ts `urls.api`
+
+[providers.bitteam]
+env = ["BITTEAM_ACCESS_KEY", "BITTEAM_APIKEY", "BITTEAM_API_KEY", "BITTEAM_API_TOKEN", "BITTEAM_KEY"]
+hosts = ["https://bit.team", "https://history.bit.team"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitteam.ts `urls.api`
+
+[providers.bittrade]
+env = ["BITTRADE_ACCESS_KEY", "BITTRADE_APIKEY", "BITTRADE_API_KEY", "BITTRADE_API_TOKEN", "BITTRADE_KEY"]
+hosts = ["https://api-cloud.bittrade.co.jp"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bittrade.ts `urls.api`
+
+[providers.bitvavo]
+env = ["BITVAVO_ACCESS_KEY", "BITVAVO_APIKEY", "BITVAVO_API_KEY", "BITVAVO_API_TOKEN", "BITVAVO_KEY"]
+hosts = ["https://api.bitvavo.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bitvavo.ts `urls.api`
+
+[providers.blockchaincom]
+env = ["BLOCKCHAINCOM_ACCESS_KEY", "BLOCKCHAINCOM_APIKEY", "BLOCKCHAINCOM_API_KEY", "BLOCKCHAINCOM_API_TOKEN", "BLOCKCHAINCOM_KEY"]
+hosts = ["https://api.blockchain.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/blockchaincom.ts `urls.api`
+
+[providers.blofin]
+env = ["BLOFIN_ACCESS_KEY", "BLOFIN_APIKEY", "BLOFIN_API_KEY", "BLOFIN_API_TOKEN", "BLOFIN_KEY"]
+hosts = ["https://openapi.blofin.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/blofin.ts `urls.api`
+
+[providers.btcbox]
+env = ["BTCBOX_ACCESS_KEY", "BTCBOX_APIKEY", "BTCBOX_API_KEY", "BTCBOX_API_TOKEN", "BTCBOX_KEY"]
+hosts = ["https://www.btcbox.co.jp"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/btcbox.ts `urls.api`
+
+[providers.btcmarkets]
+env = ["BTCMARKETS_ACCESS_KEY", "BTCMARKETS_APIKEY", "BTCMARKETS_API_KEY", "BTCMARKETS_API_TOKEN", "BTCMARKETS_KEY"]
+hosts = ["https://api.btcmarkets.net"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/btcmarkets.ts `urls.api`
+
+[providers.btcturk]
+env = ["BTCTURK_ACCESS_KEY", "BTCTURK_APIKEY", "BTCTURK_API_KEY", "BTCTURK_API_TOKEN", "BTCTURK_KEY"]
+hosts = ["https://api.btcturk.com", "https://graph-api.btcturk.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/btcturk.ts `urls.api`
+
+[providers.btse]
+env = ["BTSE_ACCESS_KEY", "BTSE_APIKEY", "BTSE_API_KEY", "BTSE_API_TOKEN", "BTSE_KEY"]
+hosts = ["https://api.btse.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/btse.ts `urls.api`
+
+[providers.bullish]
+env = ["BULLISH_ACCESS_KEY", "BULLISH_APIKEY", "BULLISH_API_KEY", "BULLISH_API_TOKEN", "BULLISH_KEY"]
+hosts = ["https://api.exchange.bullish.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bullish.ts `urls.api`
+
+[providers.bybit]
+env = ["BYBIT_ACCESS_KEY", "BYBIT_APIKEY", "BYBIT_API_KEY", "BYBIT_API_TOKEN", "BYBIT_KEY"]
+hosts = ["https://api.bybit.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bybit.ts `urls.api`
+
+[providers.bybiteu]
+env = ["BYBITEU_ACCESS_KEY", "BYBITEU_APIKEY", "BYBITEU_API_KEY", "BYBITEU_API_TOKEN", "BYBITEU_KEY"]
+hosts = ["https://api.bybit.eu"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bybiteu.ts `urls.api`
+
+[providers.bydfi]
+env = ["BYDFI_ACCESS_KEY", "BYDFI_APIKEY", "BYDFI_API_KEY", "BYDFI_API_TOKEN", "BYDFI_KEY"]
+hosts = ["https://api.bydfi.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/bydfi.ts `urls.api`
+
+[providers.cex]
+env = ["CEX_ACCESS_KEY", "CEX_APIKEY", "CEX_API_KEY", "CEX_API_TOKEN", "CEX_KEY"]
+hosts = ["https://trade.cex.io"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/cex.ts `urls.api`
+
+[providers.coinbase]
+env = ["COINBASE_ACCESS_KEY", "COINBASE_APIKEY", "COINBASE_API_KEY", "COINBASE_API_TOKEN", "COINBASE_KEY"]
+hosts = ["https://api.coinbase.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coinbase.ts `urls.api`
+
+[providers.coinbaseexchange]
+env = ["COINBASEEXCHANGE_ACCESS_KEY", "COINBASEEXCHANGE_APIKEY", "COINBASEEXCHANGE_API_KEY", "COINBASEEXCHANGE_API_TOKEN", "COINBASEEXCHANGE_KEY", "COINBASE_EXCHANGE_API_KEY"]
+hosts = ["https://api.exchange.coinbase.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coinbaseexchange.ts `urls.api`
+
+[providers.coinbaseinternational]
+env = ["COINBASEINTERNATIONAL_ACCESS_KEY", "COINBASEINTERNATIONAL_APIKEY", "COINBASEINTERNATIONAL_API_KEY", "COINBASEINTERNATIONAL_API_TOKEN", "COINBASEINTERNATIONAL_KEY"]
+hosts = ["https://api.international.coinbase.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coinbaseinternational.ts `urls.api`
+
+[providers.coincheck]
+env = ["COINCHECK_ACCESS_KEY", "COINCHECK_APIKEY", "COINCHECK_API_KEY", "COINCHECK_API_TOKEN", "COINCHECK_KEY"]
+hosts = ["https://coincheck.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coincheck.ts `urls.api`
+
+[providers.coinex]
+env = ["COINEX_ACCESS_KEY", "COINEX_APIKEY", "COINEX_API_KEY", "COINEX_API_TOKEN", "COINEX_KEY"]
+hosts = ["https://api.coinex.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coinex.ts `urls.api`
+
+[providers.coinmate]
+env = ["COINMATE_ACCESS_KEY", "COINMATE_APIKEY", "COINMATE_API_KEY", "COINMATE_API_TOKEN", "COINMATE_KEY"]
+hosts = ["https://coinmate.io"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coinmate.ts `urls.api`
+
+[providers.coinone]
+env = ["COINONE_ACCESS_KEY", "COINONE_APIKEY", "COINONE_API_KEY", "COINONE_API_TOKEN", "COINONE_KEY"]
+hosts = ["https://api.coinone.co.kr"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coinone.ts `urls.api`
+
+[providers.coinsph]
+env = ["COINSPH_ACCESS_KEY", "COINSPH_APIKEY", "COINSPH_API_KEY", "COINSPH_API_TOKEN", "COINSPH_KEY"]
+hosts = ["https://api.pro.coins.ph"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coinsph.ts `urls.api`
+
+[providers.coinspot]
+env = ["COINSPOT_ACCESS_KEY", "COINSPOT_APIKEY", "COINSPOT_API_KEY", "COINSPOT_API_TOKEN", "COINSPOT_KEY"]
+hosts = ["https://www.coinspot.com.au"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/coinspot.ts `urls.api`
+
+[providers.cryptocom]
+env = ["CRYPTOCOM_ACCESS_KEY", "CRYPTOCOM_APIKEY", "CRYPTOCOM_API_KEY", "CRYPTOCOM_API_TOKEN", "CRYPTOCOM_KEY"]
+hosts = ["https://api.crypto.com", "https://deriv-api.crypto.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/cryptocom.ts `urls.api`
+
+[providers.cryptomus]
+env = ["CRYPTOMUS_ACCESS_KEY", "CRYPTOMUS_APIKEY", "CRYPTOMUS_API_KEY", "CRYPTOMUS_API_TOKEN", "CRYPTOMUS_KEY"]
+hosts = ["https://api.cryptomus.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/cryptomus.ts `urls.api`
+
+[providers.deepcoin]
+env = ["DEEPCOIN_ACCESS_KEY", "DEEPCOIN_APIKEY", "DEEPCOIN_API_KEY", "DEEPCOIN_API_TOKEN", "DEEPCOIN_KEY"]
+hosts = ["https://api.deepcoin.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/deepcoin.ts `urls.api`
+
+[providers.delta]
+env = ["DELTA_ACCESS_KEY", "DELTA_APIKEY", "DELTA_API_KEY", "DELTA_API_TOKEN", "DELTA_KEY"]
+hosts = ["https://api.delta.exchange"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/delta.ts `urls.api`
+
+[providers.deribit]
+env = ["DERIBIT_ACCESS_KEY", "DERIBIT_APIKEY", "DERIBIT_API_KEY", "DERIBIT_API_TOKEN", "DERIBIT_KEY"]
+hosts = ["https://www.deribit.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/deribit.ts `urls.api`
+
+[providers.derive]
+env = ["DERIVE_ACCESS_KEY", "DERIVE_APIKEY", "DERIVE_API_KEY", "DERIVE_API_TOKEN", "DERIVE_KEY"]
+hosts = ["https://api.lyra.finance"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/derive.ts `urls.api`
+
+[providers.digifinex]
+env = ["DIGIFINEX_ACCESS_KEY", "DIGIFINEX_APIKEY", "DIGIFINEX_API_KEY", "DIGIFINEX_API_TOKEN", "DIGIFINEX_KEY"]
+hosts = ["https://openapi.digifinex.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/digifinex.ts `urls.api`
+
+[providers.dydx]
+env = ["DYDX_ACCESS_KEY", "DYDX_APIKEY", "DYDX_API_KEY", "DYDX_API_TOKEN", "DYDX_KEY"]
+hosts = ["https://dydx-ops-rpc.kingnodes.com", "https://dydx-rest.publicnode.com", "https://indexer.dydx.trade"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/dydx.ts `urls.api`
+
+[providers.extended]
+env = ["EXTENDED_ACCESS_KEY", "EXTENDED_APIKEY", "EXTENDED_API_KEY", "EXTENDED_API_TOKEN", "EXTENDED_KEY"]
+hosts = ["https://api.starknet.extended.exchange"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/extended.ts `urls.api`
+
+[providers.fmfwio]
+env = ["FMFWIO_ACCESS_KEY", "FMFWIO_APIKEY", "FMFWIO_API_KEY", "FMFWIO_API_TOKEN", "FMFWIO_KEY"]
+hosts = ["https://api.fmfw.io"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/fmfwio.ts `urls.api`
+
+[providers.foxbit]
+env = ["FOXBIT_ACCESS_KEY", "FOXBIT_APIKEY", "FOXBIT_API_KEY", "FOXBIT_API_TOKEN", "FOXBIT_KEY"]
+hosts = ["https://api.foxbit.com.br", "https://metadata-v2.foxbit.com.br"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/foxbit.ts `urls.api`
+
+[providers.gate]
+env = ["GATE_ACCESS_KEY", "GATE_APIKEY", "GATE_API_KEY", "GATE_API_TOKEN", "GATE_KEY"]
+hosts = ["https://api.gateio.ws"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/gate.ts `urls.api`
+
+[providers.gateeu]
+env = ["GATEEU_ACCESS_KEY", "GATEEU_APIKEY", "GATEEU_API_KEY", "GATEEU_API_TOKEN", "GATEEU_KEY"]
+hosts = ["https://api.gateeu.com", "https://api.gateio.ws"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/gateeu.ts `urls.api`
+
+[providers.grvt]
+env = ["GRVT_ACCESS_KEY", "GRVT_APIKEY", "GRVT_API_KEY", "GRVT_API_TOKEN", "GRVT_KEY"]
+hosts = ["https://edge.grvt.io", "https://market-data.grvt.io", "https://trades.grvt.io"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/grvt.ts `urls.api`
+
+[providers.hashkey]
+env = ["HASHKEY_ACCESS_KEY", "HASHKEY_APIKEY", "HASHKEY_API_KEY", "HASHKEY_API_TOKEN", "HASHKEY_KEY"]
+hosts = ["https://api-glb.hashkey.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/hashkey.ts `urls.api`
+
+[providers.hibachi]
+env = ["HIBACHI_ACCESS_KEY", "HIBACHI_APIKEY", "HIBACHI_API_KEY", "HIBACHI_API_TOKEN", "HIBACHI_KEY"]
+hosts = ["https://api.hibachi.xyz", "https://data-api.hibachi.xyz"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/hibachi.ts `urls.api`
+
+[providers.hitbtc]
+env = ["HITBTC_ACCESS_KEY", "HITBTC_APIKEY", "HITBTC_API_KEY", "HITBTC_API_TOKEN", "HITBTC_KEY"]
+hosts = ["https://api.hitbtc.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/hitbtc.ts `urls.api`
+
+[providers.hollaex]
+env = ["HOLLAEX_ACCESS_KEY", "HOLLAEX_APIKEY", "HOLLAEX_API_KEY", "HOLLAEX_API_TOKEN", "HOLLAEX_KEY"]
+hosts = ["https://api.hollaex.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/hollaex.ts `urls.api`
+
+[providers.htx]
+env = ["HTX_ACCESS_KEY", "HTX_APIKEY", "HTX_API_KEY", "HTX_API_TOKEN", "HTX_KEY"]
+hosts = ["https://api.huobi.pro"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/htx.ts `urls.api`
+
+[providers.hyperliquid]
+env = ["HYPERLIQUID_ACCESS_KEY", "HYPERLIQUID_APIKEY", "HYPERLIQUID_API_KEY", "HYPERLIQUID_API_TOKEN", "HYPERLIQUID_KEY"]
+hosts = ["https://api.hyperliquid.xyz"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/hyperliquid.ts `urls.api`
+
+[providers.independentreserve]
+env = ["INDEPENDENTRESERVE_ACCESS_KEY", "INDEPENDENTRESERVE_APIKEY", "INDEPENDENTRESERVE_API_KEY", "INDEPENDENTRESERVE_API_TOKEN", "INDEPENDENTRESERVE_KEY"]
+hosts = ["https://api.independentreserve.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/independentreserve.ts `urls.api`
+
+[providers.indodax]
+env = ["INDODAX_ACCESS_KEY", "INDODAX_APIKEY", "INDODAX_API_KEY", "INDODAX_API_TOKEN", "INDODAX_KEY"]
+hosts = ["https://indodax.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/indodax.ts `urls.api`
+
+[providers.krakenfutures]
+env = ["KRAKENFUTURES_ACCESS_KEY", "KRAKENFUTURES_APIKEY", "KRAKENFUTURES_API_KEY", "KRAKENFUTURES_API_TOKEN", "KRAKENFUTURES_KEY"]
+hosts = ["https://futures.kraken.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/krakenfutures.ts `urls.api`
+
+[providers.kucoinfutures]
+env = ["KUCOINFUTURES_ACCESS_KEY", "KUCOINFUTURES_APIKEY", "KUCOINFUTURES_API_KEY", "KUCOINFUTURES_API_TOKEN", "KUCOINFUTURES_KEY"]
+hosts = ["https://api-broker.kucoin.com", "https://api-futures.kucoin.com", "https://api.kucoin.com", "https://kucoin.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/kucoinfutures.ts `urls.api`
+
+[providers.latoken]
+env = ["LATOKEN_ACCESS_KEY", "LATOKEN_APIKEY", "LATOKEN_API_KEY", "LATOKEN_API_TOKEN", "LATOKEN_KEY"]
+hosts = ["https://api.latoken.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/latoken.ts `urls.api`
+
+[providers.lbank]
+env = ["LBANK_ACCESS_KEY", "LBANK_APIKEY", "LBANK_API_KEY", "LBANK_API_TOKEN", "LBANK_KEY"]
+hosts = ["https://api.lbank.info", "https://lbkperp.lbank.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/lbank.ts `urls.api`
+
+[providers.lighter]
+env = ["LIGHTER_ACCESS_KEY", "LIGHTER_APIKEY", "LIGHTER_API_KEY", "LIGHTER_API_TOKEN", "LIGHTER_KEY"]
+hosts = ["https://mainnet.zklighter.elliot.ai"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/lighter.ts `urls.api`
+
+[providers.mercado]
+env = ["MERCADO_ACCESS_KEY", "MERCADO_APIKEY", "MERCADO_API_KEY", "MERCADO_API_TOKEN", "MERCADO_KEY"]
+hosts = ["https://api.mercadobitcoin.net", "https://www.mercadobitcoin.com.br", "https://www.mercadobitcoin.net"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/mercado.ts `urls.api`
+
+[providers.mexc]
+env = ["MEXC_ACCESS_KEY", "MEXC_APIKEY", "MEXC_API_KEY", "MEXC_API_TOKEN", "MEXC_KEY"]
+hosts = ["https://api.mexc.com", "https://www.mexc.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/mexc.ts `urls.api`
+
+[providers.modetrade]
+env = ["MODETRADE_ACCESS_KEY", "MODETRADE_APIKEY", "MODETRADE_API_KEY", "MODETRADE_API_TOKEN", "MODETRADE_KEY"]
+hosts = ["https://api-evm.orderly.org"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/modetrade.ts `urls.api`
+
+[providers.mudrex]
+env = ["MUDREX_ACCESS_KEY", "MUDREX_APIKEY", "MUDREX_API_KEY", "MUDREX_API_TOKEN", "MUDREX_KEY"]
+hosts = ["https://trade.mudrex.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/mudrex.ts `urls.api`
+
+[providers.myokx]
+env = ["MYOKX_ACCESS_KEY", "MYOKX_APIKEY", "MYOKX_API_KEY", "MYOKX_API_TOKEN", "MYOKX_KEY"]
+hosts = ["https://eea.okx.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/myokx.ts `urls.api`
+
+[providers.nado]
+env = ["NADO_ACCESS_KEY", "NADO_APIKEY", "NADO_API_KEY", "NADO_API_TOKEN", "NADO_KEY"]
+hosts = ["https://archive.prod.nado.xyz", "https://gateway.prod.nado.xyz", "https://trigger.prod.nado.xyz"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/nado.ts `urls.api`
+
+[providers.ndax]
+env = ["NDAX_ACCESS_KEY", "NDAX_APIKEY", "NDAX_API_KEY", "NDAX_API_TOKEN", "NDAX_KEY"]
+hosts = ["https://api.ndax.io:8443"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/ndax.ts `urls.api`
+
+[providers.okx]
+env = ["OKX_ACCESS_KEY", "OKX_APIKEY", "OKX_API_KEY", "OKX_API_TOKEN", "OKX_KEY"]
+hosts = ["https://www.okx.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/okx.ts `urls.api`
+
+[providers.okxus]
+env = ["OKXUS_ACCESS_KEY", "OKXUS_APIKEY", "OKXUS_API_KEY", "OKXUS_API_TOKEN", "OKXUS_KEY"]
+hosts = ["https://us.okx.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/okxus.ts `urls.api`
+
+[providers.onetrading]
+env = ["ONETRADING_ACCESS_KEY", "ONETRADING_APIKEY", "ONETRADING_API_KEY", "ONETRADING_API_TOKEN", "ONETRADING_KEY"]
+hosts = ["https://api.onetrading.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/onetrading.ts `urls.api`
+
+[providers.p2b]
+env = ["P2B_ACCESS_KEY", "P2B_APIKEY", "P2B_API_KEY", "P2B_API_TOKEN", "P2B_KEY"]
+hosts = ["https://api.p2pb2b.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/p2b.ts `urls.api`
+
+[providers.pacifica]
+env = ["PACIFICA_ACCESS_KEY", "PACIFICA_APIKEY", "PACIFICA_API_KEY", "PACIFICA_API_TOKEN", "PACIFICA_KEY"]
+hosts = ["https://api.pacifica.fi"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/pacifica.ts `urls.api`
+
+[providers.paradex]
+env = ["PARADEX_ACCESS_KEY", "PARADEX_APIKEY", "PARADEX_API_KEY", "PARADEX_API_TOKEN", "PARADEX_KEY"]
+hosts = ["https://api.prod.paradex.trade"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/paradex.ts `urls.api`
+
+[providers.paymium]
+env = ["PAYMIUM_ACCESS_KEY", "PAYMIUM_APIKEY", "PAYMIUM_API_KEY", "PAYMIUM_API_TOKEN", "PAYMIUM_KEY"]
+hosts = ["https://paymium.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/paymium.ts `urls.api`
+
+[providers.phemex]
+env = ["PHEMEX_ACCESS_KEY", "PHEMEX_APIKEY", "PHEMEX_API_KEY", "PHEMEX_API_TOKEN", "PHEMEX_KEY"]
+hosts = ["https://api.phemex.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/phemex.ts `urls.api`
+
+[providers.revolutx]
+env = ["REVOLUTX_ACCESS_KEY", "REVOLUTX_APIKEY", "REVOLUTX_API_KEY", "REVOLUTX_API_TOKEN", "REVOLUTX_KEY"]
+hosts = ["https://revx.revolut.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/revolutx.ts `urls.api`
+
+[providers.tokocrypto]
+env = ["TOKOCRYPTO_ACCESS_KEY", "TOKOCRYPTO_APIKEY", "TOKOCRYPTO_API_KEY", "TOKOCRYPTO_API_TOKEN", "TOKOCRYPTO_KEY"]
+hosts = ["https://api.binance.com", "https://www.tokocrypto.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/tokocrypto.ts `urls.api`
+
+[providers.toobit]
+env = ["TOOBIT_ACCESS_KEY", "TOOBIT_APIKEY", "TOOBIT_API_KEY", "TOOBIT_API_TOKEN", "TOOBIT_KEY"]
+hosts = ["https://api.toobit.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/toobit.ts `urls.api`
+
+[providers.upbit]
+env = ["UPBIT_ACCESS_KEY", "UPBIT_APIKEY", "UPBIT_API_KEY", "UPBIT_API_TOKEN", "UPBIT_KEY"]
+hosts = ["https://api.upbit.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/upbit.ts `urls.api`
+
+[providers.weex]
+env = ["WEEX_ACCESS_KEY", "WEEX_APIKEY", "WEEX_API_KEY", "WEEX_API_TOKEN", "WEEX_KEY"]
+hosts = ["https://api-contract.weex.com", "https://api-spot.weex.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/weex.ts `urls.api`
+
+[providers.whitebit]
+env = ["WHITEBIT_ACCESS_KEY", "WHITEBIT_APIKEY", "WHITEBIT_API_KEY", "WHITEBIT_API_TOKEN", "WHITEBIT_KEY"]
+hosts = ["https://whitebit.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/whitebit.ts `urls.api`
+
+[providers.woo]
+env = ["WOO_ACCESS_KEY", "WOO_APIKEY", "WOO_API_KEY", "WOO_API_TOKEN", "WOO_KEY"]
+hosts = ["https://api-pub.woox.io", "https://api.woox.io"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/woo.ts `urls.api`
+
+[providers.woofipro]
+env = ["WOOFIPRO_ACCESS_KEY", "WOOFIPRO_APIKEY", "WOOFIPRO_API_KEY", "WOOFIPRO_API_TOKEN", "WOOFIPRO_KEY"]
+hosts = ["https://api-evm.orderly.org"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/woofipro.ts `urls.api`
+
+[providers.xt]
+env = ["XT_ACCESS_KEY", "XT_APIKEY", "XT_API_KEY", "XT_API_TOKEN", "XT_KEY"]
+hosts = ["https://api.xt.com", "https://dapi.xt.com", "https://fapi.xt.com", "https://sapi.xt.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/xt.ts `urls.api`
+
+[providers.zaif]
+env = ["ZAIF_ACCESS_KEY", "ZAIF_APIKEY", "ZAIF_API_KEY", "ZAIF_API_TOKEN", "ZAIF_KEY"]
+hosts = ["https://api.zaif.jp"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/zaif.ts `urls.api`
+
+[providers.zebpay]
+env = ["ZEBPAY_ACCESS_KEY", "ZEBPAY_APIKEY", "ZEBPAY_API_KEY", "ZEBPAY_API_TOKEN", "ZEBPAY_KEY"]
+hosts = ["https://futuresbe.zebpay.com", "https://sapi.zebpay.com"]
+pattern = "{base62:32}"
+# source: ccxt 4.5.78 — exchanges/zebpay.ts `urls.api`
+
+[providers.alpaca-secret]
+env = ["ALPACA_API_SECRET", "ALPACA_PRIVATE_KEY", "ALPACA_SECRET", "ALPACA_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.apex-secret]
+env = ["APEX_API_SECRET", "APEX_PRIVATE_KEY", "APEX_SECRET", "APEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.aster-secret]
+env = ["ASTER_API_SECRET", "ASTER_PRIVATE_KEY", "ASTER_SECRET", "ASTER_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.backpack-secret]
+env = ["BACKPACK_API_SECRET", "BACKPACK_PRIVATE_KEY", "BACKPACK_SECRET", "BACKPACK_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bequant-secret]
+env = ["BEQUANT_API_SECRET", "BEQUANT_PRIVATE_KEY", "BEQUANT_SECRET", "BEQUANT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bigone-secret]
+env = ["BIGONE_API_SECRET", "BIGONE_PRIVATE_KEY", "BIGONE_SECRET", "BIGONE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.binance-secret]
+env = ["BINANCE_API_SECRET", "BINANCE_PRIVATE_KEY", "BINANCE_SECRET", "BINANCE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.binancecoinm-secret]
+env = ["BINANCECOINM_API_SECRET", "BINANCECOINM_PRIVATE_KEY", "BINANCECOINM_SECRET", "BINANCECOINM_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.binanceus-secret]
+env = ["BINANCEUS_API_SECRET", "BINANCEUS_PRIVATE_KEY", "BINANCEUS_SECRET", "BINANCEUS_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.binanceusdm-secret]
+env = ["BINANCEUSDM_API_SECRET", "BINANCEUSDM_PRIVATE_KEY", "BINANCEUSDM_SECRET", "BINANCEUSDM_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bingx-secret]
+env = ["BINGX_API_SECRET", "BINGX_PRIVATE_KEY", "BINGX_SECRET", "BINGX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bit2c-secret]
+env = ["BIT2C_API_SECRET", "BIT2C_PRIVATE_KEY", "BIT2C_SECRET", "BIT2C_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitbank-secret]
+env = ["BITBANK_API_SECRET", "BITBANK_PRIVATE_KEY", "BITBANK_SECRET", "BITBANK_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitbns-secret]
+env = ["BITBNS_API_SECRET", "BITBNS_PRIVATE_KEY", "BITBNS_SECRET", "BITBNS_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitfinex-secret]
+env = ["BITFINEX_API_SECRET", "BITFINEX_PRIVATE_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitflyer-secret]
+env = ["BITFLYER_API_SECRET", "BITFLYER_PRIVATE_KEY", "BITFLYER_SECRET", "BITFLYER_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitget-secret]
+env = ["BITGET_API_SECRET", "BITGET_PRIVATE_KEY", "BITGET_SECRET", "BITGET_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bithumb-secret]
+env = ["BITHUMB_API_SECRET", "BITHUMB_PRIVATE_KEY", "BITHUMB_SECRET", "BITHUMB_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitmex-secret]
+env = ["BITMEX_API_SECRET", "BITMEX_PRIVATE_KEY", "BITMEX_SECRET", "BITMEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitopro-secret]
+env = ["BITOPRO_API_SECRET", "BITOPRO_PRIVATE_KEY", "BITOPRO_SECRET", "BITOPRO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitrue-secret]
+env = ["BITRUE_API_SECRET", "BITRUE_PRIVATE_KEY", "BITRUE_SECRET", "BITRUE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitso-secret]
+env = ["BITSO_API_SECRET", "BITSO_PRIVATE_KEY", "BITSO_SECRET", "BITSO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitstamp-secret]
+env = ["BITSTAMP_API_SECRET", "BITSTAMP_PRIVATE_KEY", "BITSTAMP_SECRET", "BITSTAMP_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitteam-secret]
+env = ["BITTEAM_API_SECRET", "BITTEAM_PRIVATE_KEY", "BITTEAM_SECRET", "BITTEAM_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bittrade-secret]
+env = ["BITTRADE_API_SECRET", "BITTRADE_PRIVATE_KEY", "BITTRADE_SECRET", "BITTRADE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bitvavo-secret]
+env = ["BITVAVO_API_SECRET", "BITVAVO_PRIVATE_KEY", "BITVAVO_SECRET", "BITVAVO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.blockchaincom-secret]
+env = ["BLOCKCHAINCOM_API_SECRET", "BLOCKCHAINCOM_PRIVATE_KEY", "BLOCKCHAINCOM_SECRET", "BLOCKCHAINCOM_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.blofin-secret]
+env = ["BLOFIN_API_SECRET", "BLOFIN_PRIVATE_KEY", "BLOFIN_SECRET", "BLOFIN_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.btcbox-secret]
+env = ["BTCBOX_API_SECRET", "BTCBOX_PRIVATE_KEY", "BTCBOX_SECRET", "BTCBOX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.btcmarkets-secret]
+env = ["BTCMARKETS_API_SECRET", "BTCMARKETS_PRIVATE_KEY", "BTCMARKETS_SECRET", "BTCMARKETS_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.btcturk-secret]
+env = ["BTCTURK_API_SECRET", "BTCTURK_PRIVATE_KEY", "BTCTURK_SECRET", "BTCTURK_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.btse-secret]
+env = ["BTSE_API_SECRET", "BTSE_PRIVATE_KEY", "BTSE_SECRET", "BTSE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bullish-secret]
+env = ["BULLISH_API_SECRET", "BULLISH_PRIVATE_KEY", "BULLISH_SECRET", "BULLISH_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bybit-secret]
+env = ["BYBIT_API_SECRET", "BYBIT_PRIVATE_KEY", "BYBIT_SECRET", "BYBIT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bybiteu-secret]
+env = ["BYBITEU_API_SECRET", "BYBITEU_PRIVATE_KEY", "BYBITEU_SECRET", "BYBITEU_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.bydfi-secret]
+env = ["BYDFI_API_SECRET", "BYDFI_PRIVATE_KEY", "BYDFI_SECRET", "BYDFI_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.cex-secret]
+env = ["CEX_API_SECRET", "CEX_PRIVATE_KEY", "CEX_SECRET", "CEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinbase-secret]
+env = ["COINBASE_API_SECRET", "COINBASE_PRIVATE_KEY", "COINBASE_SECRET", "COINBASE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinbaseexchange-secret]
+env = ["COINBASEEXCHANGE_API_SECRET", "COINBASEEXCHANGE_PRIVATE_KEY", "COINBASEEXCHANGE_SECRET", "COINBASEEXCHANGE_SECRET_KEY", "COINBASE_EXCHANGE_API_SECRET"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinbaseinternational-secret]
+env = ["COINBASEINTERNATIONAL_API_SECRET", "COINBASEINTERNATIONAL_PRIVATE_KEY", "COINBASEINTERNATIONAL_SECRET", "COINBASEINTERNATIONAL_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coincheck-secret]
+env = ["COINCHECK_API_SECRET", "COINCHECK_PRIVATE_KEY", "COINCHECK_SECRET", "COINCHECK_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinex-secret]
+env = ["COINEX_API_SECRET", "COINEX_PRIVATE_KEY", "COINEX_SECRET", "COINEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinmate-secret]
+env = ["COINMATE_API_SECRET", "COINMATE_PRIVATE_KEY", "COINMATE_SECRET", "COINMATE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinone-secret]
+env = ["COINONE_API_SECRET", "COINONE_PRIVATE_KEY", "COINONE_SECRET", "COINONE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinsph-secret]
+env = ["COINSPH_API_SECRET", "COINSPH_PRIVATE_KEY", "COINSPH_SECRET", "COINSPH_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinspot-secret]
+env = ["COINSPOT_API_SECRET", "COINSPOT_PRIVATE_KEY", "COINSPOT_SECRET", "COINSPOT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.cryptocom-secret]
+env = ["CRYPTOCOM_API_SECRET", "CRYPTOCOM_PRIVATE_KEY", "CRYPTOCOM_SECRET", "CRYPTOCOM_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.cryptomus-secret]
+env = ["CRYPTOMUS_API_SECRET", "CRYPTOMUS_PRIVATE_KEY", "CRYPTOMUS_SECRET", "CRYPTOMUS_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.deepcoin-secret]
+env = ["DEEPCOIN_API_SECRET", "DEEPCOIN_PRIVATE_KEY", "DEEPCOIN_SECRET", "DEEPCOIN_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.delta-secret]
+env = ["DELTA_API_SECRET", "DELTA_PRIVATE_KEY", "DELTA_SECRET", "DELTA_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.deribit-secret]
+env = ["DERIBIT_API_SECRET", "DERIBIT_PRIVATE_KEY", "DERIBIT_SECRET", "DERIBIT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.derive-secret]
+env = ["DERIVE_API_SECRET", "DERIVE_PRIVATE_KEY", "DERIVE_SECRET", "DERIVE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.digifinex-secret]
+env = ["DIGIFINEX_API_SECRET", "DIGIFINEX_PRIVATE_KEY", "DIGIFINEX_SECRET", "DIGIFINEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.dydx-secret]
+env = ["DYDX_API_SECRET", "DYDX_PRIVATE_KEY", "DYDX_SECRET", "DYDX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.extended-secret]
+env = ["EXTENDED_API_SECRET", "EXTENDED_PRIVATE_KEY", "EXTENDED_SECRET", "EXTENDED_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.fmfwio-secret]
+env = ["FMFWIO_API_SECRET", "FMFWIO_PRIVATE_KEY", "FMFWIO_SECRET", "FMFWIO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.foxbit-secret]
+env = ["FOXBIT_API_SECRET", "FOXBIT_PRIVATE_KEY", "FOXBIT_SECRET", "FOXBIT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.gate-secret]
+env = ["GATE_API_SECRET", "GATE_PRIVATE_KEY", "GATE_SECRET", "GATE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.gateeu-secret]
+env = ["GATEEU_API_SECRET", "GATEEU_PRIVATE_KEY", "GATEEU_SECRET", "GATEEU_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.gemini-secret]
+env = ["GEMINI_API_SECRET", "GEMINI_PRIVATE_KEY", "GEMINI_SECRET", "GEMINI_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.grvt-secret]
+env = ["GRVT_API_SECRET", "GRVT_PRIVATE_KEY", "GRVT_SECRET", "GRVT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.hashkey-secret]
+env = ["HASHKEY_API_SECRET", "HASHKEY_PRIVATE_KEY", "HASHKEY_SECRET", "HASHKEY_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.hibachi-secret]
+env = ["HIBACHI_API_SECRET", "HIBACHI_PRIVATE_KEY", "HIBACHI_SECRET", "HIBACHI_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.hitbtc-secret]
+env = ["HITBTC_API_SECRET", "HITBTC_PRIVATE_KEY", "HITBTC_SECRET", "HITBTC_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.hollaex-secret]
+env = ["HOLLAEX_API_SECRET", "HOLLAEX_PRIVATE_KEY", "HOLLAEX_SECRET", "HOLLAEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.htx-secret]
+env = ["HTX_API_SECRET", "HTX_PRIVATE_KEY", "HTX_SECRET", "HTX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.hyperliquid-secret]
+env = ["HYPERLIQUID_API_SECRET", "HYPERLIQUID_PRIVATE_KEY", "HYPERLIQUID_SECRET", "HYPERLIQUID_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.independentreserve-secret]
+env = ["INDEPENDENTRESERVE_API_SECRET", "INDEPENDENTRESERVE_PRIVATE_KEY", "INDEPENDENTRESERVE_SECRET", "INDEPENDENTRESERVE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.indodax-secret]
+env = ["INDODAX_API_SECRET", "INDODAX_PRIVATE_KEY", "INDODAX_SECRET", "INDODAX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.kraken-secret]
+env = ["KRAKEN_API_SECRET", "KRAKEN_PRIVATE_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.krakenfutures-secret]
+env = ["KRAKENFUTURES_API_SECRET", "KRAKENFUTURES_PRIVATE_KEY", "KRAKENFUTURES_SECRET", "KRAKENFUTURES_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.kucoin-secret]
+env = ["KUCOIN_API_SECRET", "KUCOIN_PRIVATE_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.kucoinfutures-secret]
+env = ["KUCOINFUTURES_API_SECRET", "KUCOINFUTURES_PRIVATE_KEY", "KUCOINFUTURES_SECRET", "KUCOINFUTURES_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.latoken-secret]
+env = ["LATOKEN_API_SECRET", "LATOKEN_PRIVATE_KEY", "LATOKEN_SECRET", "LATOKEN_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.lbank-secret]
+env = ["LBANK_API_SECRET", "LBANK_PRIVATE_KEY", "LBANK_SECRET", "LBANK_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.lighter-secret]
+env = ["LIGHTER_API_SECRET", "LIGHTER_PRIVATE_KEY", "LIGHTER_SECRET", "LIGHTER_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.luno-secret]
+env = ["LUNO_API_SECRET", "LUNO_PRIVATE_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.mercado-secret]
+env = ["MERCADO_API_SECRET", "MERCADO_PRIVATE_KEY", "MERCADO_SECRET", "MERCADO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.mexc-secret]
+env = ["MEXC_API_SECRET", "MEXC_PRIVATE_KEY", "MEXC_SECRET", "MEXC_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.modetrade-secret]
+env = ["MODETRADE_API_SECRET", "MODETRADE_PRIVATE_KEY", "MODETRADE_SECRET", "MODETRADE_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.mudrex-secret]
+env = ["MUDREX_API_SECRET", "MUDREX_PRIVATE_KEY", "MUDREX_SECRET", "MUDREX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.myokx-secret]
+env = ["MYOKX_API_SECRET", "MYOKX_PRIVATE_KEY", "MYOKX_SECRET", "MYOKX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.nado-secret]
+env = ["NADO_API_SECRET", "NADO_PRIVATE_KEY", "NADO_SECRET", "NADO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.ndax-secret]
+env = ["NDAX_API_SECRET", "NDAX_PRIVATE_KEY", "NDAX_SECRET", "NDAX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.okx-secret]
+env = ["OKX_API_SECRET", "OKX_PRIVATE_KEY", "OKX_SECRET", "OKX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.okxus-secret]
+env = ["OKXUS_API_SECRET", "OKXUS_PRIVATE_KEY", "OKXUS_SECRET", "OKXUS_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.onetrading-secret]
+env = ["ONETRADING_API_SECRET", "ONETRADING_PRIVATE_KEY", "ONETRADING_SECRET", "ONETRADING_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.p2b-secret]
+env = ["P2B_API_SECRET", "P2B_PRIVATE_KEY", "P2B_SECRET", "P2B_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.pacifica-secret]
+env = ["PACIFICA_API_SECRET", "PACIFICA_PRIVATE_KEY", "PACIFICA_SECRET", "PACIFICA_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.paradex-secret]
+env = ["PARADEX_API_SECRET", "PARADEX_PRIVATE_KEY", "PARADEX_SECRET", "PARADEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.paymium-secret]
+env = ["PAYMIUM_API_SECRET", "PAYMIUM_PRIVATE_KEY", "PAYMIUM_SECRET", "PAYMIUM_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.phemex-secret]
+env = ["PHEMEX_API_SECRET", "PHEMEX_PRIVATE_KEY", "PHEMEX_SECRET", "PHEMEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.poloniex-secret]
+env = ["POLONIEX_API_SECRET", "POLONIEX_PRIVATE_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.revolutx-secret]
+env = ["REVOLUTX_API_SECRET", "REVOLUTX_PRIVATE_KEY", "REVOLUTX_SECRET", "REVOLUTX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.tokocrypto-secret]
+env = ["TOKOCRYPTO_API_SECRET", "TOKOCRYPTO_PRIVATE_KEY", "TOKOCRYPTO_SECRET", "TOKOCRYPTO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.toobit-secret]
+env = ["TOOBIT_API_SECRET", "TOOBIT_PRIVATE_KEY", "TOOBIT_SECRET", "TOOBIT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.upbit-secret]
+env = ["UPBIT_API_SECRET", "UPBIT_PRIVATE_KEY", "UPBIT_SECRET", "UPBIT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.weex-secret]
+env = ["WEEX_API_SECRET", "WEEX_PRIVATE_KEY", "WEEX_SECRET", "WEEX_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.whitebit-secret]
+env = ["WHITEBIT_API_SECRET", "WHITEBIT_PRIVATE_KEY", "WHITEBIT_SECRET", "WHITEBIT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.woo-secret]
+env = ["WOO_API_SECRET", "WOO_PRIVATE_KEY", "WOO_SECRET", "WOO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.woofipro-secret]
+env = ["WOOFIPRO_API_SECRET", "WOOFIPRO_PRIVATE_KEY", "WOOFIPRO_SECRET", "WOOFIPRO_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.xt-secret]
+env = ["XT_API_SECRET", "XT_PRIVATE_KEY", "XT_SECRET", "XT_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.zaif-secret]
+env = ["ZAIF_API_SECRET", "ZAIF_PRIVATE_KEY", "ZAIF_SECRET", "ZAIF_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.zebpay-secret]
+env = ["ZEBPAY_API_SECRET", "ZEBPAY_PRIVATE_KEY", "ZEBPAY_SECRET", "ZEBPAY_SECRET_KEY"]
+# signing half of the same venue: an HMAC input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+# ---------------------------------------------------------------------------
+# Crypto infrastructure beyond exchanges: market data, node/RPC providers,
+# block explorers and indexers, custody, and DeFi protocols. Every host below
+# is from the vendor's own documentation (linked per entry). Keys here travel
+# in a header, a query parameter, or a URL path, so they substitute like any
+# other value. A few vendors sign with the other half of the credential — an
+# HMAC or JWT input that never reaches the wire — and those names, like the
+# exchanges' above, live in hostless `<vendor>-secret` entries. See
+# https://github.com/casualjim/hodor/issues/19.
+# ---------------------------------------------------------------------------
+
+
+[providers.coingecko]
+env = ["CG_API_KEY", "COINGECKO_ACCESS_KEY", "COINGECKO_ACCESS_TOKEN", "COINGECKO_APIKEY", "COINGECKO_API_KEY", "COINGECKO_API_TOKEN", "COINGECKO_DEMO_API_KEY", "COINGECKO_KEY", "COINGECKO_PRO_API_KEY"]
+hosts = ["https://api.coingecko.com", "https://pro-api.coingecko.com"]
+pattern = "{base62:32}"
+# source: docs.coingecko.com/docs/setting-up-your-api-key
+
+[providers.coinmarketcap]
+env = ["CMC_API_KEY", "CMC_PRO_API_KEY", "COINMARKETCAP_ACCESS_KEY", "COINMARKETCAP_ACCESS_TOKEN", "COINMARKETCAP_APIKEY", "COINMARKETCAP_API_KEY", "COINMARKETCAP_API_TOKEN", "COINMARKETCAP_KEY"]
+hosts = ["https://pro-api.coinmarketcap.com"]
+pattern = "{base62:32}"
+# source: coinmarketcap.com/api/documentation/
+
+[providers.messari]
+env = ["MESSARI_ACCESS_KEY", "MESSARI_ACCESS_TOKEN", "MESSARI_APIKEY", "MESSARI_API_KEY", "MESSARI_API_TOKEN", "MESSARI_KEY"]
+hosts = ["https://api.messari.io", "https://data.messari.io"]
+pattern = "{base62:32}"
+# source: docs.messari.io/api-reference/authentication
+
+[providers.amberdata]
+env = ["AMBERDATA_ACCESS_KEY", "AMBERDATA_ACCESS_TOKEN", "AMBERDATA_APIKEY", "AMBERDATA_API_KEY", "AMBERDATA_API_TOKEN", "AMBERDATA_KEY"]
+hosts = ["https://api.amberdata.com"]
+pattern = "{base62:32}"
+# source: docs.amberdata.io/http/http-api-fundamentals
+
+[providers.kaiko]
+env = ["KAIKO_ACCESS_KEY", "KAIKO_ACCESS_TOKEN", "KAIKO_APIKEY", "KAIKO_API_KEY", "KAIKO_API_TOKEN", "KAIKO_KEY"]
+hosts = ["https://*.market-api.kaiko.io"]
+pattern = "{base62:32}"
+# source: docs.kaiko.com/rest-api
+
+[providers.blockchair]
+env = ["BLOCKCHAIR_ACCESS_KEY", "BLOCKCHAIR_ACCESS_TOKEN", "BLOCKCHAIR_APIKEY", "BLOCKCHAIR_API_KEY", "BLOCKCHAIR_API_TOKEN", "BLOCKCHAIR_KEY"]
+hosts = ["https://api.blockchair.com"]
+pattern = "{base62:32}"
+# source: blockchair.com/api/docs
+
+[providers.bitquery]
+env = ["BITQUERY_ACCESS_KEY", "BITQUERY_ACCESS_TOKEN", "BITQUERY_APIKEY", "BITQUERY_API_KEY", "BITQUERY_API_TOKEN", "BITQUERY_KEY"]
+hosts = ["https://streaming.bitquery.io", "https://graphql.bitquery.io", "https://oauth2.bitquery.io"]
+pattern = "{base62:32}"
+# source: docs.bitquery.io/docs/authorisation/how-to-use/
+
+[providers.coinglass]
+env = ["COINGLASS_ACCESS_KEY", "COINGLASS_ACCESS_TOKEN", "COINGLASS_APIKEY", "COINGLASS_API_KEY", "COINGLASS_API_TOKEN", "COINGLASS_KEY"]
+hosts = ["https://open-api.coinglass.com", "https://open-api-v4.coinglass.com"]
+pattern = "{base62:32}"
+# source: coinglass.com/learn/CoinGlass-API-Full-Guide-en
+
+[providers.coinpaprika]
+env = ["COINPAPRIKA_ACCESS_KEY", "COINPAPRIKA_ACCESS_TOKEN", "COINPAPRIKA_APIKEY", "COINPAPRIKA_API_KEY", "COINPAPRIKA_API_TOKEN", "COINPAPRIKA_KEY"]
+hosts = ["https://api.coinpaprika.com"]
+pattern = "{base62:32}"
+# source: docs.coinpaprika.com/get-started/api-rest-introduction
+
+[providers.dune]
+env = ["DUNE_ACCESS_KEY", "DUNE_ACCESS_TOKEN", "DUNE_APIKEY", "DUNE_API_KEY", "DUNE_API_TOKEN", "DUNE_KEY"]
+hosts = ["https://api.dune.com"]
+pattern = "{base62:32}"
+# source: docs.dune.com/api-reference/overview/getting-started
+
+[providers.covalent]
+env = ["COVALENT_ACCESS_KEY", "COVALENT_ACCESS_TOKEN", "COVALENT_APIKEY", "COVALENT_API_KEY", "COVALENT_API_TOKEN", "COVALENT_KEY", "GOLDRUSH_API_KEY"]
+hosts = ["https://api.covalenthq.com"]
+pattern = "{base62:32}"
+# source: goldrush.dev/docs/chains/covalent
+
+[providers.thegraph]
+env = ["GRAPH_API_KEY", "THEGRAPH_ACCESS_KEY", "THEGRAPH_ACCESS_TOKEN", "THEGRAPH_APIKEY", "THEGRAPH_API_KEY", "THEGRAPH_API_TOKEN", "THEGRAPH_KEY"]
+hosts = ["https://gateway.thegraph.com", "https://api.thegraph.com"]
+pattern = "{base62:32}"
+# source: thegraph.com/docs/en/subgraphs/providers/subgraph-studio/managing-api-keys/
+
+[providers.quicknode]
+env = ["QUICKNODE_ACCESS_KEY", "QUICKNODE_ACCESS_TOKEN", "QUICKNODE_APIKEY", "QUICKNODE_API_KEY", "QUICKNODE_API_TOKEN", "QUICKNODE_ENDPOINT", "QUICKNODE_KEY"]
+hosts = ["https://*.quiknode.pro", "https://api.quicknode.com"]
+pattern = "{base62:32}"
+# source: quicknode.com/docs/build-with-ai/quicknode-apis
+
+[providers.helius]
+env = ["HELIUS_ACCESS_KEY", "HELIUS_ACCESS_TOKEN", "HELIUS_APIKEY", "HELIUS_API_KEY", "HELIUS_API_TOKEN", "HELIUS_KEY", "HELIUS_RPC_URL"]
+hosts = ["https://*.helius-rpc.com", "https://api.helius.xyz"]
+pattern = "{base62:32}"
+# source: helius.dev/docs/api-reference/endpoints
+
+[providers.tatum]
+env = ["TATUM_ACCESS_KEY", "TATUM_ACCESS_TOKEN", "TATUM_APIKEY", "TATUM_API_KEY", "TATUM_API_TOKEN", "TATUM_KEY"]
+hosts = ["https://*.tatum.io"]
+pattern = "{base62:32}"
+# source: tatum.io HTTP API documentation
+
+[providers.ankr]
+env = ["ANKR_ACCESS_KEY", "ANKR_ACCESS_TOKEN", "ANKR_APIKEY", "ANKR_API_KEY", "ANKR_API_TOKEN", "ANKR_KEY"]
+hosts = ["https://rpc.ankr.com"]
+pattern = "{base62:32}"
+# source: ankr.com/docs/api-reference/
+
+[providers.chainstack]
+env = ["CHAINSTACK_ACCESS_KEY", "CHAINSTACK_ACCESS_TOKEN", "CHAINSTACK_APIKEY", "CHAINSTACK_API_KEY", "CHAINSTACK_API_TOKEN", "CHAINSTACK_KEY"]
+hosts = ["https://*.p2pify.com"]
+pattern = "{base62:32}"
+# source: docs.chainstack.com/reference/chainstack-platform-api-create-node
+
+[providers.getblock]
+env = ["GETBLOCK_ACCESS_KEY", "GETBLOCK_ACCESS_TOKEN", "GETBLOCK_APIKEY", "GETBLOCK_API_KEY", "GETBLOCK_API_TOKEN", "GETBLOCK_KEY"]
+hosts = ["https://*.getblock.io"]
+pattern = "{base62:32}"
+# source: docs.getblock.io/api-reference/overview
+
+[providers.nownodes]
+env = ["NOWNODES_ACCESS_KEY", "NOWNODES_ACCESS_TOKEN", "NOWNODES_APIKEY", "NOWNODES_API_KEY", "NOWNODES_API_TOKEN", "NOWNODES_KEY"]
+hosts = ["https://*.nownodes.io"]
+pattern = "{base62:32}"
+# source: nownodes.gitbook.io/documentation/nodeapis
+
+[providers.blockdaemon]
+env = ["BLOCKDAEMON_ACCESS_KEY", "BLOCKDAEMON_ACCESS_TOKEN", "BLOCKDAEMON_APIKEY", "BLOCKDAEMON_API_KEY", "BLOCKDAEMON_API_TOKEN", "BLOCKDAEMON_KEY"]
+hosts = ["https://svc.blockdaemon.com"]
+pattern = "{base62:32}"
+# source: docs.blockdaemon.com/docs/authentication
+
+[providers.tenderly]
+env = ["TENDERLY_ACCESS_KEY", "TENDERLY_ACCESS_TOKEN", "TENDERLY_APIKEY", "TENDERLY_API_KEY", "TENDERLY_API_TOKEN", "TENDERLY_KEY", "TENDERLY_NODE_ACCESS_KEY"]
+hosts = ["https://api.tenderly.co", "https://*.gateway.tenderly.co"]
+pattern = "{base62:32}"
+# source: docs.tenderly.co/reference/api
+
+[providers.blockscout]
+env = ["BLOCKSCOUT_ACCESS_KEY", "BLOCKSCOUT_ACCESS_TOKEN", "BLOCKSCOUT_APIKEY", "BLOCKSCOUT_API_KEY", "BLOCKSCOUT_API_TOKEN", "BLOCKSCOUT_KEY"]
+hosts = ["https://*.blockscout.com"]
+pattern = "{base62:32}"
+# source: docs.blockscout.com/devs/apis
+
+[providers.solscan]
+env = ["SOLSCAN_ACCESS_KEY", "SOLSCAN_ACCESS_TOKEN", "SOLSCAN_APIKEY", "SOLSCAN_API_KEY", "SOLSCAN_API_TOKEN", "SOLSCAN_KEY"]
+hosts = ["https://pro-api.solscan.io"]
+pattern = "{base62:32}"
+# source: docs.solscan.io/api-access/how-to-generate-your-solscan-pro-api-key
+
+[providers.birdeye]
+env = ["BIRDEYE_ACCESS_KEY", "BIRDEYE_ACCESS_TOKEN", "BIRDEYE_APIKEY", "BIRDEYE_API_KEY", "BIRDEYE_API_TOKEN", "BIRDEYE_KEY"]
+hosts = ["https://public-api.birdeye.so"]
+pattern = "{base62:32}"
+# source: docs.birdeye.so/docs/authentication-api-keys
+
+[providers.jupiter]
+env = ["JUPITER_ACCESS_KEY", "JUPITER_ACCESS_TOKEN", "JUPITER_APIKEY", "JUPITER_API_KEY", "JUPITER_API_TOKEN", "JUPITER_KEY"]
+hosts = ["https://api.jup.ag", "https://lite-api.jup.ag"]
+pattern = "{base62:32}"
+# source: dev.jup.ag/api-reference/swap/quote
+
+[providers.fireblocks]
+env = ["FIREBLOCKS_ACCESS_KEY", "FIREBLOCKS_ACCESS_TOKEN", "FIREBLOCKS_APIKEY", "FIREBLOCKS_API_KEY", "FIREBLOCKS_API_TOKEN", "FIREBLOCKS_KEY"]
+hosts = ["https://api.fireblocks.io"]
+pattern = "{base62:32}"
+# source: docs.fireblocks.com/api/v1.4/
+
+[providers.bitgo]
+env = ["BITGO_ACCESS_KEY", "BITGO_ACCESS_TOKEN", "BITGO_APIKEY", "BITGO_API_KEY", "BITGO_API_TOKEN", "BITGO_KEY"]
+hosts = ["https://app.bitgo.com", "https://app.bitgo-test.com"]
+pattern = "{base62:32}"
+# source: developers.bitgo.com/guides/get-started/access-tokens
+
+[providers.cobo]
+env = ["COBO_ACCESS_KEY", "COBO_ACCESS_TOKEN", "COBO_APIKEY", "COBO_API_KEY", "COBO_API_TOKEN", "COBO_KEY"]
+hosts = ["https://api.cobo.com"]
+pattern = "{base62:32}"
+# source: cobo.com/developers/v2/guides/get-started/get-started-with-waas
+
+[providers.fordefi]
+env = ["FORDEFI_ACCESS_KEY", "FORDEFI_ACCESS_TOKEN", "FORDEFI_APIKEY", "FORDEFI_API_KEY", "FORDEFI_API_TOKEN", "FORDEFI_KEY"]
+hosts = ["https://api.fordefi.com"]
+pattern = "{base62:32}"
+# source: docs.fordefi.com/developers/authentication
+
+[providers.safe]
+env = ["SAFE_ACCESS_KEY", "SAFE_ACCESS_TOKEN", "SAFE_APIKEY", "SAFE_API_KEY", "SAFE_API_TOKEN", "SAFE_KEY"]
+hosts = ["https://*.safe.global"]
+pattern = "{base62:32}"
+# source: docs.safe.global/core-api/transaction-service-overview
+
+[providers.opensea]
+env = ["OPENSEA_ACCESS_KEY", "OPENSEA_ACCESS_TOKEN", "OPENSEA_APIKEY", "OPENSEA_API_KEY", "OPENSEA_API_TOKEN", "OPENSEA_KEY"]
+hosts = ["https://api.opensea.io"]
+pattern = "{base62:32}"
+# source: docs.opensea.io/reference/api-keys
+
+[providers.reservoir]
+env = ["RESERVOIR_ACCESS_KEY", "RESERVOIR_ACCESS_TOKEN", "RESERVOIR_APIKEY", "RESERVOIR_API_KEY", "RESERVOIR_API_TOKEN", "RESERVOIR_KEY"]
+hosts = ["https://*.reservoir.tools"]
+pattern = "{base62:32}"
+# source: docs.reservoir.tools/docs/how-do-i-get-a-reservoir-api-key
+
+[providers.1inch]
+env = ["ONE_INCH_ACCESS_KEY", "ONE_INCH_ACCESS_TOKEN", "ONE_INCH_APIKEY", "ONE_INCH_API_KEY", "ONE_INCH_API_TOKEN", "ONE_INCH_KEY"]
+hosts = ["https://api.1inch.dev", "https://api.1inch.com", "https://api.1inch.io"]
+pattern = "{base62:32}"
+# source: business.1inch.com/portal/documentation/apis/authentication
+
+[providers.0x]
+env = ["ZEROEX_ACCESS_KEY", "ZEROEX_ACCESS_TOKEN", "ZEROEX_APIKEY", "ZEROEX_API_KEY", "ZEROEX_API_TOKEN", "ZEROEX_KEY"]
+hosts = ["https://api.0x.org"]
+pattern = "{base62:32}"
+# source: docs.0x.org/0x-swap-api/introduction
+
+[providers.uniswap]
+env = ["UNISWAP_ACCESS_KEY", "UNISWAP_ACCESS_TOKEN", "UNISWAP_APIKEY", "UNISWAP_API_KEY", "UNISWAP_API_TOKEN", "UNISWAP_KEY"]
+hosts = ["https://trade-api.gateway.uniswap.org"]
+pattern = "{base62:32}"
+# source: developers.uniswap.org/docs/get-started/quickstart
+
+[providers.aave]
+env = ["AAVE_ACCESS_KEY", "AAVE_ACCESS_TOKEN", "AAVE_APIKEY", "AAVE_API_KEY", "AAVE_API_TOKEN", "AAVE_KEY"]
+hosts = ["https://*.aave.com"]
+pattern = "{base62:32}"
+# source: aave.com/docs/aave-v3/getting-started/graphql
+
+[providers.curve]
+env = ["CURVE_ACCESS_KEY", "CURVE_ACCESS_TOKEN", "CURVE_APIKEY", "CURVE_API_KEY", "CURVE_API_TOKEN", "CURVE_KEY"]
+hosts = ["https://api.curve.finance", "https://api.curve.fi"]
+pattern = "{base62:32}"
+# source: api.curve.finance/v1/documentation/
+
+[providers.chainlink]
+env = ["CHAINLINK_ACCESS_KEY", "CHAINLINK_ACCESS_TOKEN", "CHAINLINK_APIKEY", "CHAINLINK_API_KEY", "CHAINLINK_API_TOKEN", "CHAINLINK_KEY"]
+hosts = ["https://*.dataengine.chain.link"]
+pattern = "{base62:32}"
+# source: docs.chain.link/data-streams/reference/data-streams-api/interface-api
+
+[providers.pyth]
+env = ["PYTH_ACCESS_KEY", "PYTH_ACCESS_TOKEN", "PYTH_APIKEY", "PYTH_API_KEY", "PYTH_API_TOKEN", "PYTH_HERMES_API_KEY", "PYTH_KEY"]
+hosts = ["https://hermes.pyth.network"]
+pattern = "{base62:32}"
+# source: docs.pyth.network/price-feeds/core/api-instances-and-providers/hermes
+
+[providers.lifi]
+env = ["LIFI_ACCESS_KEY", "LIFI_ACCESS_TOKEN", "LIFI_APIKEY", "LIFI_API_KEY", "LIFI_API_TOKEN", "LIFI_KEY"]
+hosts = ["https://li.quest", "https://order.li.fi"]
+pattern = "{base62:32}"
+# source: docs.li.fi/api-reference/introduction
+
+[providers.fireblocks-secret]
+env = ["FIREBLOCKS_API_PRIVATE_KEY", "FIREBLOCKS_API_SECRET", "FIREBLOCKS_PRIVATE_KEY"]
+# signing half: an HMAC or JWT input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.cobo-secret]
+env = ["COBO_API_PRIVATE_KEY", "COBO_API_SECRET", "COBO_PRIVATE_KEY"]
+# signing half: an HMAC or JWT input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.coinbase-developer-platform]
+env = ["CDP_API_KEY_ID", "CDP_API_KEY_NAME"]
+hosts = ["https://api.cdp.coinbase.com"]
+pattern = "{base62:32}"
+# CDP keys sign a JWT; the retail and Exchange hosts live in the
+# ccxt-derived `coinbase` and `coinbaseexchange` entries in the section above.
+
+[providers.coinbase-developer-platform-secret]
+env = ["CDP_API_KEY_SECRET", "CDP_WALLET_SECRET"]
+# signing half: an HMAC or JWT input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.chainlink-secret]
+env = ["CHAINLINK_API_SECRET", "CHAINLINK_USER_SECRET"]
+# signing half: an HMAC or JWT input that never reaches the wire,
+# so no hosts — decoy shape only, no rule. https://github.com/casualjim/hodor/issues/19
+
+[providers.defillama]
+env = ["DEFILLAMA_ACCESS_KEY", "DEFILLAMA_ACCESS_TOKEN", "DEFILLAMA_APIKEY", "DEFILLAMA_API_KEY", "DEFILLAMA_API_TOKEN", "DEFILLAMA_KEY"]
+hosts = ["https://api.llama.fi", "https://coins.llama.fi", "https://pro-api.llama.fi", "https://stablecoins.llama.fi", "https://yields.llama.fi"]
+pattern = "{base62:32}"
+# LLAMA_API_KEY belongs to `llama` (api.llama.com), a different vendor.
+# source: docs.llama.fi/api
+
+# ---------------------------------------------------------------------------
 # Alias env names for vendors already covered above: same hosts and pattern,
 # extra spellings a project may export the credential under.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+
+[names.TOGETHERAI_API_KEY]
+hosts = ["https://api.together.xyz"]
+pattern = "tgp_v1_{base62:43}"
+# source: betterleaks v1.6.1 rule `togetherai-api-key` — its validate expression calls api.together.xyz
+
+[names.AIKIDO_CLIENT_SECRET]
+hosts = ["https://app.aikido.dev"]
+pattern = "AIK_SECRET_{base62:64}"
+# source: betterleaks v1.6.1 rule `aikido-client-secret` (its regex states the AIK_SECRET_ prefix)
+# note: the CI token uses a different, unprefixed shape, so only the client secret is narrowed.
 
 [names.AZURE_DEVOPS_PAT]
 hosts = ["https://dev.azure.com", "https://*.visualstudio.com"]
@@ -6218,3 +7807,69 @@ hosts = ["https://api.vercel.com"]
 pattern = "{base62:24}"
 # source: https://vercel.com/docs/rest-api
 # note: no vendor page states a token format; the shape is generic.
+
+# source: betterleaks v1.6.1 rule `cerebras-api-key`
+[names.CEREBRAS_API_KEY]
+pattern = "csk-{base62:48}"
+
+# source: betterleaks v1.6.1 rule `databricks-api-token`
+[names.DATABRICKS_TOKEN]
+pattern = "dapi{hex:32}"
+
+# source: betterleaks v1.6.1 rule `digitalocean-access-token`
+[names.DIGITALOCEAN_ACCESS_TOKEN]
+hosts = ["https://api.digitalocean.com"]
+pattern = "doo_v1_{hex:64}"
+# note: `doo_v1_` is DigitalOcean's OAuth token; personal access tokens carry `dop_v1_`, so `DIGITALOCEAN_TOKEN` keeps the provider's generic hex shape.
+
+# source: betterleaks v1.6.1 rule `grafana-service-account-token`
+[names.GRAFANA_SERVICE_ACCOUNT_TOKEN]
+pattern = "glsa_{base62:32}"
+# note: `GRAFANA_API_KEY` is the deprecated predecessor and keeps the provider's generic shape.
+
+# source: betterleaks v1.6.1 rule `groq-api-key`
+[names.GROQ_API_KEY]
+pattern = "gsk_{base62:52}"
+
+# source: betterleaks v1.6.1 rule `minimax-api-key`
+[names.MINIMAX_API_KEY]
+pattern = "sk-api-{base62:119}"
+
+# source: betterleaks v1.6.1 rule `npm-access-token`
+[names.NPM_TOKEN]
+pattern = "npm_{base62:36}"
+
+# source: betterleaks v1.6.1 rule `openrouter-api-key`
+[names.OPENROUTER_API_KEY]
+pattern = "sk-or-v1-{hex:64}"
+
+# source: betterleaks v1.6.1 rule `perplexity-api-key`
+[names.PERPLEXITY_API_KEY]
+pattern = "pplx-{base62:48}"
+
+# source: betterleaks v1.6.1 rule `postman-api-token`
+[names.POSTMAN_API_KEY]
+pattern = "PMAK-{hex:58}"
+# note: the real value is `PMAK-<24 hex>-<34 hex>`; a pattern carries one verb and one prefix, so the inner dash collapses and only the total length is preserved.
+
+# source: betterleaks v1.6.1 rule `prefect-api-token`
+[names.PREFECT_API_KEY]
+pattern = "pnu_{base62:36}"
+
+# source: betterleaks v1.6.1 rule `pulumi-api-token`
+[names.PULUMI_ACCESS_TOKEN]
+pattern = "pul-{hex:40}"
+
+# source: betterleaks v1.6.1 rule `readme-api-token`
+[names.README_API_KEY]
+pattern = "rdme_{base62:70}"
+
+# source: betterleaks v1.6.1 rule `sentry-user-token`
+[names.SENTRY_AUTH_TOKEN]
+pattern = "sntryu_{hex:64}"
+
+# source: betterleaks v1.6.1 rule `supabase-project-api-key`
+[names.SUPABASE_SECRET_KEY]
+hosts = ["https://*.supabase.co"]
+pattern = "sb_secret_{base62:31}"
+# note: this is the successor to the `service_role` JWT the provider claims; the provider pattern stays generic for the older JWT values.

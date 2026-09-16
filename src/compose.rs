@@ -185,9 +185,11 @@ pub fn rules_toml(decoys: &[Decoy], hostless: &[Decoy], unregistered: &[String])
   }
   if !hostless.is_empty() {
     out.push_str(
-      "# The registry knows these names but states no hosts, so a rule would be\n\
-       # dropped at serve time. Name the endpoint you run and uncomment the rule,\n\
-       # or drop the key from fnox:\n\
+      "# The registry knows these names but states no hosts: either the endpoint is\n\
+       # per deployment (self-hosted control planes) or the value is a signing input\n\
+       # that never reaches the wire (exchange API secrets — see\n\
+       # https://github.com/casualjim/hodor/issues/19). Name the endpoint to use the\n\
+       # key as a rule, or drop it from fnox to stop emitting a decoy:\n\
        #\n",
     );
     for decoy in hostless {

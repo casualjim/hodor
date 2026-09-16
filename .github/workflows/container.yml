@@ -54,12 +54,14 @@ jobs:
       - name: Assert the binary carries transparent capture
         run: |
           # dist silently ignores build settings it does not recognize, and a binary
-          # built without capture only fails at runtime, in production. The marker
-          # is compiled in unconditionally on Linux, and this works on arm64 too.
-          if ! grep -aq 'TPROXY capture failed' ctx/hodor; then
-            echo "::error::ctx/hodor was built without transparent capture"
-            exit 1
-          fi
+          # built without capture only fails at runtime, in production. Both markers
+          # are compiled in with the tun feature, and this works on arm64 too.
+          for marker in 'TUN capture failed' 'TPROXY capture failed'; do
+            if ! grep -aq "$marker" ctx/hodor; then
+              echo "::error::ctx/hodor was built without transparent capture ($marker)"
+              exit 1
+            fi
+          done
 
       - name: Set up buildx
         uses: docker/setup-buildx-action@v4

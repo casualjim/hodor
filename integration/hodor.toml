@@ -1,9 +1,9 @@
 # Project-layer config for the transparent integration demo (loaded via
-# `hodor serve --tproxy --config`. The client shares hodor's network
+# `hodor serve --proxy-backend tproxy --config`. The client shares hodor's network
 # namespace and holds only the deterministic fake printed by
-# `hodor fake GH_TOKEN`; capture is via TUN policy routing.
+# `hodor fake GH_TOKEN`; capture is via TPROXY policy routing.
 #
-# The tcp:// grant host is the literal destination IP: TUN raw TCP has no
+# The tcp:// grant host is the literal destination IP: captured raw TCP has no
 # SNI, the dst address is the identity (src/tproxy/mod.rs tproxy_conn_task).
 # Hence the static api address in compose.yaml.
 [proxy]

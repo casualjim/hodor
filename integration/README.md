@@ -3,7 +3,7 @@
 Runs the real container image (runtime-only `Dockerfile`, prebuilt
 binary) in the deployment shape hodor exists for: the
 client container shares hodor's network namespace and knows nothing about
-any proxy. hodor runs `serve --tproxy` and installs its nft rules and
+any proxy. hodor runs `serve --proxy-backend tproxy` and installs its nft rules and
 policy routing inside the shared netns, so every client connection is
 captured on the way out.
 
@@ -18,7 +18,7 @@ Topology:
 - `api` — bun server on `server` only, static IP `10.202.0.20`,
   validates only the real token.
 - `server` subnet is RFC1918 on purpose: hodor captures LAN traffic too
-  (`capture_routes` is default-route-only), and this demo proves it.
+  (the capture routes are default-route-only), and this demo proves it.
 
 | # | Client does | Grant | Passes when |
 | --- | ------------- | ------- | ------------- |

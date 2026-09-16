@@ -1,7 +1,7 @@
 # bwrap demo (transparent capture without docker)
 
 Same proof as the [docker demo](../README.md), minus the docker daemon: a
-network namespace with a veth up to the host, `hodor serve --tproxy`
+network namespace with a veth up to the host, `hodor serve --proxy-backend tproxy`
 capturing inside it, and the client sandboxed by [bubblewrap] while
 sharing the netns — proxy-unaware, fake-token-holding, captured on the way
 out.

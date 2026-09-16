@@ -3,10 +3,10 @@
 #MISE description="Run the Rust tests for this project"
 #MISE sources=["Cargo.toml", "src/**/*.rs", "rules/**/*.toml"]
 
-proj_dir=$(git rev-parse --show-toplevel)
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
 cargo nextest run --cargo-quiet --workspace --show-progress=bar --status-level=slow "$@"
-cargo nextest run --cargo-quiet --show-progress=bar --status-level=slow "$@"
+cargo nextest run --cargo-quiet --workspace --show-progress=bar --status-level=slow --features tun "$@"

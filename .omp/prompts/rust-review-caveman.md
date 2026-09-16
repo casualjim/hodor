@@ -65,7 +65,7 @@ Flag:
 - flag duplicated validation or normalization after the config boundary
 
 ### Config
-Runtime config loads via confique overlay in `config.rs`, wired from `main.rs`. `--tun`/`HODOR_TUN` is CLI/env only by design. Flag config parsing outside `config.rs`, duplicated overlay logic, or file/env precedence inversions (CLI > env > project > global).
+Runtime config loads via confique overlay in `config.rs`, wired from `main.rs`. `--proxy-backend`/`HODOR_PROXY_BACKEND` is CLI/env only by design. Flag config parsing outside `config.rs`, duplicated overlay logic, or file/env precedence inversions (CLI > env > project > global).
 
 ### Error boundaries
 - `eyre::Result` everywhere with context strings (`bail!`/`ensure!`); no per-module `Error`/`Result` aliases, no `thiserror`

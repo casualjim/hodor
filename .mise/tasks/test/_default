@@ -5,9 +5,10 @@ set -euo pipefail
 #MISE description="Run the full project test suite"
 #MISE sources=["Cargo.toml", "src/**/*.rs", "rules/**/*.toml", ".mise/tasks/test/**"]
 
-proj_dir=$(git rev-parse --show-toplevel)
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
 
 mise run --force test:rust "$@"
+mise run --force test:tun --use-sudo "$@"
 mise run --force test:tproxy --use-sudo "$@"
 

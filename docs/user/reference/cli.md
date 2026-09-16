@@ -16,12 +16,21 @@ Serve the proxy.
 | --- | --- | --- |
 | `--listen <ADDR>` | `HODOR_LISTEN` | Explicit-proxy listen address. Default `127.0.0.1:8080`. |
 | `--ca-file <PATH>` | `HODOR_CA_FILE` | CA PEM path (certificate followed by key). Default `<config-dir>/hodor/ca.pem`. |
-| `--tproxy` | `HODOR_TPROXY` | Also capture via kernel TPROXY. Needs `CAP_NET_ADMIN`; Linux only. |
-| `--tproxy-allow-root-netns` | `HODOR_TPROXY_ALLOW_ROOT_NETNS` | Allow unscoped capture rules in the host network namespace. Disposable machines only. |
+| `--proxy-backend <BACKEND>` | `HODOR_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only), `tun`, or `tproxy`. Linux only; `tun` also needs a binary built with the `tun` feature. |
+| `--tproxy-allow-root-netns` | `HODOR_TPROXY_ALLOW_ROOT_NETNS` | With `--proxy-backend tproxy`, allow unscoped capture rules in the host network namespace. Disposable machines only. |
 
-`--tproxy` and `--tproxy-allow-root-netns` are CLI and environment only, deliberately absent from config files: TPROXY mutates host nft rules and routes, so enabling it is an explicit act, not ambient configuration.
+`--proxy-backend` and `--tproxy-allow-root-netns` are CLI and environment only, deliberately absent from config files: capture mutates host routes and nft rules, so enabling it is an explicit act, not ambient configuration.
 
-The listener binds before any capture side effect, so a bad listen address fails before nft rules touch the host. With `--tproxy`, a failed TPROXY leg ends the process rather than silently serving explicit-proxy only.
+What each backend does:
+
+| Backend | Mechanism | UDP |
+| --- | --- | --- |
+| `tproxy` | nftables rules and policy routes hand TCP to an `IP_TRANSPARENT` listener. Needs `CAP_NET_ADMIN`. | Passes through untouched, except QUIC on `:443`, which is dropped so HTTP/3 clients fall back to TCP. |
+| `tun` | A TUN device plus an in-process TCP/IP stack. Needs root and the `tun` feature. | Relayed inside hodor: DNS to the system resolver, QUIC dropped, other flows to their original destination. |
+
+Both backends are peers: same interception contract (a captured connection's destination is its identity), different mechanism. `tun` is the one to reach for when you need the UDP path handled; `tproxy` is the one to reach for when you want the kernel to terminate TCP.
+
+The listener binds before any capture side effect, so a bad listen address fails before routes or nft rules touch the host. A failed capture leg ends the process rather than silently serving explicit-proxy only.
 
 ## `hodor fake <ENV> [--pattern <PATTERN>]`
 
@@ -50,4 +59,4 @@ See [how to confine a workspace](../how-to/confine-a-workspace.md).
 
 ## Exit behaviour
 
-Malformed client traffic closes the connection quietly; it never fails the process. Configuration errors, CA errors, and a failed TPROXY leg fail startup or the process. Listening on a non-loopback address logs a warning: anyone reaching the port can trigger real-secret substitution.
+Malformed client traffic closes the connection quietly; it never fails the process. Configuration errors, CA errors, and a failed capture leg fail startup or the process. Listening on a non-loopback address logs a warning: anyone reaching the port can trigger real-secret substitution.

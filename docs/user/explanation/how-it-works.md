@@ -14,7 +14,7 @@ Two capture paths feed the same machinery.
 
 **Explicit proxy.** The client points `HTTP(S)_PROXY` at hodor's listener. Every connection arrives labelled with its destination host and port.
 
-**Transparent capture (Linux).** `--tproxy` installs an `IP_TRANSPARENT` listener plus nftables rules and policy routes over netlink, so the kernel redirects every outbound TCP connection in the namespace to hodor. The client configured nothing and cannot bypass the proxy. UDP passes through, and QUIC on port 443 is dropped so HTTP/3 clients fall back to TCP.
+**Transparent capture (Linux).** `--proxy-backend` selects a backend. `tproxy` installs an `IP_TRANSPARENT` listener plus nftables rules and policy routes over netlink, so the kernel redirects every outbound TCP connection in the namespace to hodor; UDP passes through and QUIC on port 443 is dropped so HTTP/3 clients fall back to TCP. `tun` opens a TUN device and feeds it into a userspace stack (smoltcp, medium-ip, any-ip), with policy routes in a dedicated table pointing at the device, and handles UDP itself: DNS relayed to the system resolver, QUIC dropped, other flows relayed to their destination. Both are peers — same interception contract, different mechanism — and in both the client configured nothing and cannot bypass the proxy. hodor marks its own upstream dials so its egress never loops back into its own capture.
 
 Then, per connection:
 
@@ -35,7 +35,7 @@ Then, per connection:
 
 **Write-once state.** `ProxyState` is built once at startup behind an `Arc`; there is no reload. Certificates live in a `DashMap` so lookups are lock-free and keygen happens on the caller's thread, never under a lock. Per-connection work is a `tokio::spawn`, with a 10-second budget on pre-auth and dial phases.
 
-**TPROXY opts in at the CLI only.** Capture mutates host nft rules and routes. Reading it from a config file would make it ambient; hodor requires the explicit flag, binds its listener before touching the host, and tears the rules down on exit.
+**Capture opts in at the CLI only.** Capture mutates host routes, and TPROXY also host nft rules. Reading it from a config file would make it ambient; hodor requires the explicit flag, binds its listener before touching the host, and tears the rules down on exit.
 
 ## Where the secrets live
 

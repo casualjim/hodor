@@ -16,6 +16,8 @@ mod sni;
 mod substitute;
 #[cfg(target_os = "linux")]
 mod tproxy;
+#[cfg(all(feature = "tun", target_os = "linux"))]
+mod tun;
 
 use std::path::PathBuf;
 
@@ -39,7 +41,8 @@ pub struct Cli {
 /// Available subcommands.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-  /// Serve the proxy (explicit listener, plus kernel TPROXY with `--tproxy`).
+  /// Serve the proxy: the explicit listener, plus transparent capture when
+  /// `--proxy-backend` selects one.
   Serve(ServeArgs),
   /// Print the deterministic fake for an env var name.
   Fake(FakeArgs),
@@ -89,10 +92,13 @@ pub struct ServeArgs {
   #[command(flatten)]
   pub proxy: <config::ProxyCfg as confique::Config>::Layer,
   // Deployment-mode switch: CLI + env only, deliberately not a file key —
-  // TPROXY mutates host nft rules and routes, an explicit intention, not ambient.
-  /// Also capture via kernel TPROXY (needs `CAP_NET_ADMIN`; Linux only).
-  #[arg(long, env = "HODOR_TPROXY", help = "also capture via kernel TPROXY (needs CAP_NET_ADMIN)")]
-  pub tproxy: bool,
+  // both backends mutate host routes/nft rules and must be an explicit
+  // intention, not ambient configuration.
+  /// Capture traffic transparently with this backend, instead of only
+  /// serving the explicit listener. `none` (the default) runs the explicit
+  /// proxy alone.
+  #[arg(long, env = "HODOR_PROXY_BACKEND", value_enum, default_value_t = ProxyBackend::None)]
+  pub proxy_backend: ProxyBackend,
   /// Allow unscoped TPROXY rules in the current (host) network namespace.
   /// Without this, unscoped capture outside an isolated netns is refused:
   /// the rules reroute every outbound TCP packet, and an unclean exit
@@ -103,6 +109,24 @@ pub struct ServeArgs {
     help = "allow unscoped TPROXY rules in the host network namespace (disposable machines only)"
   )]
   pub tproxy_allow_root_netns: bool,
+}
+
+/// Transparent capture backend. Both are peers: same interception contract
+/// (the destination is the identity), different mechanism and different UDP
+/// behaviour.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProxyBackend {
+  /// Explicit listener only; no transparent capture.
+  #[default]
+  None,
+  /// Userspace: a TUN device plus an in-process TCP/IP stack, which also
+  /// relays UDP (DNS to the system resolver, QUIC dropped). Needs root and
+  /// a binary built with the `tun` feature.
+  Tun,
+  /// Kernel: nftables rules and policy routes hand TCP to an
+  /// `IP_TRANSPARENT` listener; UDP passes through untouched. Needs
+  /// `CAP_NET_ADMIN`.
+  Tproxy,
 }
 
 /// Arguments for [`Command::Fake`].
@@ -160,75 +184,113 @@ async fn main() -> eyre::Result<()> {
       let workspace = args.workspace.clone().unwrap_or_else(|| PathBuf::from("."));
       compose::confine_command(&args.action, &workspace)
     }
-    Command::Serve(args) => {
-      #[cfg(not(target_os = "linux"))]
-      if args.tproxy {
-        eyre::bail!("--tproxy is only supported on Linux");
-      }
-      let (mut config, workspace) = config::load(&cli)?;
-      let registry = secrets::Registry::load(config::rules_dir().as_deref())?;
-      // fnox is needed when a rule has no inline value, and when a provider
-      // credential it may declare is missing from the environment.
-      let needs_fnox =
-        config.rules.values().any(|rule| rule.value.is_none()) || secrets::FNOX_ENV.iter().any(|name| std::env::var_os(name).is_none());
-      let fnox = if needs_fnox { secrets::FnoxSource::open()? } else { None };
-      if let Some(source) = &fnox {
-        for name in secrets::export_provider_env(source).await? {
-          tracing::debug!(name, "provider credential taken from fnox");
-        }
-      }
-      secrets::resolve(&mut config, &registry, fnox).await?;
-      let resolved = grants::resolve(&config)?;
-      if let Some(ws) = &workspace {
-        tracing::info!(
-          root = %ws.root().display(),
-          kind = ?ws.kind(),
-          ecosystems = %ws.ecosystem_label(),
-          "workspace"
-        );
-      } else {
-        tracing::debug!("no workspace root, global config only");
-      }
-      let ca = ca::load_or_generate(&ca_path(&resolved.proxy)?)?;
-      let listen_addr = resolved.proxy.listen;
-      let grant_count = resolved.grants.len();
-      #[cfg(target_os = "linux")]
-      let fwmark = args.tproxy.then_some(tproxy::EGRESS_MARK);
-      #[cfg(not(target_os = "linux"))]
-      let fwmark = None;
-      let state = std::sync::Arc::new(match fwmark {
-        Some(mark) => proxy::ProxyState::new(resolved, ca).with_fwmark(mark),
-        None => proxy::ProxyState::new(resolved, ca),
-      });
-      // Bind before capture side effects: a bad listen addr must fail
-      // before nft rules and routes touch the host.
-      let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-      if !listen_addr.ip().is_loopback() {
-        tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
-      }
-      tracing::info!(listen = %listen_addr, grants = grant_count, "serving");
-      #[cfg(target_os = "linux")]
-      if args.tproxy {
-        let tproxy_state = std::sync::Arc::clone(&state);
-        let mut tproxy_handle = tokio::spawn(async move { tproxy::run_tproxy(tproxy_state, args.tproxy_allow_root_netns).await });
-        // Fail closed: capture was explicitly requested, so a dead TPROXY
-        // leg ends the process instead of silently serving explicit-proxy
-        // only.
-        return tokio::select! {
-          result = proxy::serve(listener, state) => result,
-          tproxy_result = &mut tproxy_handle => match tproxy_result {
-            Ok(inner) => inner.map_err(|err| eyre::eyre!("TPROXY capture failed: {err:?}")),
-            Err(err) => Err(eyre::eyre!("TPROXY task failed: {err}")),
-          },
-          // Dropping the capture task runs its teardown guards; handlers
-          // live here at process level only, never inside the task.
-          _ = tokio::signal::ctrl_c() => {
-            tproxy_handle.abort();
-            Ok(())
-          }
-        };
-      }
-      proxy::serve(listener, state).await
+    Command::Serve(args) => serve(&cli, args).await,
+  }
+}
+
+/// `hodor serve`: bind the explicit listener, then run the selected capture
+/// backend alongside it.
+async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
+  #[cfg(not(target_os = "linux"))]
+  if args.proxy_backend != ProxyBackend::None {
+    eyre::bail!("transparent capture (--proxy-backend) is only supported on Linux");
+  }
+  #[cfg(not(feature = "tun"))]
+  if args.proxy_backend == ProxyBackend::Tun {
+    eyre::bail!("--proxy-backend tun needs a binary built with the `tun` feature; rebuild with --features tun");
+  }
+  let (mut config, workspace) = config::load(cli)?;
+  let registry = secrets::Registry::load(config::rules_dir().as_deref())?;
+  // fnox is needed when a rule has no inline value, and when a provider
+  // credential it may declare is missing from the environment.
+  let needs_fnox =
+    config.rules.values().any(|rule| rule.value.is_none()) || secrets::FNOX_ENV.iter().any(|name| std::env::var_os(name).is_none());
+  let fnox = if needs_fnox { secrets::FnoxSource::open()? } else { None };
+  if let Some(source) = &fnox {
+    for name in secrets::export_provider_env(source).await? {
+      tracing::debug!(name, "provider credential taken from fnox");
     }
   }
+  secrets::resolve(&mut config, &registry, fnox).await?;
+  let resolved = grants::resolve(&config)?;
+  if let Some(ws) = &workspace {
+    tracing::info!(
+      root = %ws.root().display(),
+      kind = ?ws.kind(),
+      ecosystems = %ws.ecosystem_label(),
+      "workspace"
+    );
+  } else {
+    tracing::debug!("no workspace root, global config only");
+  }
+  let ca = ca::load_or_generate(&ca_path(&resolved.proxy)?)?;
+  let listen_addr = resolved.proxy.listen;
+  let grant_count = resolved.grants.len();
+  #[cfg(target_os = "linux")]
+  let fwmark = match args.proxy_backend {
+    ProxyBackend::None => None,
+    ProxyBackend::Tproxy => Some(tproxy::EGRESS_MARK),
+    #[cfg(feature = "tun")]
+    ProxyBackend::Tun => Some(tun::FWMARK),
+    // Unreachable: `serve` bails on `tun` in a build without the feature.
+    #[cfg(not(feature = "tun"))]
+    ProxyBackend::Tun => None,
+  };
+  #[cfg(not(target_os = "linux"))]
+  let fwmark = None;
+  let state = std::sync::Arc::new(match fwmark {
+    Some(mark) => proxy::ProxyState::new(resolved, ca).with_fwmark(mark),
+    None => proxy::ProxyState::new(resolved, ca),
+  });
+  // Bind before capture side effects: a bad listen addr must fail
+  // before nft rules and routes touch the host.
+  let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+  if !listen_addr.ip().is_loopback() {
+    tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
+  }
+  tracing::info!(listen = %listen_addr, grants = grant_count, "serving");
+  #[cfg(all(feature = "tun", target_os = "linux"))]
+  if args.proxy_backend == ProxyBackend::Tun {
+    let tun_state = std::sync::Arc::clone(&state);
+    let mut tun_handle = tokio::spawn(async move { tun::run_tun(tun_state).await });
+    // Fail closed: capture was explicitly requested, so a dead TUN ends
+    // the process instead of silently serving explicit-proxy only.
+    return tokio::select! {
+      result = proxy::serve(listener, state) => result,
+      tun_result = &mut tun_handle => match tun_result {
+        Ok(inner) => inner.map_err(|err| eyre::eyre!("TUN capture failed: {err:?}")),
+        Err(err) => Err(eyre::eyre!("TUN task failed: {err}")),
+      },
+      // Dropping the capture task runs its teardown guard, which removes
+      // the policy routes; a leaked default route in the capture table
+      // blackholes all egress. Handlers live here at process level only,
+      // never inside the task.
+      _ = tokio::signal::ctrl_c() => {
+        tun_handle.abort();
+        Ok(())
+      }
+    };
+  }
+  #[cfg(target_os = "linux")]
+  if args.proxy_backend == ProxyBackend::Tproxy {
+    let tproxy_state = std::sync::Arc::clone(&state);
+    let mut tproxy_handle = tokio::spawn(async move { tproxy::run_tproxy(tproxy_state, args.tproxy_allow_root_netns).await });
+    // Fail closed: capture was explicitly requested, so a dead TPROXY
+    // leg ends the process instead of silently serving explicit-proxy
+    // only.
+    return tokio::select! {
+      result = proxy::serve(listener, state) => result,
+      tproxy_result = &mut tproxy_handle => match tproxy_result {
+        Ok(inner) => inner.map_err(|err| eyre::eyre!("TPROXY capture failed: {err:?}")),
+        Err(err) => Err(eyre::eyre!("TPROXY task failed: {err}")),
+      },
+      // Dropping the capture task runs its teardown guards; handlers
+      // live here at process level only, never inside the task.
+      _ = tokio::signal::ctrl_c() => {
+        tproxy_handle.abort();
+        Ok(())
+      }
+    };
+  }
+  proxy::serve(listener, state).await
 }

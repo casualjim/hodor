@@ -26,16 +26,18 @@ The grant list is the blast radius. `https://api.anthropic.com` means the real k
 | `*` as a grant host | Matches any destination. hodor warns at startup; the exposure is yours to accept. |
 | A non-loopback listen address | Anyone reaching the port triggers real-secret substitution. Warned at startup. |
 | CA key distribution | Whoever holds `ca.key` or `ca.pem` can mint leaf certificates and intercept granted traffic. Distribute `ca.crt` only. |
-| Compromised hodor process | It holds every real value and the CA. It runs with `CAP_NET_ADMIN` under TPROXY. Treat the hodor container as tier-zero; keep its mounts minimal. |
+| Compromised hodor process | It holds every real value and the CA. It runs as root with capture enabled, and with `CAP_NET_ADMIN` under TPROXY. Treat the hodor container as tier-zero; keep its mounts minimal. |
 | Workload trusts extra CAs | A workload with its own MITM proxy in front of hodor sees pre-substitution traffic only if it holds the real credential, which it does not; but it can still see decoy traffic and everything else in the namespace. |
 | QUIC to non-443 ports | Passes through unintercepted. Only `:443` QUIC is dropped. |
+
+With `--proxy-backend tun`, UDP is not a pass-through: DNS is relayed to the system resolver and other non-443 UDP flows are relayed to their original destination from inside hodor, so the workload's UDP leaves from hodor's sockets.
 
 ## Fail-closed defaults
 
 The design prefers refusal over degradation:
 
 - A fnox-declared key that cannot resolve fails startup, whatever `if_missing` says. Only an undeclared key honours `warn`/`ignore`.
-- A TPROXY leg that dies ends the process rather than silently serving explicit-proxy only.
+- A capture leg that dies ends the process rather than silently serving explicit-proxy only.
 - Malformed traffic closes the connection quietly; framing uncertainty degrades to opaque byte forwarding, never to skipping substitution.
 - Two rules sharing an env name, an empty value, a malformed grant or pattern: startup refuses.
 

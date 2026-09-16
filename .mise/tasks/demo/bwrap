@@ -4,7 +4,7 @@
 #MISE depends=["build:release"]
 #USAGE flag "--use-sudo" help="Skip the gum escalation prompt and go straight to sudo"
 
-proj_dir=$(git rev-parse --show-toplevel)
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
 
 set -euo pipefail

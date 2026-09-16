@@ -14,7 +14,7 @@ Pick by what you need right now. New here? Start with the tutorial.
 Directions for a working practitioner, one goal each:
 
 - [Confine a workspace](how-to/confine-a-workspace.md) — run a coding agent in a container that holds only decoys.
-- [Capture traffic transparently](how-to/capture-traffic-transparently.md) — TPROXY capture, no client proxy setting, no bypass.
+- [Capture traffic transparently](how-to/capture-traffic-transparently.md) — TPROXY or TUN capture, no client proxy setting, no bypass.
 - [Get values from fnox](how-to/get-values-from-fnox.md) — keep real secrets out of hodor's config entirely.
 - [Extend the known-host registry](how-to/extend-the-registry.md) — teach hodor a private endpoint or token shape.
 - [Trust the hodor CA](how-to/trust-the-ca.md) — make clients and containers accept the intercepting certificate.

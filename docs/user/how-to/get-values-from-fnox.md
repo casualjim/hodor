@@ -1,0 +1,73 @@
+# How to get values from fnox
+
+This guide shows you how to leave the real secret out of hodor's config entirely and resolve it from fnox at serve time. You need a rule with no inline `value`, and the secret declared somewhere fnox can find it.
+
+hodor embeds `fnox-core`, so no fnox binary or daemon is needed. fnox reaches age, 1Password, AWS Secrets Manager, Vault, Bitwarden, the OS keychain, and the rest of its provider catalog.
+
+## 1. Write a value-less rule
+
+```toml
+[rules.github_token]
+env = "GITHUB_TOKEN"
+if_missing = "warn"
+```
+
+That is the whole rule. The real value resolves from fnox under the key `GITHUB_TOKEN` at startup. Set `fnox_key` when the fnox name differs:
+
+```toml
+[rules.ci]
+env = "GITHUB_TOKEN"
+fnox_key = "work/ci/github"
+```
+
+An inline `value` always wins over fnox, which makes temporary overrides a one-line change.
+
+## 2. Declare the secret to fnox
+
+hodor reads fnox's own discovery chain, plus one level of its own. From least to most specific:
+
+1. fnox's global config, `$FNOX_CONFIG_DIR/config.toml` (or fnox's default global location).
+2. `<config-dir>/hodor/fnox.toml`, hodor's own middle level. Secrets that are global for hodor but not global for fnox live here.
+3. The upward `fnox.toml` walk from the working directory, per workspace.
+
+Each level follows fnox's profile convention: `fnox.local.toml` when no profile is active, `fnox.<profile>.toml` otherwise, so `$FNOX_PROFILE` picks the file standing in for the local slot.
+
+```toml
+# <config-dir>/hodor/fnox.toml
+[secrets.GITHUB_TOKEN]
+provider = "age"
+# ... provider-specific fields as fnox documents them
+```
+
+The declared key then flows to hodor: `hodor rules` lists it, and the rule that references it resolves.
+
+## 3. Control missing-value behaviour
+
+`if_missing` decides what a gap means:
+
+- `error` (default): startup fails.
+- `warn`: hodor serves without the rule's substitutions.
+- `ignore`: same as `warn`, without the log line.
+
+Two different gaps behave differently:
+
+- A key fnox does not declare at all follows `if_missing`. This is the normal "not every machine has every secret" case.
+- A key fnox declares but cannot resolve (provider unreachable, decryption failure) is always a startup error, whatever `if_missing` says. The secret exists; failing closed is correct.
+
+## 4. Container deployments
+
+The generated confine stack mounts `~/.config/fnox/age.txt` into the hodor container read-only, so an age-encrypted store works with no extra wiring. Other providers need their own credentials reachable inside the container; mount them the same way through the compose layers.
+
+## Check it works
+
+```sh
+hodor rules
+```
+
+lists every fnox-declared name the registry knows, and names the declarations no registry entry covers. Then start the proxy and watch the substitution log line:
+
+```text
+substituted label=github_token location=Header
+```
+
+The line carries the rule label and where the swap happened, never a value.

@@ -276,7 +276,12 @@ mod tests {
     assert!(!uri_match(allow, Scheme::Https, "example.com", 443));
     assert!(uri_match(allow, Scheme::Https, "a.example.com", 443));
     assert!(uri_match(allow, Scheme::Https, "A.EXAMPLE.COM", 443));
+    assert!(
+      uri_match(allow, Scheme::Https, "a.b.example.com", 443),
+      "matches at any depth, e.g. api.v3.aave.com"
+    );
     assert!(!uri_match(allow, Scheme::Https, "notexample.com", 443));
+    assert!(!uri_match(allow, Scheme::Https, "example.com.evil.com", 443));
   }
 
   #[test]

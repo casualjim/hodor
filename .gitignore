@@ -2,5 +2,3 @@
 .cache
 .data
 mise.local.toml
-examples/agentic-devenv/hodor.toml
-examples/agentic-devenv/certs/

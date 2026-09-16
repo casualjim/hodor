@@ -232,39 +232,71 @@ impl Registry {
   }
 }
 
-/// Opened fnox handle plus the names it declares.
+/// Merged fnox config plus the profiles and names it declares.
 #[derive(Clone, Debug)]
 pub(crate) struct FnoxSource {
-  fnox: fnox_core::Fnox,
+  config: fnox_core::config::Config,
+  profiles: Vec<String>,
   declared: BTreeSet<String>,
 }
 
 /// Map a discovery failure with no config found to `None`; other errors stay.
-fn discovered_or_none(found: fnox_core::Result<fnox_core::Fnox>) -> eyre::Result<Option<fnox_core::Fnox>> {
+fn discovered_or_none(found: fnox_core::Result<fnox_core::config::Config>) -> eyre::Result<Option<fnox_core::config::Config>> {
   match found {
-    Ok(fnox) => Ok(Some(fnox)),
+    Ok(config) => Ok(Some(config)),
     Err(fnox_core::FnoxError::ConfigNotFound { .. }) => Ok(None),
     Err(err) => Err(err).wrap_err("fnox discovery failed"),
   }
 }
 
+/// The profile stack the chain loaded with, expanded through inheritance the
+/// way `load_with_recursion` does, so lookup sees the same stack.
+fn active_profiles(config: &fnox_core::config::Config) -> eyre::Result<Vec<String>> {
+  config
+    .resolve_profiles(&fnox_core::config::Config::get_profiles(&[]))
+    .wrap_err("fnox profiles")
+}
+
+/// Names a config declares under the active profiles.
+fn declared_names(config: &fnox_core::config::Config, profiles: &[String]) -> eyre::Result<BTreeSet<String>> {
+  // Same setting value() reads through get_secret, so the declared set and the
+  // resolved value cannot disagree about whether top-level secrets count.
+  let no_defaults = fnox_core::settings::Settings::get().no_defaults;
+  Ok(
+    config
+      .get_secrets_with_no_defaults(profiles, no_defaults)
+      .wrap_err("fnox: cannot list secrets")?
+      .into_keys()
+      .collect(),
+  )
+}
+
 impl FnoxSource {
-  /// Open fnox via its own discovery, or `None` when no config exists.
+  /// Open the discovered chain, or `None` when no config exists.
   pub(crate) fn open() -> eyre::Result<Option<Self>> {
-    let fnox = discovered_or_none(fnox_core::Fnox::discover())?;
-    let Some(fnox) = fnox else {
+    let Some(config) = discovered_or_none(crate::fnox_layers::discover())? else {
       return Ok(None);
     };
-    let declared = fnox.list().wrap_err("fnox: cannot list secrets")?.into_iter().collect();
-    Ok(Some(Self { fnox, declared }))
+    let profiles = active_profiles(&config)?;
+    let declared = declared_names(&config, &profiles)?;
+    Ok(Some(Self {
+      config,
+      profiles,
+      declared,
+    }))
   }
 
-  /// Open fnox at an explicit config path; test injection point.
+  /// Open one explicit config file; test injection point.
   #[cfg(test)]
   fn open_at(path: &Path) -> eyre::Result<Self> {
-    let fnox = fnox_core::Fnox::open(path).wrap_err_with(|| format!("fnox config {}", path.display()))?;
-    let declared = fnox.list().wrap_err("fnox: cannot list secrets")?.into_iter().collect();
-    Ok(Self { fnox, declared })
+    let config = crate::fnox_layers::load(path).wrap_err_with(|| format!("fnox config {}", path.display()))?;
+    let profiles = active_profiles(&config)?;
+    let declared = declared_names(&config, &profiles)?;
+    Ok(Self {
+      config,
+      profiles,
+      declared,
+    })
   }
 
   /// Names fnox declares, sorted.
@@ -278,12 +310,120 @@ impl FnoxSource {
     if !self.declared.contains(key) {
       return Ok(None);
     }
-    let Some(value) = self.fnox.get(key).await.wrap_err_with(|| format!("fnox secret `{key}`"))? else {
+    let Some(secret) = self
+      .config
+      .get_secret(&self.profiles, key)
+      .wrap_err_with(|| format!("fnox secret `{key}`"))?
+    else {
+      eyre::bail!("fnox key `{key}` is declared but resolves to no value");
+    };
+    let resolved = fnox_core::secret_resolver::resolve_secret(&self.config, &self.profiles, key, secret)
+      .await
+      .wrap_err_with(|| format!("fnox secret `{key}`"))?;
+    let Some(value) = resolved else {
       eyre::bail!("fnox key `{key}` is declared but resolves to no value");
     };
     eyre::ensure!(!value.is_empty(), "fnox key `{key}` is declared but resolves to an empty value");
     Ok(Some(value))
   }
+}
+
+/// Environment variables fnox itself reads: its own configuration, and the
+/// credentials every provider it can talk to looks for. Hodor forwards the ones
+/// the shell already has into the proxy container, and resolves the ones fnox
+/// declares but the environment lacks, which is what makes a provider token
+/// stored in fnox usable — the same job `fnox exec` does.
+///
+/// source: fnox-core 1.35 `src/env.rs`, `src/providers/*`, `src/lease_backends/*`
+pub(crate) const FNOX_ENV: &[&str] = &[
+  // fnox itself
+  "FNOX_CONFIG_DIR",
+  "FNOX_STATE_DIR",
+  "FNOX_PROFILE",
+  "FNOX_AGE_KEY",
+  // Bitwarden Secrets Manager, Bitwarden CLI
+  "BWS_ACCESS_TOKEN",
+  "FNOX_BWS_ACCESS_TOKEN",
+  "BWS_PROJECT_ID",
+  "BW_SESSION",
+  "FNOX_BW_SESSION",
+  // 1Password
+  "OP_SERVICE_ACCOUNT_TOKEN",
+  "FNOX_OP_SERVICE_ACCOUNT_TOKEN",
+  // HashiCorp Vault
+  "VAULT_TOKEN",
+  "VAULT_ADDR",
+  "VAULT_NAMESPACE",
+  "FNOX_VAULT_TOKEN",
+  "FNOX_VAULT_ADDR",
+  "FNOX_VAULT_NAMESPACE",
+  // AWS Secrets Manager and SSO leases
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_PROFILE",
+  "AWS_SSO_SESSION",
+  // Azure Key Vault
+  "AZURE_TENANT_ID",
+  "AZURE_CLIENT_ID",
+  "AZURE_CLIENT_SECRET",
+  // Google Cloud
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GCP_SERVICE_ACCOUNT_KEY",
+  // Infisical, Doppler, Cloudflare, GitHub App leases
+  "INFISICAL_TOKEN",
+  "INFISICAL_CLIENT_ID",
+  "INFISICAL_CLIENT_SECRET",
+  "INFISICAL_API_URL",
+  "FNOX_INFISICAL_TOKEN",
+  "FNOX_INFISICAL_CLIENT_ID",
+  "FNOX_INFISICAL_CLIENT_SECRET",
+  "FNOX_INFISICAL_API_URL",
+  "DOPPLER_TOKEN",
+  "FNOX_DOPPLER_TOKEN",
+  "CLOUDFLARE_API_TOKEN",
+  "CF_API_TOKEN",
+  "FNOX_GITHUB_APP_PRIVATE_KEY",
+  // Keeper, KeePass, Passwordstate, Proton Pass, pass, KMS
+  "KSM_TOKEN",
+  "KSM_CONFIG",
+  "KEEPASS_PASSWORD",
+  "FNOX_KEEPASS_PASSWORD",
+  "FNOX_KEEPER_TOKEN",
+  "FNOX_KEEPER_CONFIG",
+  "PASSWORDSTATE_API_KEY",
+  "FNOX_PASSWORDSTATE_API_KEY",
+  "PROTON_PASS_PERSONAL_ACCESS_TOKEN",
+  "FNOX_PROTON_PASS_PERSONAL_ACCESS_TOKEN",
+  "PASSWORD_STORE_DIR",
+  "FNOX_PASSWORD_STORE_DIR",
+  "PASSWORD_STORE_GPG_OPTS",
+  "FNOX_PASSWORD_STORE_GPG_OPTS",
+];
+
+/// Export provider credentials fnox declares but the environment lacks, so a
+/// provider whose own token lives in fnox can still resolve the secrets that
+/// need it. Only missing names are touched, so the shell always wins; a name
+/// that resolves to nothing warns instead of failing startup, because the rule
+/// needing that provider reports the real error a moment later.
+pub(crate) async fn export_provider_env(fnox: &FnoxSource) -> eyre::Result<Vec<String>> {
+  let mut exported = Vec::new();
+  for name in FNOX_ENV {
+    if std::env::var_os(name).is_some() || !fnox.declared().contains(*name) {
+      continue;
+    }
+    match fnox.value(name).await {
+      Ok(Some(value)) => {
+        // fnox-core's own write path, which serializes with the rest of fnox's
+        // environment access; this runs once at startup, before any task reads
+        // the environment.
+        fnox_core::env::set_var(name, value);
+        exported.push((*name).to_string());
+      }
+      Ok(None) => {}
+      Err(err) => tracing::warn!(name, "provider credential declared in fnox did not resolve: {err}"),
+    }
+  }
+  Ok(exported)
 }
 
 /// Env names fnox declares that the registry knows, sorted; `None` yields none.
@@ -740,6 +880,7 @@ hosts = ["https://api.example/path"]
       },
       workspace: crate::config::WorkspaceCfg::default(),
       rules: BTreeMap::new(),
+      agents: BTreeMap::new(),
     };
     config.rules.insert(label.to_string(), rule);
     config
@@ -855,10 +996,45 @@ value = "other-real-token"
     config_with(label, rule)
   }
 
+  /// Test-only env removal, so the unsafe call lives in one place.
+  fn unset_env(key: &str) {
+    // SAFETY: test-only mutation, and nextest runs one test per process.
+    unsafe { std::env::remove_var(key) };
+  }
+
   fn write_fnox(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("fnox.toml");
     std::fs::write(&path, body).unwrap();
     path
+  }
+
+  #[tokio::test]
+  async fn provider_credentials_declared_in_fnox_reach_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fnox(
+      dir.path(),
+      r#"
+[providers.plain]
+type = "plain"
+
+[secrets.BWS_ACCESS_TOKEN]
+provider = "plain"
+value = "bws-from-fnox"
+"#,
+    );
+    let key = "BWS_ACCESS_TOKEN";
+    unset_env(key);
+
+    let fnox = FnoxSource::open_at(&path).unwrap();
+    assert_eq!(export_provider_env(&fnox).await.unwrap(), vec![key.to_string()]);
+    assert_eq!(std::env::var(key).unwrap(), "bws-from-fnox");
+
+    // The shell wins, and nothing is exported twice.
+    assert!(export_provider_env(&fnox).await.unwrap().is_empty());
+    // A name fnox does not declare is never touched.
+    assert!(std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_none());
+
+    unset_env(key);
   }
 
   #[tokio::test]

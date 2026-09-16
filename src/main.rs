@@ -8,6 +8,7 @@
 mod ca;
 mod compose;
 mod config;
+mod fnox_layers;
 mod grants;
 mod proxy;
 mod secrets;
@@ -69,8 +70,9 @@ pub struct ConfineArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConfineAction {
   /// Generate the workspace stack into
-  /// `<state-dir>/hodor/ws/<slug>/stack.yml` if absent; existing files are
-  /// left untouched so edits survive.
+  /// `<state-dir>/hodor/ws/<slug>/compose.yml` if absent, and write the CA and
+  /// agent entrypoint the stack mounts when they are missing; existing files
+  /// are left untouched so edits survive.
   Init,
   /// Start the layered compose project from the files on disk.
   Up,
@@ -165,8 +167,16 @@ async fn main() -> eyre::Result<()> {
       }
       let (mut config, workspace) = config::load(&cli)?;
       let registry = secrets::Registry::load(config::rules_dir().as_deref())?;
-      let needs_fnox = config.rules.values().any(|rule| rule.value.is_none());
+      // fnox is needed when a rule has no inline value, and when a provider
+      // credential it may declare is missing from the environment.
+      let needs_fnox =
+        config.rules.values().any(|rule| rule.value.is_none()) || secrets::FNOX_ENV.iter().any(|name| std::env::var_os(name).is_none());
       let fnox = if needs_fnox { secrets::FnoxSource::open()? } else { None };
+      if let Some(source) = &fnox {
+        for name in secrets::export_provider_env(source).await? {
+          tracing::debug!(name, "provider credential taken from fnox");
+        }
+      }
       secrets::resolve(&mut config, &registry, fnox).await?;
       let resolved = grants::resolve(&config)?;
       if let Some(ws) = &workspace {

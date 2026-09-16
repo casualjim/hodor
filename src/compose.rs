@@ -350,7 +350,16 @@ pub(crate) fn compose_yaml(
     out,
     "\n\
      \x20 agent:\n\
-     \x20   image: ${{AGENT_IMAGE:-ghcr.io/casualjim/devenv:omp}}\n\
+     \x20   image: ${{AGENT_IMAGE:-ghcr.io/casualjim/devagent:26.04}}\n\
+     \x20   # The agent runs containers of its own, which is what the widened\n\
+     \x20   # privileges are for: inner containers mount, chroot and raise their\n\
+     \x20   # own networking, so seccomp/systempaths/apparmor are unconfined and\n\
+     \x20   # SYS_ADMIN is granted. apparmor=unconfined is what Ubuntu's default\n\
+     \x20   # profile requires and is inert where AppArmor is not loaded.\n\
+     \x20   # systempaths=unconfined is podman-only: drop it under docker.\n\
+     \x20   security_opt: [seccomp=unconfined, systempaths=unconfined, apparmor=unconfined]\n\
+     \x20   cap_add: [SYS_CHROOT, AUDIT_WRITE, NET_ADMIN, SETUID, SETGID, SYS_ADMIN]\n\
+     \x20   devices: [/dev/net/tun]\n\
      \x20   # docker-init (tini) as pid 1: signal handling and child reaping\n\
      \x20   # for the long-running shells this container hosts\n\
      \x20   init: true\n\
@@ -379,6 +388,11 @@ pub(crate) fn compose_yaml(
     out,
     "      - ${{HODOR_ENTRYPOINT:-~/.config/hodor/proxy-entrypoint.sh}}:{home}/.config/hodor/proxy-entrypoint.sh:ro\n\
      \x20     - ${{HODOR_CA_CRT:-~/.config/hodor/ca.crt}}:/usr/local/share/ca-certificates/hodor-ca.crt:ro\n\
+     \x20     # Inner container storage. Made at generation time, owned by the\n\
+     \x20     # user that runs the agent: a bind source the runtime creates itself\n\
+     \x20     # is root-owned, and podman inside then dies without a word. A named\n\
+     \x20     # volume needs the same ownership once, by hand.\n\
+     \x20     - ${{HODOR_AGENT_STORAGE:-~/.config/hodor/agent-containers}}:{home}/.local/share/containers\n\
      \x20   network_mode: \"service:hodor\"\n"
   );
   out
@@ -631,6 +645,14 @@ fn ensure_support_files(dir: &Path) -> eyre::Result<Vec<(PathBuf, bool)>> {
     Err(err) => println!("warning: could not prepare {}: {err}", dir.join("ca.pem").display()),
   }
   files.push((entrypoint.clone(), write_entrypoint(&entrypoint)?));
+  // The agent's inner container storage — see the generated compose file for
+  // why this directory has to exist before the stack starts.
+  let storage = dir.join("agent-containers");
+  let storage_created = !storage.exists();
+  match std::fs::create_dir_all(&storage) {
+    Ok(()) => files.push((storage, storage_created)),
+    Err(err) => println!("warning: could not prepare {}: {err}", storage.display()),
+  }
   Ok(files)
 }
 
@@ -972,6 +994,30 @@ mod tests {
   }
 
   #[test]
+  fn the_agent_service_carries_what_inner_containers_need() {
+    let yaml = compose_yaml(
+      &decoys(),
+      "hodor",
+      Path::new("/home/eng"),
+      "/home/eng",
+      &[],
+      &[],
+      &FnoxBinds::default(),
+    );
+    for expected in [
+      "image: ${AGENT_IMAGE:-ghcr.io/casualjim/devagent:26.04}",
+      "security_opt: [seccomp=unconfined, systempaths=unconfined, apparmor=unconfined]",
+      "cap_add: [SYS_CHROOT, AUDIT_WRITE, NET_ADMIN, SETUID, SETGID, SYS_ADMIN]",
+      "devices: [/dev/net/tun]",
+      "- ${HODOR_AGENT_STORAGE:-~/.config/hodor/agent-containers}:/home/eng/.local/share/containers",
+    ] {
+      assert!(yaml.contains(expected), "missing {expected}:\n{yaml}");
+    }
+    // The agent runs its own runtime; it never reaches the host's.
+    assert!(!yaml.contains("docker.sock") && !yaml.contains("/var/run/docker"), "{yaml}");
+  }
+
+  #[test]
   fn compose_yaml_mounts_the_workspace_at_its_translated_path() {
     let mounts = vec![
       mount("/home/ivan/github/hodor", "/home/eng/github/hodor", false),
@@ -1112,6 +1158,7 @@ mod tests {
     let crt = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
     let key = std::fs::read_to_string(dir.path().join("ca.key")).unwrap();
     assert!(dir.path().join("proxy-entrypoint.sh").is_file());
+    assert!(dir.path().join("agent-containers").is_dir());
     // `ca.pem` is what hodor reads; `ca.crt` is the certificate alone, which is
     // what the agent gets. A clean system needs both.
     assert!(

@@ -1,3 +1,15 @@
+## [0.1.15] - 2026-09-16
+
+### 🚀 Features
+
+- Workspace-scoped fnox decoy credential injection
+- Cover crypto infra APIs, fix dead hosts
+- *(confine)* Make init produce a runnable stack
+- *(confine)* Wire the agent container runtime
+
+### 📚 Documentation
+
+- Add user docs, rewrite README
 ## [0.1.14] - 2026-09-14
 
 ### 🚀 Features
@@ -7,6 +19,11 @@
 ### 🐛 Bug Fixes
 
 - Recover bwrap demo, docs, and image base lost in rebase
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.14 [ci skip]
+- Release hodor version 0.1.14
 ## [0.1.13] - 2026-09-13
 
 ### 🚀 Features

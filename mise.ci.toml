@@ -7,10 +7,21 @@
 # Nothing here should add a tool: a tool that exists only in CI is a tool the
 # gate never exercised locally. This file changes how the environment is
 # *presented*, not what it contains.
+#
+# Paths are absolute on purpose: `mise.toml` expresses them relative to
+# `{{config_root}}`, and the toolchain sandbox below only works when the paths
+# resolve on the runner as written. This is the one place the checkout path is
+# known, so it is spelled out here.
 
 [settings]
+rust.cargo_home = "/home/runner/work/hodor/hodor/.cache/native/cargo"
+rust.rustup_home = "/home/runner/work/hodor/hodor/.cache/native/rustup"
 # `replacing` (the default) draws a progress spinner and rewrites finished task
 # output in place. Through a CI log that collapses the run into one line per
 # task, which is exactly where you need the failure. Full output per task, all
 # of it, no spinner.
 task.output = "prefix"
+
+[env]
+CARGO_HOME = "/home/runner/work/hodor/hodor/.cache/native/cargo"
+RUSTUP_HOME = "/home/runner/work/hodor/hodor/.cache/native/rustup"

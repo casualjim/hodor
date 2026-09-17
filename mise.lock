@@ -417,6 +417,36 @@ checksum = "sha256:32975d1493ee1a975d6bb41e4fb56fe419cb442ded628bb772ba2e614acfa
 url = "https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/lycheeverse/lychee/releases/assets/409959491"
 
+[[tools.mold]]
+version = "2.42.1"
+backend = "aqua:rui314/mold"
+specifiers = ["latest"]
+
+[tools.mold."platforms.linux-arm64"]
+checksum = "sha256:16b025652d3d7456689e6025a77e1903bb2a15e7630877c26cc133f5df95b9c6"
+url = "https://github.com/rui314/mold/releases/download/v2.42.1/mold-2.42.1-aarch64-linux.tar.gz"
+url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557035958"
+
+[tools.mold."platforms.linux-arm64-musl"]
+checksum = "sha256:16b025652d3d7456689e6025a77e1903bb2a15e7630877c26cc133f5df95b9c6"
+url = "https://github.com/rui314/mold/releases/download/v2.42.1/mold-2.42.1-aarch64-linux.tar.gz"
+url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557035958"
+
+[tools.mold."platforms.linux-x64"]
+checksum = "sha256:6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855"
+url = "https://github.com/rui314/mold/releases/download/v2.42.1/mold-2.42.1-x86_64-linux.tar.gz"
+url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557036001"
+
+[tools.mold."platforms.linux-x64-musl"]
+checksum = "sha256:6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855"
+url = "https://github.com/rui314/mold/releases/download/v2.42.1/mold-2.42.1-x86_64-linux.tar.gz"
+url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557036001"
+
+[tools.mold."platforms.windows-x64"]
+checksum = "sha256:ce38c5d5d6a5169e05883d598592b367976a9575abfafcdc49889fcc788b51c0"
+url = "https://github.com/rui314/mold/releases/download/v2.42.1/mold-2.42.1-x86_64-windows.zip"
+url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557036000"
+
 [[tools.node]]
 version = "24.21.0"
 backend = "core:node"

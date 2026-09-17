@@ -34,6 +34,15 @@ jobs:
           install: true
           cache: true
 
+      - name: Install clang matching rustc's LLVM major
+        run: |-
+          set -euxo pipefail
+          llvm_major="$(rustc -Vv | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
+          curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- "$llvm_major"
+          sudo apt-get install -y --no-install-recommends "clang-${llvm_major}"
+          sudo update-alternatives --install /usr/bin/clang clang "/usr/bin/clang-${llvm_major}" 100
+          test "$(clang -dumpversion | cut -d. -f1)" = "$llvm_major"
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -47,22 +56,4 @@ jobs:
       - name: Buld & Test
         run: mise build
 
-      - uses: docker/setup-buildx-action@v4
 
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          build-args: BIN_DIR=target/release
-          platforms: linux/amd64
-          pull: true
-          push: true
-          tags: ghcr.io/${{ github.repository }}:main

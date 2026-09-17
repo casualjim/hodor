@@ -23,6 +23,7 @@ lychee = "latest"
 node = "lts"
 cmake = "latest"
 cargo-dist = "latest"
+mold = "latest"
 
 [[tools.rust]]
 version = "stable"

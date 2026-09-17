@@ -26,6 +26,18 @@
     install: true
     cache: true
 
+# The linker is `clang` (`.cargo/config.toml`) and must match the LLVM major
+# of the mise-installed rustc, same as ci.yml does.
+- name: Install clang matching rustc's LLVM major
+  if: ${{ runner.os == 'Linux' }}
+  run: |-
+    set -euxo pipefail
+    llvm_major="$(rustc -Vv | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
+    curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- "$llvm_major"
+    sudo apt-get install -y --no-install-recommends "clang-${llvm_major}"
+    sudo update-alternatives --install /usr/bin/clang clang "/usr/bin/clang-${llvm_major}" 100
+    test "$(clang -dumpversion | cut -d. -f1)" = "$llvm_major"
+
 # Keyed by target: the matrix builds amd64 and arm64 on different runners, and
 # a shared key would let one architecture's cached artifacts satisfy the other.
 # `matrix.targets` is an array here, unlike the scalar `matrix.target` in ci.yml.

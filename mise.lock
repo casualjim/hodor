@@ -491,6 +491,14 @@ url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-windows-amd64.e
 url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426668"
 
 [[tools.rust]]
+version = "nightly-2026-09-17"
+backend = "core:rust"
+specifiers = ["nightly"]
+
+[tools.rust.options]
+components = "llvm-tools,rustfmt"
+
+[[tools.rust]]
 version = "stable"
 backend = "core:rust"
 specifiers = ["stable"]
@@ -498,6 +506,7 @@ specifiers = ["stable"]
 [tools.rust.options]
 components = "llvm-tools,rust-analyzer"
 profile = "default"
+targets = "aarch64-apple-darwin,wasm32-unknown-unknown,wasm32-wasip2"
 
 [[tools.shellcheck]]
 version = "0.11.0"

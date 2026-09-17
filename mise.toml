@@ -17,7 +17,6 @@ hadolint = "latest"
 shellcheck = "latest"
 "cargo:cargo-sort" = "latest"
 "aqua:tamasfe/taplo" = "latest"
-rust = { version = "stable", profile = "default", components = "llvm-tools,rust-analyzer" }
 "github:casualjim/remark" = "latest"
 gum = "latest"
 lychee = "latest"
@@ -25,7 +24,18 @@ node = "lts"
 cmake = "latest"
 cargo-dist = "latest"
 
+[[tools.rust]]
+version = "stable"
+profile = "default"
+components = "llvm-tools,rust-analyzer"
+targets = "aarch64-apple-darwin,wasm32-unknown-unknown,wasm32-wasip2"
+
+[[tools.rust]]
+version = "nightly"
+components = "llvm-tools,rustfmt,rust-src"
+
 [env]
 CARGO_TERM_COLOR = "always"
 CARGO_HOME = "{{config_root}}/.cache/native/cargo"
 RUSTUP_HOME = "{{config_root}}/.cache/native/rustup"
+RUSTUP_TOOLCHAIN = "stable"

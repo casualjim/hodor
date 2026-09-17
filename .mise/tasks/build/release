@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #MISE description="Build the application (Release)"
-#MISE sources=["Cargo.toml", "crates/**/*.rs"]
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**"]
 #MISE outputs=["target/release/hodor"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)

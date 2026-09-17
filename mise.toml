@@ -10,11 +10,7 @@ rust.rustup_home = ".cache/native/rustup"
 
 [tools]
 "aqua:nextest-rs/nextest/cargo-nextest" = "latest"
-# Links the `bpfel-unknown-none` object that `aya-build` compiles from
-# `crates/hodor-ebpf-programs`. Pinned because a linker change can alter the
-# emitted BPF object. Only consulted when `hodor-ebpf` is built, and that is
-# excluded from host-wide commands on non-Linux targets.
-"github:aya-rs/bpf-linker" = "0.11.1"
+"github:aya-rs/bpf-linker" = "latest"
 hk = "latest"
 pkl = "latest"
 hadolint = "latest"
@@ -25,6 +21,8 @@ rust = { version = "stable", profile = "default", components = "llvm-tools,rust-
 gum = "latest"
 lychee = "latest"
 node = "lts"
+cmake = "latest"
+cargo-dist = "latest"
 
 [env]
 CARGO_TERM_COLOR = "always"

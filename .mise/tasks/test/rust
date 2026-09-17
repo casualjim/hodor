@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #MISE description="Run the Rust tests for this project"
-#MISE sources=["Cargo.toml", "src/**/*.rs", "crates/**/*.rs", "rules/**/*.toml"]
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", ".mise/tasks/test/**"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #MISE description="Run the live TPROXY tests (build as user, execute as root)"
-#MISE sources=["Cargo.toml", "crates/**/*.rs"]
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", ".mise/tasks/test/**"]
 #USAGE flag "--use-sudo" help="Skip the gum escalation prompt and go straight to sudo"
 #USAGE arg "[filters]" var=#true help="Test-name filters; default: tproxy_live_"
 

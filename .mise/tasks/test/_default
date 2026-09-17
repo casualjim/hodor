@@ -3,7 +3,7 @@
 set -euo pipefail
 
 #MISE description="Run the full project test suite"
-#MISE sources=["Cargo.toml", "crates/**/*.rs", "rules/**/*.toml", ".mise/tasks/test/**"]
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", ".mise/tasks/test/**"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1

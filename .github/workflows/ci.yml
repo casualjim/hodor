@@ -5,81 +5,47 @@ on:
   push:
     branches: [main, master]
 
+# mise reads `mise.<env>.toml` alongside `mise.toml`, so this is what selects
+# mise.ci.toml. Workflow-level so mise-action's `mise install --locked` and
+# every `run:` step see the same environment.
+env:
+  MISE_ENV: ci
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd
+
+      - uses: jdx/mise-action@v4
         with:
-          components: rustfmt, clippy
+          experimental: true
+          install: true
+          cache: true
 
-      # `hodor-ebpf-programs` compiles for the `bpf` target, which the stable
-      # toolchain cannot build: it needs nightly with `-Z build-std` and the
-      # `bpf-linker` linker.
-      - uses: dtolnay/rust-toolchain@nightly
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Lint
+        run: |-
+          hk validate
+          hk check --all
 
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev zstd
-
-      - name: Install bpf-linker
-        run: |
-          url=https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst
-          curl --proto '=https' --tlsv1.2 -sSfL "$url" -o /tmp/bpf-linker.tar.zst
-          tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
-          sudo install -m 0755 /tmp/bpf-linker /usr/local/bin/bpf-linker
-
-      - name: Install nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      # `--exclude hodor-ebpf-programs`: the BPF program crate is a workspace
-      # member only so `aya-build` can resolve it, and it does not build for the
-      # host. `aya-build` compiles it as part of `hodor-ebpf`, so it is covered.
-      - name: Clippy
-        run: |
-          cargo clippy --workspace --exclude hodor-ebpf-programs --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo nextest run --workspace --exclude hodor-ebpf-programs
-
-  image:
-    # Publishes ghcr.io/<repo>:main so the example can pull an image instead of
-    # building one. Releases publish :<version> and :latest from container.yml,
-    # for both architectures. This one is amd64 only.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: rust
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # The BPF programs need nightly + the BPF linker, same as the rust job.
-      - uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev zstd
-
-      - name: Install bpf-linker
-        run: |
-          url=https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst
-          curl --proto '=https' --tlsv1.2 -sSfL "$url" -o /tmp/bpf-linker.tar.zst
-          tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
-          sudo install -m 0755 /tmp/bpf-linker /usr/local/bin/bpf-linker
-
-      - name: Build the release binary
-        run: cargo build --release
+      - name: Buld & Test
+        run: mise build
 
       - uses: docker/setup-buildx-action@v4
 

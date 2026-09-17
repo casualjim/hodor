@@ -496,7 +496,7 @@ backend = "core:rust"
 specifiers = ["nightly"]
 
 [tools.rust.options]
-components = "llvm-tools,rustfmt"
+components = "llvm-tools,rust-src,rustfmt"
 
 [[tools.rust]]
 version = "stable"

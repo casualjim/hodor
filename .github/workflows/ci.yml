@@ -34,9 +34,6 @@ jobs:
           install: true
           cache: true
 
-      - name: install nightly rust toolchain
-        run: rustup toolchain install nightly-${{matrix.target}}
-
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:

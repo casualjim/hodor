@@ -16,6 +16,7 @@ pkl = "latest"
 hadolint = "latest"
 shellcheck = "latest"
 "cargo:cargo-sort" = "latest"
+"aqua:tamasfe/taplo" = "latest"
 rust = { version = "stable", profile = "default", components = "llvm-tools,rust-analyzer" }
 "github:casualjim/remark" = "latest"
 gum = "latest"

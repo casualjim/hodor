@@ -14,7 +14,7 @@
 #   passed through as literal text — keep them GitHub-only, no jinja syntax.
 - name: Install system deps
   if: ${{ runner.os == 'Linux' }}
-  run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd
+  run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold
 
 # The linker is `clang` (`.cargo/config.toml`) and must match the LLVM major
 # of the mise-installed rustc, same as ci.yml does.

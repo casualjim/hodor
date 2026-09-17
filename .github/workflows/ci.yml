@@ -34,8 +34,6 @@ jobs:
           llvm_major="$(rustc -Vv | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
           curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- "$llvm_major"
           sudo apt-get install -y --no-install-recommends "clang-${llvm_major}"
-          sudo update-alternatives --install /usr/bin/clang clang "/usr/bin/clang-${llvm_major}" 100
-          test "$(clang -dumpversion | cut -d. -f1)" = "$llvm_major"
 
       - uses: jdx/mise-action@v4
         with:

@@ -32,6 +32,8 @@ The grant list is the blast radius. `https://api.anthropic.com` means the real k
 
 With `--proxy-backend tun`, UDP is not a pass-through: DNS is relayed to the system resolver and other non-443 UDP flows are relayed to their original destination from inside hodor, so the workload's UDP leaves from hodor's sockets.
 
+With `--proxy-backend ebpf`, connected UDP is relayed unchanged (no substitution), and unconnected `sendto` traffic such as typical DNS is not captured at all. Capture is scoped by cgroup membership rather than by network namespace, so a process that escapes the cgroup leaves the capture; hodor must be run outside that cgroup, which the PID check enforces a second time. The capability set is `CAP_BPF` + `CAP_NET_ADMIN` rather than the wider privileges `tun` needs.
+
 ## Fail-closed defaults
 
 The design prefers refusal over degradation:

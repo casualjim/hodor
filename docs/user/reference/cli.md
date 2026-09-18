@@ -16,21 +16,25 @@ Serve the proxy.
 | --- | --- | --- |
 | `--listen <ADDR>` | `HODOR_LISTEN` | Explicit-proxy listen address. Default `127.0.0.1:8080`. |
 | `--ca-file <PATH>` | `HODOR_CA_FILE` | CA PEM path (certificate followed by key). Default `<config-dir>/hodor/ca.pem`. |
-| `--proxy-backend <BACKEND>` | `HODOR_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only), `tun`, or `tproxy`. Linux only; `tun` also needs a binary built with the `tun` feature. |
+| `--proxy-backend <BACKEND>` | `HODOR_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only), `tun`, `tproxy`, or `ebpf`. Linux only; every backend is compiled in, so no build flags are needed. |
 | `--tproxy-allow-root-netns` | `HODOR_TPROXY_ALLOW_ROOT_NETNS` | With `--proxy-backend tproxy`, allow unscoped capture rules in the host network namespace. Disposable machines only. |
+| `--ebpf-cgroup <PATH>` | `HODOR_EBPF_CGROUP` | With `--proxy-backend ebpf`, the cgroup v2 directory whose member processes get captured. Required for that backend; hodor itself must live outside it. |
 
-`--proxy-backend` and `--tproxy-allow-root-netns` are CLI and environment only, deliberately absent from config files: capture mutates host routes and nft rules, so enabling it is an explicit act, not ambient configuration.
+`--proxy-backend`, `--tproxy-allow-root-netns`, and `--ebpf-cgroup` are CLI and environment only, deliberately absent from config files: capture mutates host routes, nft rules, and kernel programs, so enabling it is an explicit act, not ambient configuration.
 
 What each backend does:
 
 | Backend | Mechanism | UDP |
 | --- | --- | --- |
 | `tproxy` | nftables rules and policy routes hand TCP to an `IP_TRANSPARENT` listener. Needs `CAP_NET_ADMIN`. | Passes through untouched, except QUIC on `:443`, which is dropped so HTTP/3 clients fall back to TCP. |
-| `tun` | A TUN device plus an in-process TCP/IP stack. Needs root and the `tun` feature. | Relayed inside hodor: DNS to the system resolver, QUIC dropped, other flows to their original destination. |
+| `tun` | A TUN device plus an in-process TCP/IP stack. Needs root. | Relayed inside hodor: DNS to the system resolver, QUIC dropped, other flows to their original destination. |
+| `ebpf` | cgroup v2 socket hooks (`connect4`, `recvmsg4`, and an egress hook) rewrite destinations to hodor's loopback listeners. No netfilter, no policy routes, no `IP_TRANSPARENT`. Needs `CAP_BPF` + `CAP_NET_ADMIN`, and a cgroup holding the workload with hodor outside it. | Connected UDP only (what a `connect()`ed socket sends) is relayed unchanged. Unconnected `sendto` traffic such as typical DNS is never captured. |
 
-Both backends are peers: same interception contract (a captured connection's destination is its identity), different mechanism. `tun` is the one to reach for when you need the UDP path handled; `tproxy` is the one to reach for when you want the kernel to terminate TCP.
+All three are peers: same interception contract (a captured connection's destination is its identity), different mechanism. `tun` is the one to reach for when you need the UDP path handled; `tproxy` when you want the kernel to terminate TCP with nftables you can inspect; `ebpf` when you want no netfilter rules on the host and are scoping capture by cgroup rather than by network namespace. The eBPF backend's attach handles are owned by the process, so exit detaches the programs and leaves no host state behind.
 
-The listener binds before any capture side effect, so a bad listen address fails before routes or nft rules touch the host. A failed capture leg ends the process rather than silently serving explicit-proxy only.
+Kernel floor for `ebpf` is 5.15, and it is IPv4-only.
+
+The listener binds before any capture side effect, so a bad listen address fails before routes, nft rules, or kernel programs touch the host. A failed capture leg ends the process rather than silently serving explicit-proxy only.
 
 ## `hodor fake <ENV> [--pattern <PATTERN>]`
 

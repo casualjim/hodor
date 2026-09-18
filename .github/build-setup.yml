@@ -1,3 +1,45 @@
-- name: Install cmake
+# Steps dist injects into its release build jobs (`github-build-setup` in
+# dist-workspace.toml). Everything here has to be non-interactive and work on
+# the bare runner, before `dist build` runs.
+#
+# Keep in step with `.github/workflows/ci.yml`: both install tools through the
+# same mise action, so the release build sees the toolchain the gate checked.
+# Anything installed here by another route — apt, curl — is a second toolchain
+# that can drift from the one CI validated.
+#
+# Two dist constraints, both load-bearing:
+# - every step with `uses:` must also carry `name:`; dist's template reads
+#   `step.id` on those steps and fails with `undefined value` otherwise.
+# - these steps are rendered through minijinja, so `${{ ... }}` expressions are
+#   passed through as literal text — keep them GitHub-only, no jinja syntax.
+- name: Install system deps
   if: ${{ runner.os == 'Linux' }}
-  run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev
+  run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold
+
+# The linker is `clang` (`.cargo/config.toml`) and must match the LLVM major
+# of the mise-installed rustc, same as ci.yml does.
+- name: Install clang matching rustc's LLVM major
+  if: ${{ runner.os == 'Linux' }}
+  run: |-
+    set -euxo pipefail
+    llvm_major="$(rustc -Vv | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
+    curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- "$llvm_major"
+    sudo apt-get install -y --no-install-recommends "clang-${llvm_major}"
+
+# Tools (rust, cmake, bpf-linker, nextest, hk, ...) come from mise.toml,
+# resolved to exact versions by mise.lock. cmake is one of them, so it is not
+# installed via apt here.
+- name: Install mise tools
+  uses: jdx/mise-action@v4
+  with:
+    experimental: true
+    install: true
+    cache: true
+
+# Keyed by target: the matrix builds amd64 and arm64 on different runners, and
+# a shared key would let one architecture's cached artifacts satisfy the other.
+# `matrix.targets` is an array here, unlike the scalar `matrix.target` in ci.yml.
+- name: Cache Rust dependencies
+  uses: Swatinem/rust-cache@v2
+  with:
+    key: ${{ join(matrix.targets, '-') }}

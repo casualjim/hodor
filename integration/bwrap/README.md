@@ -4,7 +4,8 @@ Same proof as the [docker demo](../README.md), minus the docker daemon: a
 network namespace with a veth up to the host, `hodor serve --proxy-backend tproxy`
 capturing inside it, and the client sandboxed by [bubblewrap] while
 sharing the netns — proxy-unaware, fake-token-holding, captured on the way
-out.
+out. Set `HODOR_BACKEND=ebpf` to run the same scenarios over the eBPF
+backend instead.
 
 [bubblewrap]: https://github.com/containers/bubblewrap
 
@@ -29,5 +30,16 @@ The task builds the release binary as you and escalates only the demo
 script (netns, veth, host NAT) via sudo, with a confirmation prompt;
 `--use-sudo` skips the prompt.
 
+To assert the same scenarios over the eBPF backend:
+
+```sh
+HODOR_BACKEND=ebpf mise run demo:bwrap
+```
+
+That needs a cgroup v2 hierarchy. The
+script creates `/sys/fs/cgroup/hodor-bwrap`, starts hodor outside it, and
+migrates the client into it before the client runs — no nft rules are
+installed for the capture, only the veth masquerade table.
+
 Requirements: sudo (for the netns, veth, and host NAT), `iproute2`, `nft`, `openssl`, `bun`, `curl`, `bwrap`.
-Everything (netns, veth, host NAT table, temp certs) is cleaned up on exit.
+Everything (netns, veth, host NAT table, temp certs, the eBPF cgroup) is cleaned up on exit.

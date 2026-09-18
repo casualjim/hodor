@@ -1,0 +1,11 @@
+# `clang` (unversioned) must resolve to the same LLVM major rustc was built
+# with — rustc 1.98.1 = LLVM 22. Locally: /usr/bin/clang. CI: installed by the
+# llvm.sh step in ci.yml. Container: Dockerfile.rustbuilder derives it from
+# `rustc -Vv`. mold comes from mise (`ld.mold` on PATH via shims).
+[target.x86_64-unknown-linux-gnu]
+linker = "clang-22"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang-22"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

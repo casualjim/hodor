@@ -1,0 +1,31 @@
+[package]
+name = "hodor-config"
+version = "0.1.16"
+edition = "2024"
+description = "grant-scoped MITM proxy: config overlay, rules, grants, and the CLI"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/hodor"
+publish = false
+
+[dependencies]
+base62 = "2.0"
+clap = { version = "4", features = ["derive", "env"] }
+code-workspace = "0.1.4"
+confique = { version = "0.4", features = ["toml"] }
+dirs = "6"
+eyre = "0.6"
+hex = "0.4"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+toml = "0.8"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

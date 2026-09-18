@@ -64,7 +64,7 @@ jobs:
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-installer.sh | sh"
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -127,9 +127,26 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "Install cmake"
+      - name: "Install system deps"
         if: "${{ runner.os == 'Linux' }}"
-        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake libudev-dev"
+        run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold"
+      - name: "Install clang matching rustc's LLVM major"
+        if: "${{ runner.os == 'Linux' }}"
+        run: |
+          set -euxo pipefail
+          llvm_major="$(rustc -Vv | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
+          curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- "$llvm_major"
+          sudo apt-get install -y --no-install-recommends "clang-${llvm_major}"
+      - name: "Install mise tools"
+        uses: "jdx/mise-action@v4"
+        with:
+          "cache": true
+          "experimental": true
+          "install": true
+      - name: "Cache Rust dependencies"
+        uses: "Swatinem/rust-cache@v2"
+        with:
+          "key": "${{ join(matrix.targets, '-') }}"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

@@ -1,0 +1,30 @@
+[package]
+name = "hodor-ebpf"
+version = "0.1.16"
+edition = "2024"
+description = "grant-scoped MITM proxy: eBPF capture backend"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/hodor"
+publish = false
+
+[dependencies]
+aya = "0.14"
+dashmap = "6"
+eyre = "0.6"
+hodor-config = { path = "../hodor-config" }
+hodor-proxy = { path = "../hodor-proxy" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[build-dependencies]
+aya-build = "0.2"
+
+[dev-dependencies]
+aya-obj = "0.3"
+hodor-pki = { path = "../hodor-pki" }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+secrecy = { version = "0.10", features = ["serde"] }
+tokio-rustls = "0.26"
+
+[lints]
+workspace = true

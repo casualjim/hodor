@@ -53,12 +53,16 @@ jobs:
 
       - name: Assert the binary carries transparent capture
         run: |
-          # dist silently ignores build settings it does not recognize, and a binary
-          # built without capture only fails at runtime, in production. All three
-          # markers are compiled in unconditionally, and this works
-          # on arm64 too.
-          for marker in 'TUN capture failed' 'TPROXY capture failed' 'eBPF capture failed'; do
-            if ! grep -aq "$marker" ctx/hodor; then
+          # dist silently ignores build settings it does not recognize, and a
+          # binary built without capture only fails at runtime, in production.
+          # Each marker is a static string that only exists when its backend is
+          # compiled in: the TUN device path (hodor-tun), the unscoped-capture
+          # guard message (hodor-tproxy), and the eBPF program name inside the
+          # embedded BPF object (hodor-ebpf-programs). The per-backend failure
+          # messages are runtime format strings ("{name} capture failed: ..."),
+          # so they never appear verbatim in the binary.
+          for marker in '/dev/net/tun' 'refusing to install unscoped TPROXY capture' 'capture_egress'; do
+            if ! grep -aq -- "$marker" ctx/hodor; then
               echo "::error::ctx/hodor was built without transparent capture ($marker)"
               exit 1
             fi

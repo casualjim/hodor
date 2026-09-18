@@ -10,6 +10,11 @@ publish = false
 # A workspace member only so `aya-build` can resolve it with
 # `cargo build --package`; it compiles for the `bpf` target alone, with nightly
 # and `-Z build-std`, and every host-wide command excludes it.
+# `dist = false` backs that up for cargo-dist: with `precise-builds` it is
+# redundant, but it keeps dist from ever selecting this crate for a release.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 aya-ebpf = "0.2"
 

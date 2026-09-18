@@ -67,17 +67,20 @@ impl Drop for TestCgroup {
 }
 
 /// A `ProxyState` with the given grants.
-fn state_with(grants: Vec<Grant>, ca: hodor_pki::ca::CertAuthority) -> Arc<ProxyState> {
-  Arc::new(ProxyState::new(
-    ResolvedConfig {
-      proxy: ProxyCfg {
-        listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        ca_file: None,
+fn state_with(grants: Vec<Grant>, ca: &hodor_pki::ca::CertAuthority) -> Arc<ProxyState> {
+  Arc::new(
+    ProxyState::new(
+      ResolvedConfig {
+        proxy: ProxyCfg {
+          listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+          ca_file: None,
+        },
+        grants,
       },
-      grants,
-    },
-    ca,
-  ))
+      ca,
+    )
+    .unwrap(),
+  )
 }
 
 /// Start capture, move this process into its cgroup, and fail loudly if the
@@ -158,7 +161,7 @@ async fn ebpf_live_tcp_mitm_substitutes() {
         port: stub_port,
       }],
     }],
-    ca,
+    &ca,
   );
 
   let cgroup = TestCgroup::create("tcp");
@@ -254,7 +257,7 @@ async fn ebpf_live_udp_relay_roundtrip() {
   hodor_pki::ca::install_crypto_provider();
   let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
   // No grants: the UDP leg is a relay, and substitution plays no part in it.
-  let state = state_with(Vec::new(), ca);
+  let state = state_with(Vec::new(), &ca);
 
   let stub = tokio::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
     .await
@@ -314,7 +317,7 @@ async fn ebpf_live_ungranted_tcp_splices_byte_identical() {
   hodor_pki::ca::install_crypto_provider();
   let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
   // No grants at all, so nothing can match and the splice path is forced.
-  let state = state_with(Vec::new(), ca);
+  let state = state_with(Vec::new(), &ca);
 
   let stub = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
     .await
@@ -369,7 +372,7 @@ async fn ebpf_live_unconnected_udp_passes_through() {
 
   hodor_pki::ca::install_crypto_provider();
   let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
-  let state = state_with(Vec::new(), ca);
+  let state = state_with(Vec::new(), &ca);
 
   // Loopback, and reached without `connect()`: the programs skip loopback
   // destinations, so nothing here can be rewritten — the point is that the

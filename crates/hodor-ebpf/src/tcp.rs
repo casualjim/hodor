@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hodor_proxy::{ProxyState, serve_candidate_stream};
+use hodor_proxy::{ProxyState, serve_transparent_stream};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::flow::{FlowTables, PROTO_TCP};
@@ -13,7 +13,7 @@ use crate::flow::{FlowTables, PROTO_TCP};
 ///
 /// The listener is a plain loopback socket: `connect4` already rewrote the
 /// destination, so no `IP_TRANSPARENT` is involved. Each accepted connection's
-/// original destination is looked up and handed to [`serve_candidate_stream`]
+/// original destination is looked up and handed to [`serve_transparent_stream`]
 /// exactly the way the TPROXY leg does — the SNI is the TLS identity, and for
 /// transparent capture there is no CONNECT authority to enforce.
 pub(crate) async fn serve(port: u16, flows: FlowTables, state: Arc<ProxyState>, upstream_override: Option<SocketAddr>) -> eyre::Result<()> {
@@ -48,5 +48,5 @@ async fn one(
   let dial = upstream_override.unwrap_or(dst);
   let dial_host = dial.ip().to_string();
   let snapshot = state.snapshot();
-  serve_candidate_stream(stream, state, &snapshot, &dial_host, dial.port(), None, &dial_host, &[]).await
+  serve_transparent_stream(stream, state, &snapshot, &dial_host, dial.port(), &dial_host).await
 }

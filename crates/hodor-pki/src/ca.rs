@@ -1,4 +1,4 @@
-//! CA management + per-domain leaf certificate cache.
+//! CA management + per-domain leaf certificate generation.
 
 use std::io::Write as _;
 #[cfg(unix)]
@@ -10,18 +10,9 @@ use rcgen::{CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::{Duration, OffsetDateTime};
-use tokio_rustls::TlsConnector;
 
 /// Leaf validity for generated per-domain certificates.
 const LEAF_VALIDITY_HOURS: u64 = 24;
-/// Max cached leaf certificates. Only bounds memory: over-capacity inserts
-/// first evict expired entries, so steady state holds the working set.
-const CACHE_CAPACITY: usize = 1000;
-/// On-demand mint burst: at most this many fresh leafs per window. Bounds
-/// remote-triggered keygen (Any-host grants, SNI rotation).
-const MINT_BURST: usize = 20;
-/// Sliding window for the mint burst.
-const MINT_WINDOW_SECS: u64 = 10;
 /// A certificate authority for signing per-domain certificates.
 pub struct CertAuthority {
   issuer: Issuer<'static, KeyPair>,
@@ -128,11 +119,24 @@ impl CertAuthority {
     generate_domain_cert(domain, self)
   }
 
-  /// Upstream TLS connector trusting the system natives plus this CA.
-  /// Verification is always on; see the free [`upstream_connector`] for why.
-  #[must_use]
-  pub fn connector(&self) -> TlsConnector {
-    upstream_connector(self.cert_der())
+  /// Boring CA pair for the rama MITM issuer: cert DER plus the PKCS8 key
+  /// bytes this CA already holds, converted to boring types.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the cert DER or the PKCS8 key bytes fail to parse
+  /// as boring types.
+  pub fn boring_pair(
+    &self,
+  ) -> eyre::Result<(
+    rama::tls::boring::core::x509::X509,
+    rama::tls::boring::core::pkey::PKey<rama::tls::boring::core::pkey::Private>,
+  )> {
+    let crt = rama::tls::boring::core::x509::X509::from_der(self.cert_der.as_ref())
+      .map_err(|err| eyre::eyre!("CA cert DER is not a valid boring X509: {err}"))?;
+    let key = rama::tls::boring::core::pkey::PKey::private_key_from_pkcs8(&self.issuer.key().serialize_der())
+      .map_err(|err| eyre::eyre!("CA key is not a valid boring PKCS8 key: {err}"))?;
+    Ok((crt, key))
   }
 }
 
@@ -335,107 +339,6 @@ pub fn generate_domain_cert(domain: &str, ca: &CertAuthority) -> eyre::Result<Do
   })
 }
 
-/// Lock-free cache of leaf certificates: exact domains and pre-generated
-/// wildcard patterns share one map. Lookups are lock-free; key generation
-/// stays on the caller, never under a lock. Expired entries rotate lazily:
-/// a lookup hitting an expired leaf drops it and reports a miss, so the
-/// caller mints a fresh one. Inserts past capacity first evict expired
-/// entries, bounding memory without ever blocking readers.
-pub struct CertCache {
-  map: dashmap::DashMap<String, Arc<DomainCert>>,
-  mints: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
-}
-
-impl std::fmt::Debug for CertCache {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("CertCache").field("cached", &self.map.len()).finish_non_exhaustive()
-  }
-}
-
-impl CertCache {
-  /// Empty cache.
-  #[must_use]
-  pub fn new() -> Self {
-    Self {
-      map: dashmap::DashMap::new(),
-      mints: std::sync::Mutex::new(std::collections::VecDeque::new()),
-    }
-  }
-
-  /// Cached leaf for `key` (exact domain or `*.`-pattern), if present and
-  /// unexpired. Expired entries are dropped and reported as a miss.
-  pub fn get(&self, key: &str) -> Option<Arc<DomainCert>> {
-    let cert = Arc::clone(self.map.get(key)?.value());
-    if cert.expires_at > OffsetDateTime::now_utc() {
-      Some(cert)
-    } else {
-      // Remove only this stale entry: a concurrent rotation may already
-      // have replaced it with a fresh leaf.
-      let stale = cert;
-      self.map.remove_if(key, |_, value| Arc::ptr_eq(value, &stale));
-      None
-    }
-  }
-
-  /// Store a freshly generated leaf, evicting expired entries first when
-  /// over capacity.
-  pub fn insert(&self, key: &str, cert: Arc<DomainCert>) {
-    self.map.insert(key.to_string(), cert);
-    if self.map.len() > CACHE_CAPACITY {
-      let now = OffsetDateTime::now_utc();
-      self.map.retain(|_, cert| cert.expires_at > now);
-    }
-  }
-
-  /// Store an on-demand minted leaf, recording it in the burst window.
-  /// Startup pre-generation uses insert and stays untracked.
-  pub fn insert_minted(&self, key: &str, cert: Arc<DomainCert>) {
-    self.insert(key, cert);
-    let mut mints = self.mints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    mints.push_back(std::time::Instant::now());
-  }
-
-  /// True when another on-demand mint fits in the burst window.
-  pub fn mint_allowed(&self) -> bool {
-    let mut mints = self.mints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // `None` means the monotonic clock has not yet run for a full window
-    // (uptime under `MINT_WINDOW_SECS`), so no recorded mint can be older
-    // than the cutoff and there is nothing to evict.
-    if let Some(cutoff) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(MINT_WINDOW_SECS)) {
-      while mints.front().is_some_and(|at| *at < cutoff) {
-        mints.pop_front();
-      }
-    }
-    mints.len() < MINT_BURST
-  }
-}
-
-impl Default for CertCache {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-/// Build the upstream TLS connector. Roots are the system natives plus our
-/// own CA, so loopback stubs presenting hodor-signed certs verify on the
-/// production path. Verification is always on: this proxy swaps real secrets
-/// upstream, so a network attacker with an untrusted cert must fail closed.
-pub fn upstream_connector(ca_der: &CertificateDer<'static>) -> TlsConnector {
-  let mut root_store = rustls::RootCertStore::empty();
-  let natives = rustls_native_certs::load_native_certs();
-  if !natives.errors.is_empty() {
-    tracing::warn!(count = natives.errors.len(), "errors loading native certificates");
-  }
-  for cert in natives.certs {
-    let _ = root_store.add(cert);
-  }
-  let _ = root_store.add(ca_der.clone());
-  let client_config = rustls::ClientConfig::builder()
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
-  TlsConnector::from(Arc::new(client_config))
-}
-
 /// Install the aws-lc-rs crypto provider as the process default. Idempotent;
 /// required before building any rustls config.
 pub fn install_crypto_provider() {
@@ -455,26 +358,6 @@ mod tests {
     let reloaded = load_or_generate(&path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(reloaded.cert_der, ca.cert_der);
-  }
-
-  #[test]
-  fn cert_cache_reuses_fresh_and_rotates_expired() {
-    install_crypto_provider();
-    let ca = CertAuthority::generate().unwrap();
-    let cache = CertCache::new();
-    assert!(cache.get("example.com").is_none());
-    let fresh = Arc::new(generate_domain_cert("example.com", &ca).unwrap());
-    cache.insert("example.com", Arc::clone(&fresh));
-    let hit = cache.get("example.com").unwrap();
-    assert!(Arc::ptr_eq(&hit, &fresh));
-    assert!(hit.expires_at > OffsetDateTime::now_utc() + Duration::hours(23));
-    // Expired entries report a miss so the caller rotates them.
-    let stale = Arc::new(DomainCert {
-      expires_at: OffsetDateTime::now_utc() - Duration::seconds(1),
-      server_config: Arc::clone(&fresh.server_config),
-    });
-    cache.insert("stale.example", Arc::clone(&stale));
-    assert!(cache.get("stale.example").is_none());
   }
 
   #[test]

@@ -112,13 +112,16 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   };
   #[cfg(not(target_os = "linux"))]
   let fwmark = None;
+  #[cfg(target_os = "linux")]
   let state = std::sync::Arc::new(match fwmark {
-    Some(mark) => hodor_proxy::ProxyState::new(resolved, ca).with_fwmark(mark),
-    None => hodor_proxy::ProxyState::new(resolved, ca),
+    Some(mark) => hodor_proxy::ProxyState::new(resolved, &ca)?.with_fwmark(mark),
+    None => hodor_proxy::ProxyState::new(resolved, &ca)?,
   });
+  #[cfg(not(target_os = "linux"))]
+  let state = std::sync::Arc::new(hodor_proxy::ProxyState::new(resolved, &ca)?);
   // Bind before capture side effects: a bad listen addr must fail
   // before nft rules and routes touch the host.
-  let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+  let listener = hodor_proxy::bind_explicit(listen_addr).await?;
   if !listen_addr.ip().is_loopback() {
     tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
   }
@@ -148,7 +151,8 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     let capture = std::sync::Arc::clone(&state);
     return with_capture(listener, state, "eBPF", async move { hodor_ebpf::run_ebpf(capture, cgroup).await }).await;
   }
-  hodor_proxy::serve(listener, state).await
+  hodor_proxy::serve(listener, state).await;
+  Ok(())
 }
 
 /// Serve the explicit listener while a capture backend runs beside it, failing
@@ -159,7 +163,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
 /// lives here, at process level, never inside the capture task: aborting the
 /// task is what runs its teardown, and every backend has host state to unwind.
 async fn with_capture<F>(
-  listener: tokio::net::TcpListener,
+  listener: hodor_proxy::RamaTcpListener,
   state: std::sync::Arc<hodor_proxy::ProxyState>,
   name: &'static str,
   capture: F,
@@ -169,7 +173,7 @@ where
 {
   let mut handle = tokio::spawn(capture);
   tokio::select! {
-    result = hodor_proxy::serve(listener, state) => result,
+    () = hodor_proxy::serve(listener, state) => Ok(()),
     capture_result = &mut handle => match capture_result {
       Ok(inner) => inner.map_err(|err| eyre::eyre!("{name} capture failed: {err:?}")),
       Err(err) => Err(eyre::eyre!("{name} task failed: {err}")),

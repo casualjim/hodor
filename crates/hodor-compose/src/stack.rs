@@ -209,11 +209,15 @@ pub(crate) fn generate_stack(root: &Path) -> eyre::Result<String> {
   );
   let root_container = translate(root, host_home.as_deref(), &home);
   let project = config.workspace.name.clone().unwrap_or_else(|| workspace_slug(root));
+  let storage = workspace_state_dir(root).join("containers");
   Ok(compose_yaml(
     &decoys,
     &project,
-    &root_container,
-    &home,
+    &AgentSpec {
+      root: &root_container,
+      home: &home,
+      storage: &storage,
+    },
     &mounts,
     &agent_configs,
     &fnox,
@@ -285,6 +289,17 @@ pub(crate) fn rules_toml(decoys: &[Decoy], hostless: &[Decoy], unregistered: &[S
   out
 }
 
+/// What the generated agent service is built from: container-side paths and
+/// the host directory mounted as the inner runtime's storage.
+pub(crate) struct AgentSpec<'a> {
+  /// Workspace root, translated into the agent container.
+  pub(crate) root: &'a Path,
+  /// The agent user's home directory in the container.
+  pub(crate) home: &'a str,
+  /// Host directory mounted at `{home}/.local/share/containers`.
+  pub(crate) storage: &'a Path,
+}
+
 /// The generated stack: hodor merges config from its working directory like
 /// always and fnox resolves per-workspace inside, and the agent shares
 /// hodor's network namespace from the translated workspace directory,
@@ -292,8 +307,7 @@ pub(crate) fn rules_toml(decoys: &[Decoy], hostless: &[Decoy], unregistered: &[S
 pub(crate) fn compose_yaml(
   decoys: &[Decoy],
   project: &str,
-  root_container: &Path,
-  home: &str,
+  agent: &AgentSpec<'_>,
   mounts: &[Mount],
   agent_configs: &[Mount],
   fnox: &FnoxBinds,
@@ -317,13 +331,13 @@ pub(crate) fn compose_yaml(
      \x20     # Provider credentials fnox reads, taken from the environment\n\
      \x20     # this stack starts in; a token fnox itself declares is resolved\n\
      \x20     # inside the container instead.\n",
-    root = root_container.display()
+    root = agent.root.display()
   );
   for name in &fnox.env {
     let _ = writeln!(out, "      {name}: \"${{{name}}}\"");
   }
   out.push_str(
-    "     \x20   cap_add:\n\
+    "    cap_add:\n\
      \x20     - NET_ADMIN\n\
      \x20   stop_grace_period: 1s\n\
      \x20   volumes:\n",
@@ -363,8 +377,8 @@ pub(crate) fn compose_yaml(
      \x20     NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt\n\
      \x20     REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt\n\
      \x20     # decoys — one per declared rule, swapped by hodor on grant match\n",
-    root = root_container.display(),
-    home = home
+    root = agent.root.display(),
+    home = agent.home
   );
   for decoy in decoys {
     let _ = writeln!(out, "      {}: \"{}\"", decoy.env, decoy.value);
@@ -378,12 +392,15 @@ pub(crate) fn compose_yaml(
     out,
     "      - ${{HODOR_ENTRYPOINT:-~/.config/hodor/proxy-entrypoint.sh}}:{home}/.config/hodor/proxy-entrypoint.sh:ro\n\
      \x20     - ${{HODOR_CA_CRT:-~/.config/hodor/ca.crt}}:/usr/local/share/ca-certificates/hodor-ca.crt:ro\n\
-     \x20     # Inner container storage. Made at generation time, owned by the\n\
-     \x20     # user that runs the agent: a bind source the runtime creates itself\n\
-     \x20     # is root-owned, and podman inside then dies without a word. A named\n\
-     \x20     # volume needs the same ownership once, by hand.\n\
-     \x20     - ${{HODOR_AGENT_STORAGE:-~/.config/hodor/agent-containers}}:{home}/.local/share/containers\n\
-     \x20   network_mode: \"service:hodor\"\n"
+     \x20     # Inner container storage. Made at generation time under this\n\
+     \x20     # workspace's state directory, owned by the user that runs the\n\
+     \x20     # agent: a bind source the runtime creates itself is root-owned,\n\
+     \x20     # and podman inside then dies without a word. A named volume needs\n\
+     \x20     # the same ownership once, by hand.\n\
+     \x20     - ${{HODOR_AGENT_STORAGE:-{storage}}}:{home}/.local/share/containers\n\
+     \x20   network_mode: \"service:hodor\"\n",
+    home = agent.home,
+    storage = agent.storage.display()
   );
   out
 }
@@ -504,6 +521,17 @@ pub(crate) fn generation_registry() -> eyre::Result<hodor_config::registry::Regi
 /// Open fnox via its own discovery; no hodor-specific env vars.
 pub(crate) fn open_fnox() -> eyre::Result<Option<hodor_fnox::FnoxSource>> {
   hodor_fnox::FnoxSource::open()
+}
+
+/// The workspace's state directory: `<state-dir>/hodor/ws/<slug>`. The
+/// generated stack lives here and the agent's inner-runtime storage sits
+/// beside it.
+pub(crate) fn workspace_state_dir(root: &Path) -> PathBuf {
+  dirs::state_dir()
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("hodor")
+    .join("ws")
+    .join(workspace_slug(root))
 }
 
 /// The workspace's override file: `hodor.compose.yaml` first, then `.yml`.

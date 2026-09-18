@@ -42,6 +42,16 @@ mod tests {
     }
   }
 
+  /// Test agent spec: `root` inside the container, home `/home/eng`, and the
+  /// workspace-state storage directory the agent service mounts.
+  fn agent_paths(root: &str) -> AgentSpec<'_> {
+    AgentSpec {
+      root: Path::new(root),
+      home: "/home/eng",
+      storage: Path::new("/state/hodor/ws/hodor/containers"),
+    }
+  }
+
   /// Test-only env write and removal, so the unsafe call lives in one place.
   fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
     // SAFETY: test-only mutation, and nextest runs one test per process.
@@ -180,8 +190,7 @@ mod tests {
     let yaml = compose_yaml(
       &decoys(),
       "hodor",
-      Path::new("/home/eng/github/hodor"),
-      "/home/eng",
+      &agent_paths("/home/eng/github/hodor"),
       &[],
       &mounts,
       &FnoxBinds::default(),
@@ -240,26 +249,38 @@ mod tests {
 
   #[test]
   fn the_agent_service_carries_what_inner_containers_need() {
-    let yaml = compose_yaml(
-      &decoys(),
-      "hodor",
-      Path::new("/home/eng"),
-      "/home/eng",
-      &[],
-      &[],
-      &FnoxBinds::default(),
-    );
+    let yaml = compose_yaml(&decoys(), "hodor", &agent_paths("/home/eng"), &[], &[], &FnoxBinds::default());
     for expected in [
       "image: ${AGENT_IMAGE:-ghcr.io/casualjim/devagent:26.04}",
       "security_opt: [seccomp=unconfined, systempaths=unconfined, apparmor=unconfined]",
       "cap_add: [SYS_CHROOT, AUDIT_WRITE, NET_ADMIN, SETUID, SETGID, SYS_ADMIN]",
       "devices: [/dev/net/tun]",
-      "- ${HODOR_AGENT_STORAGE:-~/.config/hodor/agent-containers}:/home/eng/.local/share/containers",
+      "- ${HODOR_AGENT_STORAGE:-/state/hodor/ws/hodor/containers}:/home/eng/.local/share/containers",
     ] {
       assert!(yaml.contains(expected), "missing {expected}:\n{yaml}");
     }
     // The agent runs its own runtime; it never reaches the host's.
     assert!(!yaml.contains("docker.sock") && !yaml.contains("/var/run/docker"), "{yaml}");
+  }
+
+  #[test]
+  fn compose_yaml_indents_every_mapping_key_under_its_parent() {
+    // The generated stack is parsed by docker's YAML loader, so a key at the
+    // wrong depth is a hard failure, not a cosmetic one. In these literals a
+    // `\`-continued line drops its leading whitespace while the first line
+    // keeps it, which is how `cap_add:` once landed at nine spaces inside
+    // `environment:` and `hodor confine up` died with "did not find expected key".
+    let yaml = compose_yaml(&decoys(), "hodor", &agent_paths("/home/eng"), &[], &[], &FnoxBinds::default());
+    for expected in [
+      "\n    cap_add:\n      - NET_ADMIN\n",
+      "\n    stop_grace_period: 1s\n",
+      "\n    volumes:\n",
+      "\n  agent:\n",
+      "\n  hodor:\n",
+      "\nservices:\n",
+    ] {
+      assert!(yaml.contains(expected), "missing {expected:?}:\n{yaml}");
+    }
   }
 
   #[test]
@@ -271,8 +292,7 @@ mod tests {
     let yaml = compose_yaml(
       &decoys(),
       "hodor",
-      Path::new("/home/eng/github/hodor"),
-      "/home/eng",
+      &agent_paths("/home/eng/github/hodor"),
       &mounts,
       &[],
       &FnoxBinds::default(),
@@ -281,7 +301,14 @@ mod tests {
     assert!(yaml.contains("working_dir: \"/home/eng/github/hodor\""), "{yaml}");
     assert!(yaml.contains("- /home/ivan/github/hodor:/home/eng/github/hodor:rw"), "{yaml}");
     assert!(yaml.contains("- /home/ivan/.config/mise:/home/eng/.config/mise:ro"), "{yaml}");
-    assert!(yaml.contains("/home/eng/.config/hodor/proxy-entrypoint.sh:ro"), "{yaml}");
+    assert!(
+      yaml.contains("entrypoint: [\"/home/eng/.config/hodor/proxy-entrypoint.sh\"]"),
+      "the entrypoint is the in-container path: {yaml}"
+    );
+    assert!(
+      yaml.contains(":/home/eng/.config/hodor/proxy-entrypoint.sh:ro"),
+      "mounted where the entrypoint names it: {yaml}"
+    );
     assert!(yaml.contains("network_mode: \"service:hodor\""), "{yaml}");
     assert!(yaml.contains("- ${HODOR_CA:-~/.config/hodor/ca.pem}:/certs/ca.pem"), "{yaml}");
     assert!(!yaml.contains("/root/.config/fnox"), "no fnox mount without binds to mount: {yaml}");
@@ -379,7 +406,7 @@ mod tests {
     set_env(key, "0.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let binds = fnox_binds(None, None);
     assert!(binds.env.iter().any(|name| name == key), "{:?}", binds.env);
-    let yaml = compose_yaml(&decoys(), "hodor", Path::new("/home/eng"), "/home/eng", &[], &[], &binds);
+    let yaml = compose_yaml(&decoys(), "hodor", &agent_paths("/home/eng"), &[], &[], &binds);
     assert!(yaml.contains(&format!("{key}: \"${{{key}}}\"")), "{yaml}");
     assert!(
       !yaml.contains("0.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -396,14 +423,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
     let entrypoint = dir.path().join("proxy-entrypoint.sh");
+    let storage = dir.path().join("state").join("containers");
 
-    let files = ensure_support_files(dir.path()).unwrap();
+    let files = ensure_support_files(dir.path(), &storage).unwrap();
     assert!(files.iter().all(|(_, created)| *created), "{files:?}");
     let pem = std::fs::read_to_string(dir.path().join("ca.pem")).unwrap();
     let crt = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
     let key = std::fs::read_to_string(dir.path().join("ca.key")).unwrap();
-    assert!(dir.path().join("proxy-entrypoint.sh").is_file());
-    assert!(dir.path().join("agent-containers").is_dir());
+    assert!(entrypoint.is_file());
+    assert!(storage.is_dir(), "storage belongs to the workspace state, not the config dir");
+    assert!(
+      !dir.path().join("agent-containers").exists(),
+      "no storage under the config dir: {files:?}"
+    );
     // `ca.pem` is what hodor reads; `ca.crt` is the certificate alone, which is
     // what the agent gets. A clean system needs both.
     assert!(
@@ -432,7 +464,7 @@ mod tests {
 
     std::fs::write(&entrypoint, "#!/bin/sh\necho mine\n").unwrap();
     std::fs::remove_file(dir.path().join("ca.pem")).unwrap();
-    let files = ensure_support_files(dir.path()).unwrap();
+    let files = ensure_support_files(dir.path(), &storage).unwrap();
     let created: BTreeMap<&str, bool> = files
       .iter()
       .map(|(path, created)| (path.file_name().unwrap().to_str().unwrap(), *created))

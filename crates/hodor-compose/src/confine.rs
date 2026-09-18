@@ -7,7 +7,7 @@ use eyre::WrapErr as _;
 use hodor_config::cli::ConfineAction;
 
 use crate::paths::translate;
-use crate::stack::{generate_stack, workspace_config, workspace_file, workspace_slug};
+use crate::stack::{generate_stack, workspace_config, workspace_file, workspace_state_dir};
 
 /// The entrypoint the generated agent service runs: it makes hodor's CA trusted
 /// inside the container before handing off to the command, by installing it into
@@ -36,8 +36,9 @@ exec "$@"
 /// entrypoint. Nothing existing is overwritten, so an edited entrypoint or a CA
 /// you installed elsewhere survives. The directory is the hodor config
 /// directory, which is what the compose defaults point at, not `[proxy]
-/// ca_file`: that describes a host-run hodor, not the container's mount.
-pub(crate) fn ensure_support_files(dir: &Path) -> eyre::Result<Vec<(PathBuf, bool)>> {
+/// ca_file`: that describes a host-run hodor, not the container's mount. The
+/// storage directory is this workspace's, under the state directory.
+pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> eyre::Result<Vec<(PathBuf, bool)>> {
   let ca = dir.join("ca.pem");
   let entrypoint = dir.join("proxy-entrypoint.sh");
   let mut files = Vec::new();
@@ -51,10 +52,9 @@ pub(crate) fn ensure_support_files(dir: &Path) -> eyre::Result<Vec<(PathBuf, boo
   files.push((entrypoint.clone(), write_entrypoint(&entrypoint)?));
   // The agent's inner container storage — see the generated compose file for
   // why this directory has to exist before the stack starts.
-  let storage = dir.join("agent-containers");
   let storage_created = !storage.exists();
-  match std::fs::create_dir_all(&storage) {
-    Ok(()) => files.push((storage, storage_created)),
+  match std::fs::create_dir_all(storage) {
+    Ok(()) => files.push((storage.to_path_buf(), storage_created)),
     Err(err) => println!("warning: could not prepare {}: {err}", storage.display()),
   }
   Ok(files)
@@ -71,10 +71,11 @@ pub(crate) fn write_entrypoint(path: &Path) -> eyre::Result<bool> {
   Ok(true)
 }
 
-/// Resolve the config directory, then create what the stack mounts there.
-pub(crate) fn prepare_support_files() -> eyre::Result<Vec<(PathBuf, bool)>> {
+/// Resolve the config directory and this workspace's state directory, then
+/// create what the stack mounts from them.
+pub(crate) fn prepare_support_files(root: &Path) -> eyre::Result<Vec<(PathBuf, bool)>> {
   let dir = hodor_config::config::config_dir().ok_or_else(|| eyre::eyre!("unable to resolve the hodor config directory"))?;
-  ensure_support_files(&dir)
+  ensure_support_files(&dir, &workspace_state_dir(root).join("containers"))
 }
 
 /// Report the files the call actually created; absent ones are already there.
@@ -102,17 +103,12 @@ pub fn confine_command(action: &ConfineAction, workspace: &Path) -> eyre::Result
   let root = workspace
     .canonicalize()
     .wrap_err_with(|| format!("resolve workspace {}", workspace.display()))?;
-  let slug = workspace_slug(&root);
-  let state_ws = dirs::state_dir()
-    .unwrap_or_else(|| PathBuf::from("."))
-    .join("hodor")
-    .join("ws")
-    .join(&slug);
+  let state_ws = workspace_state_dir(&root);
   let ws_compose = state_ws.join("compose.yml");
   match action {
     ConfineAction::Init => {
       std::fs::create_dir_all(&state_ws).wrap_err_with(|| format!("create {}", state_ws.display()))?;
-      report_created(&prepare_support_files()?);
+      report_created(&prepare_support_files(&root)?);
       if ws_compose.is_file() {
         println!("exists, left untouched: {}", ws_compose.display());
         return Ok(());
@@ -169,7 +165,7 @@ pub fn confine_command(action: &ConfineAction, workspace: &Path) -> eyre::Result
             .status()
         }
         ConfineAction::Up => {
-          report_created(&prepare_support_files()?);
+          report_created(&prepare_support_files(&root)?);
           command.arg("up").arg("-d").status()
         }
         _ => command.arg("down").status(),

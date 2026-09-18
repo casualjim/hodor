@@ -2,7 +2,7 @@
 //! rules (`nft.rs`, `route.rs`). The kernel terminates TCP; hodor sees
 //! plain accepted streams with the original destination recoverable from
 //! `local_addr()`. Non-matching traffic splices through the same
-//! `serve_candidate_stream` machinery as explicit CONNECT.
+//! `serve_transparent_stream` machinery as explicit CONNECT.
 //!
 //! Privileges: `CAP_NET_ADMIN` (nft table, fib rules, `IP_TRANSPARENT`).
 
@@ -23,10 +23,12 @@ use netlink_sys::constants::NETLINK_NETFILTER;
 use rama::net::address::SocketAddress;
 use rama::net::socket::SocketOptions;
 use rama::net::socket::opts::Domain;
+use rama::rt::Executor;
+use rama::tcp::server::TcpListener as RamaTcpListener;
 use tokio::net::TcpStream;
 
 use hodor_config::grants::ResolvedConfig;
-use hodor_proxy::{ProxyState, serve_candidate_stream};
+use hodor_proxy::{ProxyState, serve_transparent_stream};
 
 /// Capture mark: the nft OUTPUT rule sets it on intercepted TCP, the fib
 /// rule routes marked packets to the local-delivery table, and the
@@ -131,8 +133,8 @@ fn assert_unscoped_capture_allowed(options: &Options) -> eyre::Result<()> {
 
 pub(crate) async fn run_tproxy_with(options: Options, state: Arc<ProxyState>) -> eyre::Result<()> {
   assert_unscoped_capture_allowed(&options)?;
-  let listener = transparent_listener(options.port.unwrap_or(LISTEN_PORT))?;
-  let listen_port = listener.local_addr()?.port();
+  let listener = transparent_listener(options.port.unwrap_or(LISTEN_PORT)).await?;
+  let listen_port = listener.local_addr().map_err(|err| eyre::eyre!("tproxy local addr: {err}"))?.port();
   let handle = route::netlink()?;
   let lo = route::link_index(&handle, "lo").await?;
   for plan in route::proxy_rules(ROUTE_TABLE) {
@@ -171,8 +173,9 @@ pub(crate) async fn run_tproxy_with(options: Options, state: Arc<ProxyState>) ->
   // the Drop guards when this task is dropped; SIGKILL is uncatchable and
   // the install log names the manual cleanup commands for that case.
   loop {
-    let (stream, _peer) = listener.accept().await?;
+    let (stream, _peer) = listener.accept().await.map_err(|err| eyre::eyre!("tproxy accept: {err}"))?;
     // On a transparent socket the local address IS the original destination.
+    let stream = stream.stream;
     let Ok(dst) = stream.local_addr() else {
       continue;
     };
@@ -198,11 +201,11 @@ async fn tproxy_conn_task(
   let dial_host = dial.ip().to_string();
   let snapshot: Arc<ResolvedConfig> = state.snapshot();
   let snapshot = &*snapshot;
-  serve_candidate_stream(stream, &state, snapshot, &dial_host, dial.port(), None, &dial_host, &[]).await
+  serve_transparent_stream(stream, &state, snapshot, &dial_host, dial.port(), &dial_host).await
 }
 
-/// `IP_TRANSPARENT` listener on `0.0.0.0:port`.
-fn transparent_listener(port: u16) -> eyre::Result<tokio::net::TcpListener> {
+/// `IP_TRANSPARENT` listener on `0.0.0.0:port`, bound through rama.
+async fn transparent_listener(port: u16) -> eyre::Result<RamaTcpListener> {
   let socket = SocketOptions {
     address: Some(SocketAddress::default_ipv4(port)),
     ip_transparent: Some(true),
@@ -211,9 +214,10 @@ fn transparent_listener(port: u16) -> eyre::Result<tokio::net::TcpListener> {
     ..SocketOptions::default_tcp()
   }
   .try_build_socket(Domain::IPv4)?;
-  socket.set_nonblocking(true)?;
   socket.listen(1024)?;
-  Ok(tokio::net::TcpListener::from_std(socket.into())?)
+  RamaTcpListener::bind_socket(socket, Executor::default())
+    .await
+    .map_err(|err| eyre::eyre!("tproxy bind: {err}"))
 }
 
 /// Sends a prepared nftables batch over a fresh netfilter netlink socket
@@ -415,8 +419,9 @@ mod tests {
           },
           grants,
         },
-        ca,
+        &ca,
       )
+      .unwrap()
       .with_fwmark(EGRESS_MARK),
     );
 

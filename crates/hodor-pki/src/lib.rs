@@ -1,7 +1,5 @@
-//! PKI: the signing CA, per-domain leaf certificates, and SNI extraction.
+//! PKI: the signing CA and per-domain leaf certificates for test stubs.
 
 pub mod ca;
-pub mod sni;
 
-pub use ca::{CertAuthority, CertCache, DomainCert, install_crypto_provider, load_or_generate, upstream_connector};
-pub use sni::{MAX_HELLO, extract_sni};
+pub use ca::{CertAuthority, DomainCert, install_crypto_provider, load_or_generate};

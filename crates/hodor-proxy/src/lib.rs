@@ -5,38 +5,56 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use rustls::pki_types::ServerName;
+use rama::error::BoxError;
+use rama::extensions::{Extensions, ExtensionsRef};
+use rama::io::BridgeIo;
+use rama::net::address::{Host, HostWithPort, SocketAddress};
+use rama::net::client::ConnectorTarget;
+use rama::net::socket::SocketOptions;
+use rama::net::socket::opts::Domain;
+use rama::rt::Executor;
+use rama::tcp::client::TcpStreamConnector;
+pub use rama::tcp::server::TcpListener as RamaTcpListener;
+use rama::tcp::stream::TcpStream as RamaTcpStream;
+use rama::tls::boring::TlsStream;
+use rama::tls::boring::proxy::TlsMitmEgressServerAuth;
+use rama::tls::boring::proxy::TlsMitmRelay;
+use rama::tls::boring::proxy::TlsMitmRelayService;
+use rama::tls::boring::proxy::cert_issuer::{CachedBoringMitmCertIssuer, InMemoryBoringMitmCertIssuer};
+use rama::tls::client::ServerVerifyMode;
+use rama::tls::server::InputWithClientHello;
+use rama::{Service, crypto};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+#[cfg(test)]
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
-use hodor_config::grants::{Grant, HostPat, ResolvedConfig, Scheme, https_eligible, intercept_candidate};
-use hodor_pki::ca::{CertAuthority, CertCache, DomainCert};
+use hodor_config::grants::{ResolvedConfig, Scheme, intercept_candidate};
+use hodor_pki::ca::CertAuthority;
 
-use crate::substitute::{AnyMachine, H2Machine, SecretsMachine};
-use crate::substitute::{Direction, H2_PREFACE};
+use crate::policy::{MintBucket, Route, decide, peek_stream};
+use crate::substitute::{AnyMachine, Direction, H2_PREFACE, H2Machine, SecretsMachine};
 
+mod policy;
 mod substitute;
 
 mod relay;
-mod sniff;
 
 pub(crate) use relay::relay_guarded;
-pub(crate) use sniff::{Sniffed, sniff_stream};
 
 const MAX_HEAD: usize = 64 * 1024;
-const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+pub(crate) const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
-/// Shared proxy state: live config snapshot, CA, and leaf-cert cache.
+/// Shared proxy state: live config snapshot, boring MITM relay, and the
+/// issuance burst guard.
 ///
 /// Config is write-once (no reload path), so a plain `Arc` — no lock, no
-/// swap. The cert cache is a lock-free map; key generation stays on the
-/// caller, never under a lock, so connections never block each other on it.
+/// swap. Leaf issuance runs inside the boring relay's cached issuer, and the
+/// [`MintBucket`] bounds remote-triggered issuance per MITM arm entry.
 pub struct ProxyState {
   config: Arc<ResolvedConfig>,
-  ca: Arc<CertAuthority>,
-  certs: CertCache,
-  connector: TlsConnector,
+  relay: TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>,
+  mint: MintBucket,
   fwmark: Option<u32>,
 }
 
@@ -47,41 +65,37 @@ impl std::fmt::Debug for ProxyState {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("ProxyState")
       .field("config", &self.config)
-      .field("certs", &self.certs)
       .field("fwmark", &self.fwmark)
       .finish_non_exhaustive()
   }
 }
 
 impl ProxyState {
-  /// Build state from resolved config and the CA. Leaf certs for exact
-  /// grant hosts — plus one wildcard leaf per `*.`-grant — are generated
-  /// up front, so steady-state connections never pay keygen. `Any` hosts
-  /// are unbounded and stay on on-demand generation.
-  #[must_use]
-  pub fn new(resolved: ResolvedConfig, ca: CertAuthority) -> Self {
-    let connector = ca.connector();
-    let ca = Arc::new(ca);
-    let certs = CertCache::new();
-    for host in exact_hosts(&resolved.grants) {
-      match ca.generate_domain_cert(host) {
-        Ok(fresh) => certs.insert(host, Arc::new(fresh)),
-        Err(err) => tracing::warn!(%host, "pre-generated leaf failed, on-demand fallback: {err}"),
-      }
-    }
-    for pattern in wildcard_hosts(&resolved.grants) {
-      match ca.generate_domain_cert(pattern) {
-        Ok(fresh) => certs.insert(pattern, Arc::new(fresh)),
-        Err(err) => tracing::warn!(%pattern, "pre-generated wildcard leaf failed, on-demand fallback: {err}"),
-      }
-    }
-    Self {
+  /// Build state from resolved config and the CA. The boring pair comes from
+  /// [`CertAuthority::boring_pair`]; egress trust is the system natives plus
+  /// the hodor CA itself, so loopback stubs presenting hodor-signed certs
+  /// verify on the production path. Verification is always on: this proxy
+  /// swaps real secrets upstream, so a network attacker with an untrusted
+  /// cert must fail closed.
+  /// # Errors
+  ///
+  /// Returns an error when the CA pair fails to convert to boring types, or
+  /// when the egress trust policy rejects the hodor CA anchor.
+  pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> eyre::Result<Self> {
+    let (crt, key) = ca.boring_pair()?;
+    let anchor = crypto::pki_types::CertificateDer::from(ca.cert_der().to_vec());
+    let egress = TlsMitmEgressServerAuth::new()
+      .with_server_verify(ServerVerifyMode::Auto)
+      .with_webpki_roots()
+      .try_with_extra_server_trust_anchors([anchor])
+      .map_err(|err| eyre::eyre!("egress trust anchors: {err}"))?;
+    let relay = TlsMitmRelay::new_cached_in_memory(crt, key).with_egress_server_auth(egress);
+    Ok(Self {
       config: Arc::new(resolved),
-      ca,
-      certs,
-      connector,
+      relay,
+      mint: MintBucket::new(),
       fwmark: None,
-    }
+    })
   }
 
   #[cfg(target_os = "linux")]
@@ -104,116 +118,189 @@ impl ProxyState {
   pub fn fwmark(&self) -> Option<u32> {
     self.fwmark
   }
+}
 
-  /// Leaf cert for `domain`: exact hit first, then the wildcard leaf when a
-  /// `*.`-grant covers it, else mint per-domain (`Any` hosts land here).
-  /// Expired entries rotate lazily via the cache. Concurrent misses for one
-  /// domain may generate twice; last store wins, both valid.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when an on-demand leaf cannot be generated, or when the
-  /// per-connection mint budget is exhausted.
-  pub async fn leaf_cert(&self, domain: &str) -> eyre::Result<Arc<DomainCert>> {
-    if let Some(hit) = self.certs.get(domain) {
-      return Ok(hit);
+/// Guest-side adapter: any tokio stream plus a rama extension map. The relay
+/// reads the [`ConnectorTarget`] identity from these extensions to derive
+/// egress SNI and verification identity.
+struct GuestIo<S> {
+  inner: S,
+  extensions: Extensions,
+}
+
+impl<S> GuestIo<S> {
+  fn with_target(inner: S, identity: &str, port: u16) -> eyre::Result<Self> {
+    let host: Host = identity.parse().map_err(|err| eyre::eyre!("bad MITM identity {identity}: {err}"))?;
+    let extensions = Extensions::new();
+    extensions.insert(ConnectorTarget(HostWithPort::new(host, port)));
+    Ok(Self { inner, extensions })
+  }
+
+  fn bare(inner: S) -> Self {
+    Self {
+      inner,
+      extensions: Extensions::new(),
     }
-    if let Some(pattern) = wildcard_covering(&self.config.grants, domain) {
-      if let Some(hit) = self.certs.get(&pattern) {
-        return Ok(hit);
-      }
-      if !self.certs.mint_allowed() {
-        eyre::bail!("leaf mint rate limit exceeded for {pattern}");
-      }
-      let ca = Arc::clone(&self.ca);
-      let pattern_owned = pattern.clone();
-      let joined = tokio::task::spawn_blocking({
-        let pattern = pattern_owned.clone();
-        move || ca.generate_domain_cert(&pattern)
-      })
-      .await
-      .map_err(|err| eyre::eyre!("leaf mint task: {err}"))?;
-      let fresh = Arc::new(joined?);
-      self.certs.insert_minted(&pattern_owned, Arc::clone(&fresh));
-      return Ok(fresh);
-    }
-    if !self.certs.mint_allowed() {
-      eyre::bail!("leaf mint rate limit exceeded for {domain}");
-    }
-    let ca = Arc::clone(&self.ca);
-    let domain_owned = domain.to_string();
-    let joined = tokio::task::spawn_blocking({
-      let domain = domain_owned.clone();
-      move || ca.generate_domain_cert(&domain)
-    })
-    .await
-    .map_err(|err| eyre::eyre!("leaf mint task: {err}"))?;
-    let fresh = Arc::new(joined?);
-    self.certs.insert_minted(&domain_owned, Arc::clone(&fresh));
-    Ok(fresh)
   }
 }
 
-/// Exact hostnames across all grants, deduplicated. `Any` hosts stay on
-/// on-demand generation; wildcards are covered by [`wildcard_hosts`].
-fn exact_hosts(grants: &[Grant]) -> Vec<&str> {
-  let mut hosts: Vec<&str> = grants
-    .iter()
-    .flat_map(|grant| grant.allow.iter())
-    .filter_map(|uri| match &uri.host {
-      HostPat::Exact(host) => Some(host.as_str()),
-      _ => None,
-    })
-    .collect();
-  hosts.sort_unstable();
-  hosts.dedup();
-  hosts
+impl<S: AsyncRead + Unpin> AsyncRead for GuestIo<S> {
+  fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.inner).poll_read(cx, buf)
+  }
 }
 
-/// Deduplicated `*.`-patterns across all grants (e.g. `*.example.com`).
-/// One leaf per pattern covers every subdomain, so wildcard subdomains
-/// never pay per-host keygen.
-fn wildcard_hosts(grants: &[Grant]) -> Vec<&str> {
-  let mut hosts: Vec<&str> = grants
-    .iter()
-    .flat_map(|grant| grant.allow.iter())
-    .filter_map(|uri| match &uri.host {
-      HostPat::Wildcard(pattern) => Some(pattern.as_str()),
-      _ => None,
-    })
-    .collect();
-  hosts.sort_unstable();
-  hosts.dedup();
-  hosts
+impl<S: AsyncWrite + Unpin> AsyncWrite for GuestIo<S> {
+  fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    Pin::new(&mut self.inner).poll_write(cx, buf)
+  }
+
+  fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.inner).poll_flush(cx)
+  }
+
+  fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.inner).poll_shutdown(cx)
+  }
+}
+impl<S> ExtensionsRef for GuestIo<S> {
+  fn extensions(&self) -> &Extensions {
+    &self.extensions
+  }
 }
 
-/// First `*.`-pattern covering `domain`, if any. Grant order wins on
-/// overlap; grants derive from a `BTreeMap`, so the order is deterministic.
-fn wildcard_covering(grants: &[Grant], domain: &str) -> Option<String> {
-  grants.iter().flat_map(|grant| grant.allow.iter()).find_map(|uri| match &uri.host {
-    HostPat::Wildcard(pattern) if uri.host.matches(domain) => Some(pattern.clone()),
-    _ => None,
-  })
+/// Byte-pump service: the relay hands paired TLS streams here, and the
+/// substitution machines pump them once plaintext detection has picked the
+/// HTTP, H2, or raw arm. Decoded-request middleware is deliberately not used:
+/// a `Request<Body>` round-trips through the HTTP codec and would break the
+/// byte-identical guarantee the verbatim tests pin.
+#[derive(Debug, Clone)]
+struct PumpService {
+  snapshot: Arc<ResolvedConfig>,
+  identity: String,
+  port: u16,
+}
+impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for PumpService
+where
+  GI: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+  GE: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+  type Output = ();
+  type Error = BoxError;
+
+  async fn serve(&self, input: BridgeIo<TlsStream<GI>, TlsStream<GE>>) -> Result<Self::Output, Self::Error> {
+    let BridgeIo(mut guest_tls, mut server_tls) = input;
+    let (peeked, mode) = peek_mode(&mut guest_tls).await.map_err(|err| into_box_error(&err))?;
+    let (mut req, mut resp): (AnyMachine, AnyMachine) = match mode {
+      PlainMode::Http => (
+        AnyMachine::Http1(SecretsMachine::new(
+          &self.snapshot.grants,
+          Scheme::Https,
+          &self.identity,
+          self.port,
+          Direction::Request,
+        )),
+        AnyMachine::Http1(SecretsMachine::new(
+          &self.snapshot.grants,
+          Scheme::Https,
+          &self.identity,
+          self.port,
+          Direction::Response,
+        )),
+      ),
+      PlainMode::Raw => (
+        AnyMachine::Http1(SecretsMachine::new_raw_tls(
+          &self.snapshot.grants,
+          &self.identity,
+          self.port,
+          Direction::Request,
+        )),
+        AnyMachine::Http1(SecretsMachine::new_raw_tls(
+          &self.snapshot.grants,
+          &self.identity,
+          self.port,
+          Direction::Response,
+        )),
+      ),
+      PlainMode::H2 => (
+        AnyMachine::H2(H2Machine::new(
+          &self.snapshot.grants,
+          Scheme::Https,
+          &self.identity,
+          self.port,
+          Direction::Request,
+          true,
+        )),
+        AnyMachine::H2(H2Machine::new(
+          &self.snapshot.grants,
+          Scheme::Https,
+          &self.identity,
+          self.port,
+          Direction::Response,
+          false,
+        )),
+      ),
+    };
+    relay_guarded(&mut guest_tls, &mut server_tls, &mut req, &mut resp, &peeked)
+      .await
+      .map_err(|err| into_box_error(&err))
+  }
 }
 
-/// Accept connections forever; returns only when the listener fails.
+/// Box an eyre report for a rama service error, preserving its debug chain.
+fn into_box_error(err: &eyre::Report) -> BoxError {
+  BoxError::from(format!("{err:?}"))
+}
+/// Serve the explicit listener until its executor shuts down. Accept errors
+/// are logged by the listener loop and never end the process.
+pub async fn serve(listener: RamaTcpListener, state: Arc<ProxyState>) {
+  listener.serve(ExplicitService { state }).await;
+}
+
+/// Bind the explicit listener with rama socket options: plain TCP socket for
+/// the configured address, bound and listening, ready to serve. Backlog
+/// matches `std` (128).
 ///
 /// # Errors
 ///
-/// Returns an error when accepting from `listener` fails.
-pub async fn serve(listener: TcpListener, state: Arc<ProxyState>) -> eyre::Result<()> {
-  loop {
-    let (stream, peer) = listener.accept().await?;
-    let state = Arc::clone(&state);
-    tokio::spawn(async move {
-      if let Err(err) = handle_conn(stream, &state).await {
-        tracing::debug!(%peer, ?err, "connection failed");
-      }
-    });
+/// Returns an error when the socket cannot be built, bound, or marked
+/// listening.
+pub async fn bind_explicit(addr: SocketAddr) -> eyre::Result<RamaTcpListener> {
+  let domain = if addr.is_ipv4() { Domain::IPv4 } else { Domain::IPv6 };
+  let socket = SocketOptions {
+    address: Some(SocketAddress::from(addr)),
+    ..SocketOptions::default_tcp()
+  }
+  .try_build_socket(domain)
+  .map_err(|err| eyre::eyre!("explicit listen socket: {err}"))?;
+  socket.listen(128).map_err(|err| eyre::eyre!("explicit listen: {err}"))?;
+  RamaTcpListener::bind_socket(socket, Executor::default())
+    .await
+    .map_err(|err| eyre::eyre!("explicit bind: {err}"))
+}
+
+/// Explicit ingress service: HTTP head dispatch (CONNECT vs forward).
+/// Per-connection failures close quietly with a debug log.
+#[derive(Debug, Clone)]
+struct ExplicitService {
+  state: Arc<ProxyState>,
+}
+
+impl Service<RamaTcpStream> for ExplicitService {
+  type Output = ();
+  type Error = std::convert::Infallible;
+
+  async fn serve(&self, input: RamaTcpStream) -> Result<Self::Output, Self::Error> {
+    let client = input.stream;
+    let peer = client.peer_addr().ok();
+    if let Err(err) = dispatch(client, &self.state).await {
+      tracing::debug!(?peer, ?err, "connection failed");
+    }
+    Ok(())
   }
 }
 
-async fn handle_conn(mut client: TcpStream, state: &ProxyState) -> eyre::Result<()> {
+async fn dispatch(mut client: TcpStream, state: &ProxyState) -> eyre::Result<()> {
   let snapshot = state.snapshot();
   let head = read_head(&mut client).await?;
   let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -226,72 +313,84 @@ async fn handle_conn(mut client: TcpStream, state: &ProxyState) -> eyre::Result<
     return Ok(()); // malformed request line: close, no response
   };
   if method.eq_ignore_ascii_case("connect") {
-    handle_connect(client, target, state, &snapshot, &head).await
-  } else {
-    handle_forward(client, &head, target, state, &snapshot).await
-  }
-}
-
-async fn handle_connect(
-  mut client: TcpStream,
-  target: &str,
-  state: &ProxyState,
-  snapshot: &ResolvedConfig,
-  head: &[u8],
-) -> eyre::Result<()> {
-  let Some((host, port)) = parse_authority(target, None) else {
-    return Ok(());
-  };
-  let tail = head_tail(head);
-  if !intercept_candidate(&snapshot.grants, &host, port) {
-    let mut upstream = dial_marked(&host, port, state.fwmark).await?;
-    client.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
-    // Client bytes already read past the head (pipelined payloads) must not
-    // be dropped: replay them upstream before splicing.
-    if !tail.is_empty() {
-      upstream.write_all(tail).await?;
+    let Some((host, port)) = parse_authority(target, None) else {
+      return Ok(());
+    };
+    let tail = head_tail(&head).to_vec();
+    if !intercept_candidate(&snapshot.grants, &host, port) {
+      let mut upstream = dial_marked(&host, port, state.fwmark).await?;
+      client.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
+      // Client bytes already read past the head (pipelined payloads) must not
+      // be dropped: replay them upstream before splicing.
+      if !tail.is_empty() {
+        upstream.write_all(&tail).await?;
+      }
+      tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+      return Ok(());
     }
-    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
-    return Ok(());
+    client.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
+    serve_connect_stream(client, state, &snapshot, &host, port, &tail).await
+  } else {
+    forward_arm(client, &head, target, state, &snapshot).await
   }
-  client.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
-  serve_candidate_stream(client, state, snapshot, &host, port, Some(&host), &host, tail).await
 }
 /// Bytes after the HTTP head boundary, if any (pipelined client data).
 fn head_tail(head: &[u8]) -> &[u8] {
   head.windows(4).position(|w| w == b"\r\n\r\n").map_or(&[], |pos| &head[pos + 4..])
 }
 
-/// Host header of a complete HTTP request head, port-defaulted to the
-/// dialed port. None when the buffer is not a complete request head or the
-/// header is missing/unparseable.
-fn http_head_host(buf: &[u8], default_port: u16) -> Option<(String, u16)> {
-  let mut headers = [httparse::EMPTY_HEADER; 64];
-  let mut req = httparse::Request::new(&mut headers);
-  let status = req.parse(buf).ok()?;
-  if !status.is_complete() {
-    return None;
-  }
-  let host = req.headers.iter().find(|h| h.name.eq_ignore_ascii_case("host"))?;
-  let value = std::str::from_utf8(host.value).ok()?;
-  parse_authority(value, Some(default_port))
-}
-
-/// Serve a candidate stream (post-200 CONNECT, or TUN TCP): sniff TLS vs
-/// plain TCP, then MITM / splice-with-replay / raw-machines as appropriate.
-/// `enforce_host`: SNI must equal it (CONNECT authority); None → the SNI
-/// itself is the identity (TUN). `dial_host` is the upstream TCP target,
-/// `raw_host` the hostname for tcp:// grant matching.
+/// Serve a post-200 CONNECT stream: peek TLS vs plain, route through the
+/// policy table with the CONNECT authority enforced as SNI identity, then
+/// MITM / splice / machines as appropriate. `initial` replays pipelined
+/// bytes read past the CONNECT head.
 ///
 /// # Errors
 ///
-/// Returns an error when sniffing fails, when the SNI does not match
-/// `enforce_host`, or when the upstream dial fails.
+/// Returns an error when peeking fails, or when the upstream dial fails.
+/// SNI mismatch and empty input close quietly (`Ok(())`), never errors.
+pub async fn serve_connect_stream<G>(
+  guest: G,
+  state: &ProxyState,
+  snapshot: &ResolvedConfig,
+  host: &str,
+  port: u16,
+  initial: &[u8],
+) -> eyre::Result<()>
+where
+  G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+  drive_candidate_stream(guest, state, snapshot, host, port, Some(host), host, initial).await
+}
+
+/// Serve a transparently captured stream (TUN/TPROXY/eBPF leg): peek TLS vs
+/// plain, route through the policy table with the SNI itself as identity,
+/// then MITM / splice / machines as appropriate. `dial_host` is the upstream
+/// TCP target, `raw_host` the hostname for tcp:// grant matching.
+///
+/// # Errors
+///
+/// Returns an error when peeking fails, or when the upstream dial fails.
+/// Empty input closes quietly (`Ok(())`), never errors.
+pub async fn serve_transparent_stream<G>(
+  guest: G,
+  state: &ProxyState,
+  snapshot: &ResolvedConfig,
+  dial_host: &str,
+  port: u16,
+  raw_host: &str,
+) -> eyre::Result<()>
+where
+  G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+  drive_candidate_stream(guest, state, snapshot, dial_host, port, None, raw_host, &[]).await
+}
+
+/// Shared candidate core behind the two entries above.
 #[expect(
   clippy::too_many_arguments,
   reason = "connection gating context: stream, state, targets, identity hint, replay buffer"
 )]
-pub async fn serve_candidate_stream<G>(
+async fn drive_candidate_stream<G>(
   mut guest: G,
   state: &ProxyState,
   snapshot: &ResolvedConfig,
@@ -302,158 +401,71 @@ pub async fn serve_candidate_stream<G>(
   initial: &[u8],
 ) -> eyre::Result<()>
 where
-  G: AsyncRead + AsyncWrite + Unpin,
+  G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-  let Some(sniffed) = sniff_stream(&mut guest, initial).await? else {
+  let Some(peeked) = peek_stream(&mut guest, initial).await? else {
     return Ok(());
   };
-  match sniffed {
-    Sniffed::RawTcp { buf } => {
+  let Some(route) = decide(snapshot, port, enforce_host, peeked) else {
+    return Ok(());
+  };
+  match route {
+    Route::Splice { buf } => {
+      let mut upstream = dial_marked(dial_host, port, state.fwmark).await?;
+      upstream.write_all(&buf).await?;
+      tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
+      Ok(())
+    }
+    Route::RawTcpMachines { buf } => {
       let upstream = dial_marked(dial_host, port, state.fwmark).await?;
-      // Transparent plain HTTP: the Host header is the http:// grant
-      // identity (TUN destination is an IP, no hostname). Non-HTTP bytes
-      // stay on tcp:// raw machines.
-      if let Some((host, hport)) = http_head_host(&buf, port)
-        && snapshot.grants.iter().any(|grant| grant.matches(Scheme::Http, &host, hport))
-      {
-        let mut req = AnyMachine::Http1(SecretsMachine::new(
-          &snapshot.grants,
-          Scheme::Http,
-          &host,
-          hport,
-          Direction::Request,
-        ));
-        let mut resp = AnyMachine::Http1(SecretsMachine::new(
-          &snapshot.grants,
-          Scheme::Http,
-          &host,
-          hport,
-          Direction::Response,
-        ));
-        relay_guarded(guest, upstream, &mut req, &mut resp, &buf).await
-      } else {
-        let mut req = AnyMachine::Http1(SecretsMachine::new_raw(&snapshot.grants, raw_host, port, Direction::Request));
-        let mut resp = AnyMachine::Http1(SecretsMachine::new_raw(&snapshot.grants, raw_host, port, Direction::Response));
-        relay_guarded(guest, upstream, &mut req, &mut resp, &buf).await
-      }
+      let mut req = AnyMachine::Http1(SecretsMachine::new_raw(&snapshot.grants, raw_host, port, Direction::Request));
+      let mut resp = AnyMachine::Http1(SecretsMachine::new_raw(&snapshot.grants, raw_host, port, Direction::Response));
+      relay_guarded(guest, upstream, &mut req, &mut resp, &buf).await
     }
-    Sniffed::Tls { buf, sni } => {
-      if let Some(authority) = enforce_host
-        && !sni.eq_ignore_ascii_case(authority)
-      {
-        tracing::debug!(authority, sni, "CONNECT authority differs from SNI; closing");
-        return Ok(());
+    Route::PlainHttpMachines { host, port: hport, buf } => {
+      let upstream = dial_marked(dial_host, port, state.fwmark).await?;
+      let mut req = AnyMachine::Http1(SecretsMachine::new(
+        &snapshot.grants,
+        Scheme::Http,
+        &host,
+        hport,
+        Direction::Request,
+      ));
+      let mut resp = AnyMachine::Http1(SecretsMachine::new(
+        &snapshot.grants,
+        Scheme::Http,
+        &host,
+        hport,
+        Direction::Response,
+      ));
+      relay_guarded(guest, upstream, &mut req, &mut resp, &buf).await
+    }
+    Route::MitmTls { identity, buf, hello } => {
+      if !state.mint.allow() {
+        eyre::bail!("MITM issuance burst exceeded for {identity}");
       }
-      let identity: &str = match enforce_host {
-        Some(authority) => authority,
-        None => &sni,
+      state.mint.record();
+      let upstream = dial_marked(dial_host, port, state.fwmark).await?;
+      let guest_io = GuestIo::with_target(Prefixed::new(buf, guest), &identity, port)?;
+      let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
+      let pump = PumpService {
+        snapshot: state.snapshot(),
+        identity,
+        port,
       };
-      if !intercept_candidate(&snapshot.grants, identity, port) || !https_eligible(&snapshot.grants, identity, port) {
-        // No grant match, or only a non-HTTPS (e.g. tcp://) grant on this
-        // port: splice the raw bytes instead of terminating TLS with no
-        // substitution to perform.
-        let mut upstream = dial_marked(dial_host, port, state.fwmark).await?;
-        upstream.write_all(&buf).await?;
-        tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
-        return Ok(());
-      }
-      mitm_tls_stream(guest, buf, identity, dial_host, port, state, snapshot).await
-    }
-    Sniffed::TlsNoSni { buf } => {
-      // No SNI: CONNECT path still knows the authority, so MITM with it;
-      // TUN path has no identity to mint for, so splice with replay.
-      if let Some(authority) = enforce_host {
-        if !intercept_candidate(&snapshot.grants, authority, port) || !https_eligible(&snapshot.grants, authority, port) {
-          let mut upstream = dial_marked(dial_host, port, state.fwmark).await?;
-          upstream.write_all(&buf).await?;
-          tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
-          return Ok(());
-        }
-        mitm_tls_stream(guest, buf, authority, dial_host, port, state, snapshot).await
-      } else {
-        let mut upstream = dial_marked(dial_host, port, state.fwmark).await?;
-        upstream.write_all(&buf).await?;
-        tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
-        Ok(())
+      let relay = TlsMitmRelayService::new(state.relay.clone(), pump);
+      match hello {
+        Some(hello) => relay
+          .serve(InputWithClientHello {
+            input: bridge,
+            client_hello: hello,
+          })
+          .await
+          .map_err(|err| eyre::eyre!("MITM relay: {err}")),
+        None => relay.serve(bridge).await.map_err(|err| eyre::eyre!("MITM relay: {err}")),
       }
     }
   }
-}
-
-/// Terminate guest TLS (`ClientHello` in `initial`), re-encrypt to
-/// (`dial_host`, `port`) as `tls_host`, relay through machines.
-async fn mitm_tls_stream<G>(
-  guest: G,
-  initial: Vec<u8>,
-  tls_host: &str,
-  dial_host: &str,
-  port: u16,
-  state: &ProxyState,
-  snapshot: &ResolvedConfig,
-) -> eyre::Result<()>
-where
-  G: AsyncRead + AsyncWrite + Unpin,
-{
-  let leaf = state.leaf_cert(tls_host).await?;
-  let acceptor = TlsAcceptor::from(Arc::clone(&leaf.server_config));
-  let prefixed = Prefixed::new(initial, guest);
-  let mut guest_tls = tokio::time::timeout(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS), acceptor.accept(prefixed))
-    .await
-    .map_err(|_elapsed| eyre::eyre!("guest TLS handshake timed out"))?
-    .map_err(|err| eyre::eyre!("guest TLS handshake: {err}"))?;
-
-  let upstream = dial_marked(dial_host, port, state.fwmark).await?;
-  let server_name = ServerName::try_from(tls_host.to_string()).map_err(|err| eyre::eyre!("bad SNI: {err}"))?;
-  let server_tls = tokio::time::timeout(
-    std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-    state.connector.connect(server_name, upstream),
-  )
-  .await
-  .map_err(|_elapsed| eyre::eyre!("upstream TLS handshake timed out"))?
-  .map_err(|err| eyre::eyre!("upstream TLS handshake: {err}"))?;
-
-  let (peeked, mode) = peek_mode(&mut guest_tls).await?;
-  let (mut req, mut resp): (AnyMachine, AnyMachine) = match mode {
-    PlainMode::Http => (
-      AnyMachine::Http1(SecretsMachine::new(
-        &snapshot.grants,
-        Scheme::Https,
-        tls_host,
-        port,
-        Direction::Request,
-      )),
-      AnyMachine::Http1(SecretsMachine::new(
-        &snapshot.grants,
-        Scheme::Https,
-        tls_host,
-        port,
-        Direction::Response,
-      )),
-    ),
-    PlainMode::Raw => (
-      AnyMachine::Http1(SecretsMachine::new_raw_tls(&snapshot.grants, tls_host, port, Direction::Request)),
-      AnyMachine::Http1(SecretsMachine::new_raw_tls(&snapshot.grants, tls_host, port, Direction::Response)),
-    ),
-    PlainMode::H2 => (
-      AnyMachine::H2(H2Machine::new(
-        &snapshot.grants,
-        Scheme::Https,
-        tls_host,
-        port,
-        Direction::Request,
-        true,
-      )),
-      AnyMachine::H2(H2Machine::new(
-        &snapshot.grants,
-        Scheme::Https,
-        tls_host,
-        port,
-        Direction::Response,
-        false,
-      )),
-    ),
-  };
-  relay_guarded(guest_tls, server_tls, &mut req, &mut resp, &peeked).await
 }
 
 /// Dial upstream, applying the fwmark when set (TUN self-exclusion).
@@ -491,31 +503,15 @@ pub async fn dial_marked(host: &str, port: u16, fwmark: Option<u32>) -> std::io:
 }
 
 async fn dial_one(addr: SocketAddr, fwmark: Option<u32>) -> std::io::Result<TcpStream> {
-  let Some(mark) = fwmark else {
+  if fwmark.is_none() {
     return TcpStream::connect(addr).await;
-  };
-  let domain = if addr.is_ipv4() {
-    socket2::Domain::IPV4
-  } else {
-    socket2::Domain::IPV6
-  };
-  let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-  socket.set_mark(mark)?;
-  socket.set_nonblocking(true)?;
-  match socket.connect(&addr.into()) {
-    Ok(()) => {}
-    // In-flight nonblocking connect: WouldBlock (Windows/some Unixes) or
-    // EINPROGRESS (Linux 115, macOS/BSD 36). `ErrorKind::InProgress` is
-    // still unstable, so match the raw errno.
-    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || matches!(err.raw_os_error(), Some(115 | 36)) => {}
-    Err(err) => return Err(err),
   }
-  let stream = TcpStream::from_std(socket.into())?;
-  stream.writable().await?;
-  if let Some(err) = stream.take_error()? {
-    return Err(err);
-  }
-  Ok(stream)
+  let opts = Arc::new(SocketOptions {
+    mark: fwmark,
+    ..SocketOptions::default_tcp()
+  });
+  // The mark lives on the fd, so the tokio stream unwraps losslessly.
+  opts.connect(addr).await.map(|stream| stream.stream).map_err(std::io::Error::other)
 }
 
 /// Plaintext protocol detected from the first client bytes.
@@ -595,13 +591,7 @@ fn decide_partial(peeked: Vec<u8>) -> (Vec<u8>, PlainMode) {
   }
 }
 
-async fn handle_forward(
-  mut client: TcpStream,
-  head: &[u8],
-  target: &str,
-  state: &ProxyState,
-  snapshot: &ResolvedConfig,
-) -> eyre::Result<()> {
+async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &ProxyState, snapshot: &ResolvedConfig) -> eyre::Result<()> {
   let remainder = target.get(..7).filter(|p| p.eq_ignore_ascii_case("http://")).map(|_| &target[7..]);
   let Some(remainder) = remainder else {
     return Ok(()); // origin-form / unknown scheme: close
@@ -727,8 +717,10 @@ mod tests {
   use super::*;
   use std::time::Duration;
 
-  use hodor_config::grants::UriGrant;
+  use hodor_config::grants::{Grant, UriGrant};
   use hodor_pki::ca::install_crypto_provider;
+  use rustls::pki_types::ServerName;
+  use tokio_rustls::{TlsAcceptor, TlsConnector};
 
   #[test]
   fn parse_authority_bracketed_v6_default_port() {
@@ -745,28 +737,31 @@ mod tests {
     assert_eq!(parse_authority("user@example.com:80", None), None);
   }
   fn test_state() -> Arc<ProxyState> {
-    test_state_with(Vec::new(), CertAuthority::generate().unwrap())
+    test_state_with(Vec::new(), &CertAuthority::generate().unwrap())
   }
 
-  fn test_state_with(grants: Vec<Grant>, ca: CertAuthority) -> Arc<ProxyState> {
+  fn test_state_with(grants: Vec<Grant>, ca: &CertAuthority) -> Arc<ProxyState> {
     install_crypto_provider();
-    Arc::new(ProxyState::new(
-      ResolvedConfig {
-        proxy: hodor_config::config::ProxyCfg {
-          listen: "127.0.0.1:0".parse().unwrap(),
-          ca_file: None,
+    Arc::new(
+      ProxyState::new(
+        ResolvedConfig {
+          proxy: hodor_config::config::ProxyCfg {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ca_file: None,
+          },
+          grants,
         },
-        grants,
-      },
-      ca,
-    ))
+        ca,
+      )
+      .unwrap(),
+    )
   }
 
   async fn run_proxy_with(state: Arc<ProxyState>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = local_addr(&listener);
+    let listener = bind_explicit("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
-      let _ = serve(listener, state).await;
+      serve(listener, state).await;
     });
     (addr, handle)
   }
@@ -812,7 +807,7 @@ mod tests {
     let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_port = local_addr(&stub).port();
     let grants = make_grants(stub_port);
-    let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, ca)).await;
+    let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca_der).unwrap();
     let client_config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
@@ -1090,25 +1085,40 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn wildcard_grant_shares_one_leaf_across_subdomains() {
-    install_crypto_provider();
-    let ca = CertAuthority::generate().unwrap();
-    let grants = vec![Grant {
-      label: "t".into(),
-      fake: "fake".into(),
-      value: secrecy::SecretString::from("value"),
-      allow: vec![UriGrant {
-        scheme: Scheme::Https,
-        host: "*.example.com".parse().unwrap(),
-        port: 443,
-      }],
-    }];
-    let state = test_state_with(grants, ca);
-    let a = state.leaf_cert("a.example.com").await.unwrap();
-    let b = state.leaf_cert("other.example.com").await.unwrap();
-    assert!(Arc::ptr_eq(&a, &b));
+  async fn connect_authority_sni_mismatch_closes_without_dial() {
+    let fx = mitm_fixture(|port| localhost_grant(port, "fake", "value")).await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      connector,
+      ..
+    } = fx;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+      .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    let mut head = vec![0u8; 19];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+    // Authority says localhost, SNI says otherwise: the relay must close
+    // quietly instead of minting, so the handshake fails on EOF.
+    let server_name = ServerName::try_from("other.test".to_string()).unwrap();
+    let handshake = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, client)).await;
+    let failed = match handshake {
+      Err(_) | Ok(Err(_)) => true,
+      Ok(Ok(_)) => false,
+    };
+    assert!(failed, "mismatched SNI must not complete a handshake");
+    // No upstream dial happened: the stub accept still hangs.
+    tokio::time::timeout(Duration::from_secs(2), stub.accept()).await.unwrap_err();
+    proxy.abort();
   }
-
   #[tokio::test]
   async fn non_candidate_splices_bytes_verbatim() {
     let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1332,7 +1342,7 @@ mod tests {
         port: stub_port,
       }],
     }];
-    let state = test_state_with(grants, ca);
+    let state = test_state_with(grants, &ca);
     let snapshot = state.snapshot();
     let stub_task = tokio::spawn(async move {
       let (mut conn, _) = stub.accept().await.unwrap();
@@ -1349,7 +1359,7 @@ mod tests {
     let serve = tokio::spawn({
       let state = Arc::clone(&state);
       let snapshot = Arc::clone(&snapshot);
-      async move { serve_candidate_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, None, "127.0.0.1", &[]).await }
+      async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await }
     });
     client_end
       .write_all(
@@ -1388,7 +1398,7 @@ mod tests {
         port: stub_port,
       }],
     }];
-    let state = test_state_with(grants, ca);
+    let state = test_state_with(grants, &ca);
     let snapshot = state.snapshot();
     let stub_task = tokio::spawn(async move {
       let (conn, _) = stub.accept().await.unwrap();
@@ -1407,7 +1417,7 @@ mod tests {
       let state = Arc::clone(&state);
       let snapshot = Arc::clone(&snapshot);
       // TUN shape: dial target is an address, the SNI alone is the identity.
-      async move { serve_candidate_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, None, "127.0.0.1", &[]).await }
+      async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await }
     });
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca_der).unwrap();

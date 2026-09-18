@@ -25,7 +25,7 @@ use crate::route::{RoutePlan, TABLE_MAIN, Undo};
 use crate::route::{add_route, add_rule, capture_routes, capture_rules, capture_undos, link_index, netlink};
 use crate::tracker::{NewTcpConn, TaskMsg, TcpTracker};
 use crate::udp::{MAX_UDP_SESSIONS, UdpKey, udp_session_task, upstream_dns};
-use hodor_proxy::{ProxyState, serve_candidate_stream};
+use hodor_proxy::{ProxyState, serve_transparent_stream};
 
 /// `SO_MARK` for our own upstream sockets: policy routing sends marked
 /// packets via the real gateway so they never loop back into TUN.
@@ -230,7 +230,7 @@ async fn tun_conn_task(conn: NewTcpConn, upstream_override: Option<SocketAddr>, 
   let port = dst.port();
   let abort_tx = conn.to_guest.clone();
   let guest = ChanStream::new(conn.from_guest, conn.to_guest);
-  let result = serve_candidate_stream(guest, &state, &snapshot, &dial_host, port, None, &dial_host, &[]).await;
+  let result = serve_transparent_stream(guest, &state, &snapshot, &dial_host, port, &dial_host).await;
   if result.is_err() {
     // Dial/TLS failure: RST so the guest fails fast instead of hanging.
     let _ = abort_tx.send(TaskMsg::Abort).await;
@@ -278,8 +278,9 @@ mod tests {
         },
         grants,
       },
-      ca,
-    );
+      &ca,
+    )
+    .unwrap();
     Arc::new(match fwmark {
       Some(mark) => base.with_fwmark(mark),
       None => base,
@@ -379,8 +380,9 @@ mod tests {
           },
           grants,
         },
-        ca,
+        &ca,
       )
+      .unwrap()
       .with_fwmark(FWMARK),
     );
 

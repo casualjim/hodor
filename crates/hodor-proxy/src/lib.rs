@@ -29,11 +29,11 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Re
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
+use crate::policy::{MintBucket, Route, decide, peek_stream};
+use crate::substitute::{AnyMachine, Direction, H2_PREFACE, H2Machine, MachineMode, MachineParams, SecretsMachine};
 use hodor_config::grants::{ResolvedConfig, Scheme, intercept_candidate};
 use hodor_pki::ca::CertAuthority;
-
-use crate::policy::{MintBucket, Route, decide, peek_stream};
-use crate::substitute::{AnyMachine, Direction, H2_PREFACE, H2Machine, SecretsMachine};
+use hodor_plugin::Direction as HookDirection;
 
 mod policy;
 mod substitute;
@@ -56,6 +56,7 @@ pub struct ProxyState {
   relay: TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>,
   mint: MintBucket,
   fwmark: Option<u32>,
+  plugins: Arc<hodor_plugin::Registry>,
 }
 
 impl std::fmt::Debug for ProxyState {
@@ -66,6 +67,7 @@ impl std::fmt::Debug for ProxyState {
     f.debug_struct("ProxyState")
       .field("config", &self.config)
       .field("fwmark", &self.fwmark)
+      .field("plugins", &self.plugins)
       .finish_non_exhaustive()
   }
 }
@@ -77,11 +79,14 @@ impl ProxyState {
   /// verify on the production path. Verification is always on: this proxy
   /// swaps real secrets upstream, so a network attacker with an untrusted
   /// cert must fail closed.
+  ///
   /// # Errors
   ///
-  /// Returns an error when the CA pair fails to convert to boring types, or
-  /// when the egress trust policy rejects the hodor CA anchor.
+  /// Returns an error when the CA pair fails to convert to boring types,
+  /// when the egress trust policy rejects the hodor CA anchor, or when a
+  /// configured plugin cannot be loaded.
   pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> eyre::Result<Self> {
+    let plugins = Arc::new(hodor_plugin::Registry::load(&resolved.plugins)?);
     let (crt, key) = ca.boring_pair()?;
     let anchor = crypto::pki_types::CertificateDer::from(ca.cert_der().to_vec());
     let egress = TlsMitmEgressServerAuth::new()
@@ -95,6 +100,7 @@ impl ProxyState {
       relay,
       mint: MintBucket::new(),
       fwmark: None,
+      plugins,
     })
   }
 
@@ -179,6 +185,7 @@ struct PumpService {
   snapshot: Arc<ResolvedConfig>,
   identity: String,
   port: u16,
+  plugins: Arc<hodor_plugin::Registry>,
 }
 impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for PumpService
 where
@@ -194,50 +201,79 @@ where
     let (mut req, mut resp): (AnyMachine, AnyMachine) = match mode {
       PlainMode::Http => (
         AnyMachine::Http1(SecretsMachine::new(
-          &self.snapshot.grants,
-          Scheme::Https,
-          &self.identity,
-          self.port,
-          Direction::Request,
+          MachineParams::new(
+            &self.snapshot.grants,
+            MachineMode::Https,
+            &self.identity,
+            self.port,
+            Direction::Request,
+          )
+          .hook(
+            self
+              .plugins
+              .select(Scheme::Https, &self.identity, self.port, HookDirection::Request),
+          ),
         )),
         AnyMachine::Http1(SecretsMachine::new(
-          &self.snapshot.grants,
-          Scheme::Https,
-          &self.identity,
-          self.port,
-          Direction::Response,
+          MachineParams::new(
+            &self.snapshot.grants,
+            MachineMode::Https,
+            &self.identity,
+            self.port,
+            Direction::Response,
+          )
+          .hook(
+            self
+              .plugins
+              .select(Scheme::Https, &self.identity, self.port, HookDirection::Response),
+          ),
         )),
       ),
+      // Raw TLS has no HTTP structure to hook: machines only.
       PlainMode::Raw => (
-        AnyMachine::Http1(SecretsMachine::new_raw_tls(
+        AnyMachine::Http1(SecretsMachine::new(MachineParams::new(
           &self.snapshot.grants,
+          MachineMode::RawTls,
           &self.identity,
           self.port,
           Direction::Request,
-        )),
-        AnyMachine::Http1(SecretsMachine::new_raw_tls(
+        ))),
+        AnyMachine::Http1(SecretsMachine::new(MachineParams::new(
           &self.snapshot.grants,
+          MachineMode::RawTls,
           &self.identity,
           self.port,
           Direction::Response,
-        )),
+        ))),
       ),
       PlainMode::H2 => (
         AnyMachine::H2(H2Machine::new(
-          &self.snapshot.grants,
-          Scheme::Https,
-          &self.identity,
-          self.port,
-          Direction::Request,
-          true,
+          MachineParams::new(
+            &self.snapshot.grants,
+            MachineMode::Https,
+            &self.identity,
+            self.port,
+            Direction::Request,
+          )
+          .hook(
+            self
+              .plugins
+              .select(Scheme::Https, &self.identity, self.port, HookDirection::Request),
+          ),
         )),
         AnyMachine::H2(H2Machine::new(
-          &self.snapshot.grants,
-          Scheme::Https,
-          &self.identity,
-          self.port,
-          Direction::Response,
-          false,
+          MachineParams::new(
+            &self.snapshot.grants,
+            MachineMode::Https,
+            &self.identity,
+            self.port,
+            Direction::Response,
+          )
+          .hook(
+            self
+              .plugins
+              .select(Scheme::Https, &self.identity, self.port, HookDirection::Response),
+          ),
         )),
       ),
     };
@@ -418,25 +454,40 @@ where
     }
     Route::RawTcpMachines { buf } => {
       let upstream = dial_marked(dial_host, port, state.fwmark).await?;
-      let mut req = AnyMachine::Http1(SecretsMachine::new_raw(&snapshot.grants, raw_host, port, Direction::Request));
-      let mut resp = AnyMachine::Http1(SecretsMachine::new_raw(&snapshot.grants, raw_host, port, Direction::Response));
+      // Raw TCP has no HTTP structure to hook: machines only.
+      let mut req = AnyMachine::Http1(SecretsMachine::new(MachineParams::new(
+        &snapshot.grants,
+        MachineMode::RawTcp,
+        raw_host,
+        port,
+        Direction::Request,
+      )));
+      let mut resp = AnyMachine::Http1(SecretsMachine::new(MachineParams::new(
+        &snapshot.grants,
+        MachineMode::RawTcp,
+        raw_host,
+        port,
+        Direction::Response,
+      )));
       relay_guarded(guest, upstream, &mut req, &mut resp, &buf).await
     }
     Route::PlainHttpMachines { host, port: hport, buf } => {
       let upstream = dial_marked(dial_host, port, state.fwmark).await?;
       let mut req = AnyMachine::Http1(SecretsMachine::new(
-        &snapshot.grants,
-        Scheme::Http,
-        &host,
-        hport,
-        Direction::Request,
+        MachineParams::new(&snapshot.grants, MachineMode::Http, &host, hport, Direction::Request).hook(state.plugins.select(
+          Scheme::Http,
+          &host,
+          hport,
+          HookDirection::Request,
+        )),
       ));
       let mut resp = AnyMachine::Http1(SecretsMachine::new(
-        &snapshot.grants,
-        Scheme::Http,
-        &host,
-        hport,
-        Direction::Response,
+        MachineParams::new(&snapshot.grants, MachineMode::Http, &host, hport, Direction::Response).hook(state.plugins.select(
+          Scheme::Http,
+          &host,
+          hport,
+          HookDirection::Response,
+        )),
       ));
       relay_guarded(guest, upstream, &mut req, &mut resp, &buf).await
     }
@@ -452,6 +503,7 @@ where
         snapshot: state.snapshot(),
         identity,
         port,
+        plugins: Arc::clone(&state.plugins),
       };
       let relay = TlsMitmRelayService::new(state.relay.clone(), pump);
       match hello {
@@ -608,13 +660,21 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     return Ok(());
   }
-  let mut req = AnyMachine::Http1(SecretsMachine::new(&snapshot.grants, Scheme::Http, &host, port, Direction::Request));
+  let mut req = AnyMachine::Http1(SecretsMachine::new(
+    MachineParams::new(&snapshot.grants, MachineMode::Http, &host, port, Direction::Request).hook(state.plugins.select(
+      Scheme::Http,
+      &host,
+      port,
+      HookDirection::Request,
+    )),
+  ));
   let mut resp = AnyMachine::Http1(SecretsMachine::new(
-    &snapshot.grants,
-    Scheme::Http,
-    &host,
-    port,
-    Direction::Response,
+    MachineParams::new(&snapshot.grants, MachineMode::Http, &host, port, Direction::Response).hook(state.plugins.select(
+      Scheme::Http,
+      &host,
+      port,
+      HookDirection::Response,
+    )),
   ));
   relay_guarded(client, upstream, &mut req, &mut resp, head).await
 }
@@ -718,9 +778,12 @@ mod tests {
   use std::time::Duration;
 
   use hodor_config::grants::{Grant, UriGrant};
+  use hodor_config::{PluginDirection, ResolvedPlugin};
   use hodor_pki::ca::install_crypto_provider;
   use rustls::pki_types::ServerName;
   use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+  use crate::substitute::SubMachine;
 
   #[test]
   fn parse_authority_bracketed_v6_default_port() {
@@ -741,6 +804,10 @@ mod tests {
   }
 
   fn test_state_with(grants: Vec<Grant>, ca: &CertAuthority) -> Arc<ProxyState> {
+    test_state_with_plugins(grants, Vec::new(), ca)
+  }
+
+  fn test_state_with_plugins(grants: Vec<Grant>, plugins: Vec<ResolvedPlugin>, ca: &CertAuthority) -> Arc<ProxyState> {
     install_crypto_provider();
     Arc::new(
       ProxyState::new(
@@ -750,6 +817,7 @@ mod tests {
             ca_file: None,
           },
           grants,
+          plugins,
         },
         ca,
       )
@@ -799,6 +867,14 @@ mod tests {
   /// Proxy + TLS stub presenting a hodor-signed localhost cert; client
   /// connector trusts the hodor CA. Grants built with the stub port.
   async fn mitm_fixture(make_grants: impl Fn(u16) -> Vec<Grant>) -> MitmFixture {
+    mitm_fixture_with_plugins(make_grants, |_| Vec::new()).await
+  }
+
+  /// [`mitm_fixture`] plus plugin fixtures built with the stub port.
+  async fn mitm_fixture_with_plugins(
+    make_grants: impl Fn(u16) -> Vec<Grant>,
+    make_plugins: impl Fn(u16) -> Vec<ResolvedPlugin>,
+  ) -> MitmFixture {
     install_crypto_provider();
     let ca = CertAuthority::generate().unwrap();
     let ca_der = ca.cert_der().clone();
@@ -807,7 +883,8 @@ mod tests {
     let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_port = local_addr(&stub).port();
     let grants = make_grants(stub_port);
-    let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
+    let plugins = make_plugins(stub_port);
+    let (proxy_addr, proxy) = run_proxy_with(test_state_with_plugins(grants, plugins, &ca)).await;
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca_der).unwrap();
     let client_config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
@@ -1181,7 +1258,6 @@ mod tests {
   }
 
   #[tokio::test]
-  #[expect(clippy::cast_possible_truncation, reason = "test frame sized by construction, masked to bytes")]
   async fn mitm_h2_substitutes_headers() {
     use httlib_hpack::{Decoder, Encoder};
 
@@ -1237,9 +1313,8 @@ mod tests {
         .unwrap();
     }
     let mut frame = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
-    frame.push(((block.len() >> 16) & 0xff) as u8);
-    frame.push(((block.len() >> 8) & 0xff) as u8);
-    frame.push((block.len() & 0xff) as u8);
+    let len = u32::try_from(block.len()).unwrap();
+    frame.extend_from_slice(&len.to_be_bytes()[1..]);
     frame.extend_from_slice(&[0x1, 0x4 | 0x1, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS|END_STREAM
     frame.extend_from_slice(&block);
     tls.write_all(&frame).await.unwrap();
@@ -1458,5 +1533,477 @@ mod tests {
     }
     assert_eq!(body, expect.as_bytes());
     serve.await.unwrap().unwrap();
+  }
+
+  /// Hook that votes `Close` on every call.
+  struct CloseHook;
+
+  impl hodor_plugin::RewriteHook for CloseHook {
+    fn rewrite_head<'a>(&'a mut self, _head: &'a mut hodor_plugin::Head) -> hodor_plugin::BoxFuture<'a, hodor_plugin::Verdict> {
+      Box::pin(async move { hodor_plugin::Verdict::Close })
+    }
+
+    fn rewrite_trailers<'a>(
+      &'a mut self,
+      _headers: &'a mut Vec<hodor_plugin::Header>,
+    ) -> hodor_plugin::BoxFuture<'a, hodor_plugin::Verdict> {
+      Box::pin(async move { hodor_plugin::Verdict::Close })
+    }
+
+    fn rewrite_chunk<'a>(&'a mut self, _data: &'a mut Vec<u8>, _eof: bool) -> hodor_plugin::BoxFuture<'a, hodor_plugin::Verdict> {
+      Box::pin(async move { hodor_plugin::Verdict::Close })
+    }
+  }
+
+  #[tokio::test]
+  async fn plugin_e2e_close_verdict_drops_connection() {
+    let (guest_end, mut client_end) = tokio::io::duplex(64 * 1024);
+    let (server_end, mut stub_end) = tokio::io::duplex(64 * 1024);
+    let mut req =
+      SecretsMachine::new(MachineParams::new(&[], MachineMode::Http, "x", 80, Direction::Request).hook(Some(Box::new(CloseHook))));
+    let mut resp = SecretsMachine::new(MachineParams::new(&[], MachineMode::Http, "x", 80, Direction::Response));
+    let (relay_out, ()) = tokio::join!(relay_guarded(guest_end, server_end, &mut req, &mut resp, b""), async {
+      client_end.write_all(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+    });
+    relay_out.unwrap();
+    assert!(req.must_close());
+    // The latched head never reached the wire: upstream sees nothing.
+    // The relay already returned, dropping its server half, so the read
+    // resolves as EOF — zero bytes means `Ok(0)`, a leak would be `Ok(n)`.
+    let mut buf = [0u8; 64];
+    let n = stub_end.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0, "upstream must receive zero bytes");
+  }
+
+  /// Fixture component path, or `None` when `HODOR_PLUGIN_FIXTURES` is unset
+  /// or the fixture was not built (`mise run build:plugins` first).
+  fn plugin_fixture(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(std::env::var_os("HODOR_PLUGIN_FIXTURES")?).join(format!("{name}.wasm"));
+    path.is_file().then_some(path)
+  }
+
+  /// Plugin allow list mirroring [`localhost_grant`]: the MITM leg selects
+  /// hooks with the same identity the machine receives.
+  fn plugin_allow(port: u16) -> Vec<UriGrant> {
+    vec![UriGrant {
+      scheme: Scheme::Https,
+      host: "localhost".parse().unwrap(),
+      port,
+    }]
+  }
+
+  fn plugin_entry(name: &str, port: u16, fixture: std::path::PathBuf) -> ResolvedPlugin {
+    ResolvedPlugin {
+      name: name.to_string(),
+      path: fixture,
+      allow: plugin_allow(port),
+      direction: PluginDirection::Both,
+    }
+  }
+
+  #[tokio::test]
+  async fn plugin_e2e_request_head_chunk_and_trailers() {
+    const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let Some(fixture) = plugin_fixture("marker-request") else {
+      println!("skip: HODOR_PLUGIN_FIXTURES missing marker-request.wasm");
+      return;
+    };
+    let fx = mitm_fixture_with_plugins(
+      |port| localhost_grant(port, FAKE, VALUE),
+      |port| vec![plugin_entry("marker-request", port, fixture.clone())],
+    )
+    .await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let mut tls = stub_acceptor.accept(conn).await.unwrap();
+      let head = read_head_from(&mut tls).await;
+      let head_str = String::from_utf8(head).unwrap();
+      assert!(head_str.contains(&format!("Authorization: Bearer {VALUE}\r\n")), "{head_str}");
+      assert!(!head_str.contains(FAKE), "{head_str}");
+      // Stage 1 plugin head effect.
+      assert!(head_str.contains("x-hodor-plugin: marker\r\n"), "{head_str}");
+      // Chunked rest: the head read may have swallowed the whole message
+      // (client sent it in one block); only read more when the chunked
+      // terminator is not in hand yet.
+      let mut message = head_str;
+      while !message.contains("x-trailer-plugin: marker\r\n\r\n") {
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut chunk))
+          .await
+          .unwrap()
+          .unwrap();
+        assert!(n > 0, "unexpected EOF waiting for chunked body");
+        message.push_str(&String::from_utf8_lossy(&chunk[..n]));
+      }
+      assert!(message.contains("C\r\nhello-marked\r\n0\r\n"), "{message}");
+      assert!(message.contains("x-client-trailer: yes\r\n"), "{message}");
+      assert!(message.contains("x-trailer-plugin: marker\r\n"), "{message}");
+      tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").await.unwrap();
+      tls.shutdown().await.unwrap();
+    });
+    let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    tls
+      .write_all(
+        format!(
+          "POST /x HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {FAKE}\r\nTransfer-Encoding: chunked\r\nTrailer: x-client-trailer\r\n\r\n5\r\nhello\r\n0\r\nx-client-trailer: yes\r\n\r\n"
+        )
+        .as_bytes(),
+      )
+      .await
+      .unwrap();
+    let resp = read_head_from(&mut tls).await;
+    assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", resp.escape_ascii());
+    assert_eq!(read_body(&mut tls, &resp, 2).await, b"hi");
+    stub_task.await.unwrap();
+    proxy.abort();
+  }
+
+  #[tokio::test]
+  async fn plugin_e2e_response_head_and_chunk() {
+    let Some(fixture) = plugin_fixture("marker-response") else {
+      println!("skip: HODOR_PLUGIN_FIXTURES missing marker-response.wasm");
+      return;
+    };
+    let fx = mitm_fixture_with_plugins(
+      |port| localhost_grant(port, "fake", "value"),
+      |port| vec![plugin_entry("marker-response", port, fixture.clone())],
+    )
+    .await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let mut tls = stub_acceptor.accept(conn).await.unwrap();
+      let head = read_head_from(&mut tls).await;
+      assert!(
+        !String::from_utf8(head).unwrap().contains("x-hodor-response-plugin"),
+        "response-only world leaves the request leg alone"
+      );
+      tls
+        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+        .await
+        .unwrap();
+      tls.shutdown().await.unwrap();
+    });
+    let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    tls.write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let resp = read_head_from(&mut tls).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("x-hodor-response-plugin: marker\r\n"), "{resp_str}");
+    // The chunk hook grew the body; chunked framing carries the new size.
+    let mut message = resp;
+    while !message.ends_with(b"0\r\n\r\n") {
+      let mut chunk = [0u8; 4096];
+      let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut chunk))
+        .await
+        .unwrap()
+        .unwrap();
+      assert!(n > 0, "unexpected EOF waiting for chunked body");
+      message.extend_from_slice(&chunk[..n]);
+    }
+    let message = String::from_utf8_lossy(&message);
+    assert!(message.contains("C\r\nhello-marked\r\n0\r\n\r\n"), "{message}");
+    stub_task.await.unwrap();
+    proxy.abort();
+  }
+
+  #[tokio::test]
+  async fn plugin_e2e_h2_chunk_hook_per_frame() {
+    use httlib_hpack::{Decoder, Encoder};
+
+    fn data_frame(flags: u8, payload: &[u8]) -> Vec<u8> {
+      let mut frame = Vec::new();
+      frame.push(((payload.len() >> 16) & 0xff) as u8);
+      frame.push(((payload.len() >> 8) & 0xff) as u8);
+      frame.push((payload.len() & 0xff) as u8);
+      frame.extend_from_slice(&[0x0, flags, 0, 0, 0, 1]);
+      frame.extend_from_slice(payload);
+      frame
+    }
+
+    let Some(fixture) = plugin_fixture("marker-request") else {
+      println!("skip: HODOR_PLUGIN_FIXTURES missing marker-request.wasm");
+      return;
+    };
+    let fx = mitm_fixture_with_plugins(
+      |port| localhost_grant(port, "fake", "value"),
+      |port| vec![plugin_entry("marker-request", port, fixture.clone())],
+    )
+    .await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let mut tls = stub_acceptor.accept(conn).await.unwrap();
+      let mut preface = [0u8; 24];
+      tls.read_exact(&mut preface).await.unwrap();
+      assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+      let mut hdr = [0u8; 9];
+      tls.read_exact(&mut hdr).await.unwrap();
+      assert_eq!(hdr[3], 0x1, "expected HEADERS");
+      let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
+      let mut block = vec![0u8; len];
+      tls.read_exact(&mut block).await.unwrap();
+      let mut decoder = Decoder::default();
+      let mut headers = Vec::new();
+      decoder.decode(&mut block, &mut headers).unwrap();
+      assert!(
+        headers
+          .iter()
+          .any(|(name, value, _)| name == b"x-hodor-plugin" && value == b"marker"),
+        "head hook marker upstream"
+      );
+      // Three DATA frames, END_STREAM only on the last.
+      let mut bodies = Vec::new();
+      for (i, end_stream) in [false, false, true].iter().enumerate() {
+        let mut hdr = [0u8; 9];
+        tls.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[3], 0x0, "expected DATA frame {i}");
+        assert_eq!(hdr[4] & 0x1, u8::from(*end_stream), "END_STREAM on frame {i}");
+        let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
+        let mut payload = vec![0u8; len];
+        tls.read_exact(&mut payload).await.unwrap();
+        bodies.push(payload);
+      }
+      // One marker per DATA frame: the hook ran per frame (streaming),
+      // not once over a buffered body (which would mark at most once).
+      let joined = String::from_utf8(bodies.concat()).unwrap();
+      assert_eq!(joined.matches("-marked").count(), 3, "{joined}");
+      assert_eq!(joined.replace("-marked", ""), "AAAAAAAABBBBBBBBC");
+      tls.shutdown().await.unwrap();
+    });
+    let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    let mut encoder = Encoder::default();
+    let mut block = Vec::new();
+    for (name, value) in [
+      (":method", "POST"),
+      (":scheme", "https"),
+      (":path", "/x"),
+      (":authority", "localhost"),
+    ] {
+      encoder
+        .encode(
+          (name.as_bytes().to_vec(), value.as_bytes().to_vec(), Encoder::NEVER_INDEXED),
+          &mut block,
+        )
+        .unwrap();
+    }
+    let mut req = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
+    req.push(((block.len() >> 16) & 0xff) as u8);
+    req.push(((block.len() >> 8) & 0xff) as u8);
+    req.push((block.len() & 0xff) as u8);
+    req.extend_from_slice(&[0x1, 0x4, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS
+    req.extend_from_slice(&block);
+    req.extend_from_slice(&data_frame(0x0, b"AAAAAAAA"));
+    req.extend_from_slice(&data_frame(0x0, b"BBBBBBBB"));
+    req.extend_from_slice(&data_frame(0x1, b"C"));
+    tls.write_all(&req).await.unwrap();
+    tls.flush().await.unwrap();
+    let mut one = [0u8; 1];
+    assert_eq!(tls.read(&mut one).await.unwrap(), 0);
+    stub_task.await.unwrap();
+    proxy.abort();
+  }
+
+  #[tokio::test]
+  async fn plugin_e2e_h2_trailers_hook() {
+    use httlib_hpack::{Decoder, Encoder};
+
+    let Some(fixture) = plugin_fixture("marker-request") else {
+      println!("skip: HODOR_PLUGIN_FIXTURES missing marker-request.wasm");
+      return;
+    };
+    let fx = mitm_fixture_with_plugins(
+      |port| localhost_grant(port, "fake", "value"),
+      |port| vec![plugin_entry("marker-request", port, fixture.clone())],
+    )
+    .await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let mut tls = stub_acceptor.accept(conn).await.unwrap();
+      let mut preface = [0u8; 24];
+      tls.read_exact(&mut preface).await.unwrap();
+      // Skip the request HEADERS; the second HEADERS block is trailers.
+      for _ in 0..2 {
+        let mut hdr = [0u8; 9];
+        tls.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[3], 0x1, "expected HEADERS");
+        let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
+        let mut block = vec![0u8; len];
+        tls.read_exact(&mut block).await.unwrap();
+        if hdr[4] & 0x1 == 0x1 {
+          let mut decoder = Decoder::default();
+          let mut headers = Vec::new();
+          decoder.decode(&mut block, &mut headers).unwrap();
+          assert!(headers.iter().any(|(name, value, _)| name == b"x-t" && value == b"abc"));
+          assert!(
+            headers
+              .iter()
+              .any(|(name, value, _)| name == b"x-trailer-plugin" && value == b"marker"),
+            "trailer hook marker upstream"
+          );
+        }
+      }
+      tls.shutdown().await.unwrap();
+    });
+    let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    let mut encoder = Encoder::default();
+    let mut head_block = Vec::new();
+    for (name, value) in [
+      (":method", "POST"),
+      (":scheme", "https"),
+      (":path", "/x"),
+      (":authority", "localhost"),
+    ] {
+      encoder
+        .encode(
+          (name.as_bytes().to_vec(), value.as_bytes().to_vec(), Encoder::NEVER_INDEXED),
+          &mut head_block,
+        )
+        .unwrap();
+    }
+    let mut trailer_block = Vec::new();
+    encoder
+      .encode(
+        ("x-t".as_bytes().to_vec(), "abc".as_bytes().to_vec(), Encoder::NEVER_INDEXED),
+        &mut trailer_block,
+      )
+      .unwrap();
+    let mut req = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
+    req.push(((head_block.len() >> 16) & 0xff) as u8);
+    req.push(((head_block.len() >> 8) & 0xff) as u8);
+    req.push((head_block.len() & 0xff) as u8);
+    req.extend_from_slice(&[0x1, 0x4, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS
+    req.extend_from_slice(&head_block);
+    req.push(((trailer_block.len() >> 16) & 0xff) as u8);
+    req.push(((trailer_block.len() >> 8) & 0xff) as u8);
+    req.push((trailer_block.len() & 0xff) as u8);
+    req.extend_from_slice(&[0x1, 0x4 | 0x1, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS|END_STREAM
+    req.extend_from_slice(&trailer_block);
+    tls.write_all(&req).await.unwrap();
+    tls.flush().await.unwrap();
+    let mut one = [0u8; 1];
+    assert_eq!(tls.read(&mut one).await.unwrap(), 0);
+    stub_task.await.unwrap();
+    proxy.abort();
+  }
+
+  #[tokio::test]
+  async fn plugin_e2e_grant_mismatch_not_invoked() {
+    let Some(fixture) = plugin_fixture("marker-request") else {
+      println!("skip: HODOR_PLUGIN_FIXTURES missing marker-request.wasm");
+      return;
+    };
+    let fx = mitm_fixture_with_plugins(
+      |port| localhost_grant(port, "fake", "value"),
+      |port| {
+        vec![ResolvedPlugin {
+          name: "marker-request".to_string(),
+          path: fixture.clone(),
+          allow: vec![UriGrant {
+            scheme: Scheme::Https,
+            host: "other.invalid".parse().unwrap(),
+            port,
+          }],
+          direction: PluginDirection::Both,
+        }]
+      },
+    )
+    .await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let mut tls = stub_acceptor.accept(conn).await.unwrap();
+      let head = read_head_from(&mut tls).await;
+      assert!(
+        !String::from_utf8(head).unwrap().contains("x-hodor-plugin"),
+        "ungranted plugin stays out of the head"
+      );
+      tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").await.unwrap();
+      tls.shutdown().await.unwrap();
+    });
+    let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    tls.write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let resp = read_head_from(&mut tls).await;
+    assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", resp.escape_ascii());
+    assert_eq!(read_body(&mut tls, &resp, 2).await, b"hi");
+    stub_task.await.unwrap();
+    proxy.abort();
+  }
+
+  #[tokio::test]
+  async fn plugin_e2e_trap_fails_closed() {
+    let Some(fixture) = plugin_fixture("trap-request") else {
+      println!("skip: HODOR_PLUGIN_FIXTURES missing trap-request.wasm");
+      return;
+    };
+    let fx = mitm_fixture_with_plugins(
+      |port| localhost_grant(port, "fake", "value"),
+      |port| vec![plugin_entry("trap-request", port, fixture.clone())],
+    )
+    .await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let mut tls = stub_acceptor.accept(conn).await.unwrap();
+      // The proxy already completed the upstream TLS handshake before the
+      // guest trapped on the request head: application bytes must be zero.
+      let mut buf = [0u8; 64];
+      let res = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf)).await.unwrap();
+      assert!(
+        matches!(res, Ok(0)) || res.is_err(),
+        "upstream must receive zero bytes, got {res:?}"
+      );
+    });
+    let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    tls.write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let mut one = [0u8; 1];
+    let res = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut one)).await.unwrap();
+    assert!(matches!(res, Ok(0)) || res.is_err(), "guest connection must drop, got {res:?}");
+    stub_task.await.unwrap();
+    proxy.abort();
   }
 }

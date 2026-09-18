@@ -418,6 +418,7 @@ mod tests {
             ca_file: None,
           },
           grants,
+          plugins: Vec::new(),
         },
         &ca,
       )

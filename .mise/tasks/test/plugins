@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the WASM plugin e2e tests against target/plugins fixtures"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", "examples/plugins/**", ".mise/tasks/test/plugins"]
+
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+set -euo pipefail
+
+# `HODOR_PLUGIN_FIXTURES` activates the plugin_e2e_ tests in hodor-proxy;
+# without it (or with a fixture missing) each prints a skip line and passes.
+# Build the fixtures first with `mise run build:plugins`.
+HODOR_PLUGIN_FIXTURES="$proj_dir/target/plugins" cargo nextest run --cargo-quiet --workspace --exclude hodor-ebpf-programs --show-progress=bar --status-level=slow "$@"

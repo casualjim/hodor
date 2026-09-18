@@ -12,6 +12,7 @@ base64 = "0.22"
 eyre = "0.6"
 hodor-config = { path = "../hodor-config" }
 hodor-pki = { path = "../hodor-pki" }
+hodor-plugin = { path = "../hodor-plugin" }
 httlib-hpack = "0.1.3"
 httparse = "1"
 rama = { git = "https://github.com/plabayo/rama", default-features = false, features = ["boring", "tcp"] }

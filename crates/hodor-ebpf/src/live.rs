@@ -76,6 +76,7 @@ fn state_with(grants: Vec<Grant>, ca: &hodor_pki::ca::CertAuthority) -> Arc<Prox
           ca_file: None,
         },
         grants,
+        plugins: Vec::new(),
       },
       ca,
     )

@@ -421,6 +421,7 @@ mod tests {
       },
       workspace: hodor_config::config::WorkspaceCfg::default(),
       rules: BTreeMap::new(),
+      plugins: BTreeMap::new(),
       agents: BTreeMap::new(),
     };
     config.rules.insert(label.to_string(), rule);

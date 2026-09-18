@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+#MISE description="Build the example WASM plugins to target/plugins"
+#MISE sources=["examples/plugins/**", "crates/hodor-plugin/wit/**", ".mise/tasks/build/plugins"]
+#MISE outputs=["target/plugins/marker-request.wasm", "target/plugins/marker-response.wasm", "target/plugins/trap-request.wasm"]
+
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+set -euo pipefail
+
+# Standalone guest crates (excluded from the workspace): each builds into its
+# own target dir, then the component is copied to target/plugins.
+mkdir -p target/plugins
+for name in marker-request marker-response trap-request; do
+  cargo build --quiet --release --target wasm32-wasip2 --manifest-path "examples/plugins/$name/Cargo.toml"
+  cp "examples/plugins/$name/target/wasm32-wasip2/release/"*.wasm "target/plugins/$name.wasm"
+done

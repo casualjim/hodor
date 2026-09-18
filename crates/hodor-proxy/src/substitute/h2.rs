@@ -6,11 +6,15 @@ use std::collections::{HashMap, HashSet};
 use base64::Engine as _;
 use httlib_hpack::{Decoder, Encoder};
 
-use hodor_config::grants::{Grant, Scheme};
+#[cfg(test)]
+use hodor_config::grants::Grant;
+use hodor_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Verdict};
 
+#[cfg(test)]
+use super::MachineMode;
 use super::{
-  Direction, Hit, Location, Pair, SubMachine, eligible_pairs, max_tail_size, replace_bytes, replace_in, response_has_no_body,
-  scan_with_tail,
+  Direction, Hit, Location, MachineParams, Pair, SubMachine, eligible_pairs, max_tail_size, needle_safe_emit_len, replace_bytes,
+  replace_in, response_has_no_body, scan_with_tail,
 };
 
 /// HTTP/2 connection preface.
@@ -77,6 +81,18 @@ struct H2Block {
   raw: Vec<u8>,
 }
 
+/// Connection lifecycle: preface consumption, frame walking, or degraded
+/// scan-only passthrough (one-way).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H2Phase {
+  /// Waiting for the client connection preface (request leg only).
+  Preface,
+  /// Walking frames.
+  Framing,
+  /// Framing violation: scan-only passthrough for the rest of the stream.
+  Opaque,
+}
+
 /// Per-connection, per-direction HTTP/2 machine. HEADERS/CONTINUATION blocks
 /// are HPACK-decoded, substituted, and re-encoded; DATA payloads are
 /// substituted with the frame length rewritten (a per-stream overlap window
@@ -85,14 +101,15 @@ struct H2Block {
 pub(crate) struct H2Machine {
   pairs: Vec<Pair>,
   dir: Direction,
+  hook: Option<Box<dyn RewriteHook>>,
   decoder: Decoder<'static>,
   encoder: Encoder<'static>,
   buffer: Vec<u8>,
-  preface_done: bool,
+  /// Connection lifecycle phase.
+  phase: H2Phase,
   block: Option<H2Block>,
   open_streams: HashSet<u32>,
   data_tails: HashMap<u32, Vec<u8>>,
-  opaque: bool,
   scan_tail: Vec<u8>,
   tail_size: usize,
   /// Request side: HEAD methods seen, pending pickup by the relay.
@@ -104,23 +121,27 @@ pub(crate) struct H2Machine {
 }
 
 impl H2Machine {
-  /// `expect_preface` is true for the request direction only; responses
-  /// start with frames.
+  /// Build from explicit parameters. The request leg consumes the H2
+  /// connection preface; responses start with frames.
   #[must_use]
-  pub fn new(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction, expect_preface: bool) -> Self {
-    let pairs = eligible_pairs(grants, scheme, host, port, dir, false);
+  pub fn new(params: MachineParams<'_>) -> Self {
+    let pairs = eligible_pairs(params.grants, params.mode, params.host, params.port, params.dir);
     let tail_size = max_tail_size(&pairs);
     Self {
       pairs,
-      dir,
+      dir: params.dir,
+      hook: params.hook,
       decoder: Decoder::default(),
       encoder: Encoder::default(),
       buffer: Vec::new(),
-      preface_done: !expect_preface,
+      phase: if params.dir == Direction::Request {
+        H2Phase::Preface
+      } else {
+        H2Phase::Framing
+      },
       block: None,
       open_streams: HashSet::new(),
       data_tails: HashMap::new(),
-      opaque: false,
       scan_tail: Vec::new(),
       tail_size,
       head_requests: 0,
@@ -133,7 +154,7 @@ impl H2Machine {
   /// the trait impl below forwards here so concrete and dynamic callers share
   /// one code path.
   #[must_use]
-  pub fn substitute<'a>(&mut self, chunk: &'a [u8]) -> (Cow<'a, [u8]>, Vec<Hit>) {
+  pub async fn substitute<'a>(&mut self, chunk: &'a [u8]) -> (Cow<'a, [u8]>, Vec<Hit>) {
     if chunk.is_empty() {
       let mut out = std::mem::take(&mut self.buffer);
       if let Some(block) = self.block.take() {
@@ -159,7 +180,7 @@ impl H2Machine {
       }
       return (Cow::Owned(out), held_hits);
     }
-    if self.opaque {
+    if self.phase == H2Phase::Opaque {
       let hits = scan_with_tail(&self.pairs, &mut self.scan_tail, self.tail_size, chunk, Location::Body);
       if self.dir == Direction::Response && !hits.is_empty() {
         self.must_close = true;
@@ -169,7 +190,7 @@ impl H2Machine {
     self.buffer.extend_from_slice(chunk);
     let mut out = Vec::new();
     let mut hits = Vec::new();
-    if !self.preface_done {
+    if self.phase == H2Phase::Preface {
       if self.buffer.len() < H2_PREFACE.len() {
         return (Cow::Owned(Vec::new()), hits);
       }
@@ -179,7 +200,7 @@ impl H2Machine {
       }
       out.extend_from_slice(H2_PREFACE);
       self.buffer.drain(..H2_PREFACE.len());
-      self.preface_done = true;
+      self.phase = H2Phase::Framing;
     }
     // Take the buffer out of `self` so frame slices borrow the local vec
     // while `process_frame` mutates machine state; one compaction per
@@ -192,8 +213,7 @@ impl H2Machine {
       if buf.len() - cursor < full {
         break;
       }
-      let raw = &buf[cursor..cursor + full];
-      let violation = match self.process_frame(raw, &mut hits) {
+      let violation = match self.process_frame(&buf[cursor..cursor + full], &mut hits).await {
         Ok(emit) => {
           out.extend_from_slice(&emit);
           cursor += full;
@@ -223,7 +243,7 @@ impl H2Machine {
   /// frame passes through untouched, empty while holding a block); Err =
   /// bytes to emit before going opaque. `raw` borrows the caller's local
   /// frame buffer, never `self`.
-  fn process_frame<'f>(&mut self, raw: &'f [u8], hits: &mut Vec<Hit>) -> Result<Cow<'f, [u8]>, Vec<u8>> {
+  async fn process_frame<'f>(&mut self, raw: &'f [u8], hits: &mut Vec<Hit>) -> Result<Cow<'f, [u8]>, Vec<u8>> {
     let kind = raw[3];
     let flags = raw[4];
     let stream_id = u32::from_be_bytes([raw[5], raw[6], raw[7], raw[8]]) & 0x7fff_ffff;
@@ -234,9 +254,9 @@ impl H2Machine {
       return Err(emit);
     }
     match kind {
-      F_HEADERS => self.headers_frame(stream_id, flags, payload, raw, hits).map(Cow::Owned),
-      F_CONTINUATION => self.continuation_frame(stream_id, flags, payload, raw, hits).map(Cow::Owned),
-      F_DATA => self.data_frame(stream_id, flags, payload, raw, hits).map(Cow::Owned),
+      F_HEADERS => self.headers_frame(stream_id, flags, payload, raw, hits).await.map(Cow::Owned),
+      F_CONTINUATION => self.continuation_frame(stream_id, flags, payload, raw, hits).await.map(Cow::Owned),
+      F_DATA => self.data_frame(stream_id, flags, payload, raw, hits).await.map(Cow::Owned),
       F_RST_STREAM => {
         if stream_id == 0 {
           return Err(raw.to_vec());
@@ -252,7 +272,14 @@ impl H2Machine {
     }
   }
 
-  fn headers_frame(&mut self, stream_id: u32, flags: u8, payload: &[u8], raw: &[u8], hits: &mut Vec<Hit>) -> Result<Vec<u8>, Vec<u8>> {
+  async fn headers_frame(
+    &mut self,
+    stream_id: u32,
+    flags: u8,
+    payload: &[u8],
+    raw: &[u8],
+    hits: &mut Vec<Hit>,
+  ) -> Result<Vec<u8>, Vec<u8>> {
     if stream_id == 0 {
       return Err(raw.to_vec());
     }
@@ -267,14 +294,21 @@ impl H2Machine {
       raw: raw.to_vec(),
     };
     if flags & FLAG_END_HEADERS != 0 {
-      self.finish_block(block, hits)
+      self.finish_block(block, hits).await
     } else {
       self.block = Some(block);
       Ok(Vec::new())
     }
   }
 
-  fn continuation_frame(&mut self, stream_id: u32, flags: u8, payload: &[u8], raw: &[u8], hits: &mut Vec<Hit>) -> Result<Vec<u8>, Vec<u8>> {
+  async fn continuation_frame(
+    &mut self,
+    stream_id: u32,
+    flags: u8,
+    payload: &[u8],
+    raw: &[u8],
+    hits: &mut Vec<Hit>,
+  ) -> Result<Vec<u8>, Vec<u8>> {
     let Some(mut block) = self.block.take() else {
       return Err(raw.to_vec());
     };
@@ -288,14 +322,14 @@ impl H2Machine {
       return Err(block.raw);
     }
     if flags & FLAG_END_HEADERS != 0 {
-      self.finish_block(block, hits)
+      self.finish_block(block, hits).await
     } else {
       self.block = Some(block);
       Ok(Vec::new())
     }
   }
 
-  fn data_frame(&mut self, stream_id: u32, flags: u8, payload: &[u8], raw: &[u8], hits: &mut Vec<Hit>) -> Result<Vec<u8>, Vec<u8>> {
+  async fn data_frame(&mut self, stream_id: u32, flags: u8, payload: &[u8], raw: &[u8], hits: &mut Vec<Hit>) -> Result<Vec<u8>, Vec<u8>> {
     if stream_id == 0 || !self.open_streams.contains(&stream_id) {
       return Err(raw.to_vec());
     }
@@ -307,10 +341,22 @@ impl H2Machine {
     let held_tail = self.data_tails.get_mut(&stream_id).map(std::mem::take).unwrap_or_default();
     let mut combined = held_tail;
     combined.extend_from_slice(data);
-    let hold = if end_stream { 0 } else { self.tail_size.min(combined.len()) };
+    let hold = if end_stream {
+      0
+    } else {
+      // Never slice a needle: emit past complete matches, hold any trailing
+      // partial. A fixed window could cut a needle ending inside it.
+      combined.len() - needle_safe_emit_len(&combined, &self.pairs, self.tail_size)
+    };
     let emit_len = combined.len() - hold;
-    let (new_emit, mut data_hits) = replace_in(&combined[..emit_len], &self.pairs, Location::Body);
+    let (mut new_emit, mut data_hits) = replace_in(&combined[..emit_len], &self.pairs, Location::Body);
     hits.append(&mut data_hits);
+    if let Some(hook) = self.hook.as_mut()
+      && hook.rewrite_chunk(&mut new_emit, end_stream).await == Verdict::Close
+    {
+      self.must_close = true;
+      return Ok(Vec::new());
+    }
     if end_stream {
       // Release the stream slot: otherwise long-lived H2 connections leak
       // one open_streams entry per DATA-terminated stream until the 1024
@@ -327,6 +373,11 @@ impl H2Machine {
     if new_emit.len() > 0xff_ffff {
       // Substitution grew the payload past the 24-bit length field: the
       // frame cannot be legally re-framed, so degrade rather than lie.
+      // With a hook active the growth may hide an unsigned body: fail closed.
+      if self.hook.is_some() {
+        self.must_close = true;
+        return Ok(Vec::new());
+      }
       return Err(raw.to_vec());
     }
     let mut frame = Vec::with_capacity(9 + new_emit.len());
@@ -334,7 +385,7 @@ impl H2Machine {
     Ok(frame)
   }
 
-  fn finish_block(&mut self, block: H2Block, hits: &mut Vec<Hit>) -> Result<Vec<u8>, Vec<u8>> {
+  async fn finish_block(&mut self, block: H2Block, hits: &mut Vec<Hit>) -> Result<Vec<u8>, Vec<u8>> {
     let mut frag = block.fragments;
     let mut headers: Vec<(Vec<u8>, Vec<u8>, u8)> = Vec::new();
     if self.decoder.decode(&mut frag, &mut headers).is_err() {
@@ -344,6 +395,32 @@ impl H2Machine {
       return Err(block.raw);
     }
     substitute_h2_values(&mut headers, &self.pairs, hits);
+    if let Some(hook) = self.hook.as_mut() {
+      let has_method = headers.iter().any(|(name, _, _)| name.eq_ignore_ascii_case(b":method"));
+      let has_status = headers.iter().any(|(name, _, _)| name.eq_ignore_ascii_case(b":status"));
+      if has_method || has_status {
+        if !rewrite_h2_head(hook, &mut headers).await {
+          self.must_close = true;
+          return Err(block.raw);
+        }
+      } else {
+        let mut trailers: Vec<PluginHeader> = headers
+          .iter()
+          .map(|(name, value, _)| PluginHeader {
+            name: String::from_utf8_lossy(name).into_owned(),
+            value: value.clone(),
+          })
+          .collect();
+        if hook.rewrite_trailers(&mut trailers).await == Verdict::Close {
+          self.must_close = true;
+          return Err(block.raw);
+        }
+        headers = trailers
+          .into_iter()
+          .map(|header| (header.name.into_bytes(), header.value, 0))
+          .collect();
+      }
+    }
     if self.dir == Direction::Request && is_head_method(&headers) {
       self.head_requests += 1;
     }
@@ -387,17 +464,44 @@ impl H2Machine {
       self.open_streams.insert(block.stream_id);
     }
     let mut out = Vec::new();
-    append_header_frames(&mut out, block.stream_id, block.end_stream, &encoded);
     if block.end_stream {
-      self.data_tails.remove(&block.stream_id);
+      // Trailer-terminated stream: the DATA hold-back window still parks
+      // body bytes (no DATA END_STREAM released them). Flush them as a
+      // final DATA frame before the trailer block, or they are lost —
+      // split secrets included.
+      if let Some(held) = self.data_tails.remove(&block.stream_id)
+        && !held.is_empty()
+      {
+        let (mut new_held, mut held_hits) = replace_in(&held, &self.pairs, Location::Body);
+        hits.append(&mut held_hits);
+        let mut closed = false;
+        if let Some(hook) = self.hook.as_mut()
+          && hook.rewrite_chunk(&mut new_held, true).await == Verdict::Close
+        {
+          self.must_close = true;
+          closed = true;
+        }
+        if !closed {
+          let mut offset = 0;
+          while offset < new_held.len() {
+            let take = (new_held.len() - offset).min(0xff_ffff);
+            append_frame(&mut out, F_DATA, 0, block.stream_id, &new_held[offset..offset + take]);
+            offset += take;
+          }
+        }
+      }
       self.open_streams.remove(&block.stream_id);
     }
+    append_header_frames(&mut out, block.stream_id, block.end_stream, &encoded);
     Ok(out)
   }
 
   fn go_opaque(&mut self, out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
-    self.opaque = true;
+    self.phase = H2Phase::Opaque;
     self.block = None;
+    if self.hook.is_some() {
+      self.must_close = true;
+    }
     let rest = std::mem::take(&mut self.buffer);
     hits.extend(scan_with_tail(
       &self.pairs,
@@ -411,7 +515,7 @@ impl H2Machine {
 }
 
 impl SubMachine for H2Machine {
-  fn substitute<'b>(&mut self, chunk: &'b [u8]) -> (Cow<'b, [u8]>, Vec<Hit>) {
+  fn substitute<'a>(&mut self, chunk: &'a [u8]) -> impl Future<Output = (Cow<'a, [u8]>, Vec<Hit>)> + Send {
     H2Machine::substitute(self, chunk)
   }
   fn take_head_requests(&mut self) -> usize {
@@ -471,6 +575,92 @@ fn substitute_h2_values(headers: &mut [(Vec<u8>, Vec<u8>, u8)], pairs: &[Pair], 
       });
     }
   }
+}
+
+/// Regular (non-pseudo) decoded H2 fields as hook-visible headers.
+fn regular_h2_headers(headers: &[(Vec<u8>, Vec<u8>, u8)]) -> Vec<PluginHeader> {
+  headers
+    .iter()
+    .filter(|(name, _, _)| name.first() != Some(&b':'))
+    .map(|(name, value, _)| PluginHeader {
+      name: String::from_utf8_lossy(name).into_owned(),
+      value: value.clone(),
+    })
+    .collect()
+}
+
+/// Find a pseudo-header value, lossy-decoded.
+fn pseudo_value(headers: &[(Vec<u8>, Vec<u8>, u8)], name: &[u8]) -> Option<String> {
+  headers
+    .iter()
+    .find(|(field, _, _)| field.eq_ignore_ascii_case(name))
+    .map(|(_, value, _)| String::from_utf8_lossy(value).into_owned())
+}
+/// Rebuilt pseudo-headers plus hook-returned regular headers.
+type HookedHead = (Vec<(Vec<u8>, Vec<u8>)>, Vec<PluginHeader>);
+
+/// Run the head hook over decoded headers: swap is stage 0, the plugin is
+/// stage 1. Pseudo-headers ride outside the hook-visible list (routing
+/// safety); the hook's regular headers replace the block's wholesale while
+/// the extracted `:method`/`:path`/`:status` are re-injected at the front.
+/// Returns false on `Verdict::Close`. An unparseable `:status` or a head the
+/// hook retypes to the other variant keeps legacy pseudos: only the regular
+/// headers are applied.
+async fn rewrite_h2_head(hook: &mut Box<dyn RewriteHook>, headers: &mut Vec<(Vec<u8>, Vec<u8>, u8)>) -> bool {
+  let is_response = headers.iter().any(|(name, _, _)| name.eq_ignore_ascii_case(b":status"));
+  let mut head = if is_response {
+    let Some(status) = pseudo_value(headers, b":status").and_then(|value| value.trim().parse::<u16>().ok()) else {
+      return true;
+    };
+    PluginHead::Response {
+      status,
+      headers: regular_h2_headers(headers),
+    }
+  } else {
+    PluginHead::Request {
+      method: pseudo_value(headers, b":method").unwrap_or_default(),
+      path_with_query: pseudo_value(headers, b":path").unwrap_or_default(),
+      headers: regular_h2_headers(headers),
+    }
+  };
+  if hook.rewrite_head(&mut head).await == Verdict::Close {
+    return false;
+  }
+  let (pseudos, hooked): HookedHead = match head {
+    PluginHead::Request {
+      method,
+      path_with_query,
+      headers,
+    } if !is_response => (
+      vec![
+        (b":method".to_vec(), method.into_bytes()),
+        (b":path".to_vec(), path_with_query.into_bytes()),
+      ],
+      headers,
+    ),
+    PluginHead::Response { status, headers } if is_response => (vec![(b":status".to_vec(), status.to_string().into_bytes())], headers),
+    PluginHead::Request { headers, .. } | PluginHead::Response { headers, .. } => (Vec::new(), headers),
+  };
+  let mut others: Vec<(Vec<u8>, Vec<u8>, u8)> = Vec::new();
+  for (name, value, flag) in std::mem::take(headers) {
+    if name.first() != Some(&b':') {
+      continue;
+    }
+    if pseudos.iter().any(|(fresh, _)| fresh.eq_ignore_ascii_case(&name)) {
+      continue;
+    }
+    others.push((name, value, flag));
+  }
+  let mut rebuilt: Vec<(Vec<u8>, Vec<u8>, u8)> = pseudos
+    .into_iter()
+    .map(|(name, value)| (name, value, Encoder::NEVER_INDEXED))
+    .collect();
+  rebuilt.append(&mut others);
+  for header in hooked {
+    rebuilt.push((header.name.into_bytes(), header.value, Encoder::NEVER_INDEXED));
+  }
+  *headers = rebuilt;
+  true
 }
 
 fn headers_fragment(flags: u8, payload: &[u8]) -> Option<&[u8]> {
@@ -550,11 +740,23 @@ mod h2_tests {
   }
 
   fn req_machine() -> H2Machine {
-    H2Machine::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Request, true)
+    H2Machine::new(MachineParams::new(
+      &grants(),
+      MachineMode::Https,
+      "api.github.com",
+      443,
+      Direction::Request,
+    ))
   }
 
   fn resp_machine() -> H2Machine {
-    H2Machine::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Response, false)
+    H2Machine::new(MachineParams::new(
+      &grants(),
+      MachineMode::Https,
+      "api.github.com",
+      443,
+      Direction::Response,
+    ))
   }
 
   fn encode_headers(fields: &[(&str, &str)]) -> Vec<u8> {
@@ -593,11 +795,11 @@ mod h2_tests {
     (kind, flags, stream, out[9..9 + len].to_vec())
   }
 
-  #[test]
-  fn h2_request_headers_substituted() {
+  #[tokio::test]
+  async fn h2_request_headers_substituted() {
     let mut machine = req_machine();
     // Preface split across writes is held, not emitted.
-    let (out1, _) = machine.substitute(&H2_PREFACE[..10]);
+    let (out1, _) = machine.substitute(&H2_PREFACE[..10]).await;
     assert!(out1.into_owned().is_empty());
 
     let block = encode_headers(&[
@@ -609,7 +811,7 @@ mod h2_tests {
     ]);
     let mut input = H2_PREFACE[10..].to_vec();
     input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &block));
-    let (out, hits) = machine.substitute(&input);
+    let (out, hits) = machine.substitute(&input).await;
     let out = out.into_owned();
     assert!(out.starts_with(H2_PREFACE), "preface must pass through first");
     let (kind, flags, stream, payload) = first_frame_payload(&out[H2_PREFACE.len()..]);
@@ -624,15 +826,15 @@ mod h2_tests {
     assert!(hits.iter().any(|hit| hit.location == Location::Header));
   }
 
-  #[test]
-  fn h2_continuation_block_substituted() {
+  #[tokio::test]
+  async fn h2_continuation_block_substituted() {
     let mut machine = req_machine();
     let block = encode_headers(&[(":method", "POST"), ("authorization", &format!("Bearer {FAKE}"))]);
     let mid = block.len() / 2;
     let mut input = H2_PREFACE.to_vec();
     input.extend_from_slice(&frame(F_HEADERS, 0, 1, &block[..mid]));
     input.extend_from_slice(&frame(F_CONTINUATION, FLAG_END_HEADERS, 1, &block[mid..]));
-    let (out, _) = machine.substitute(&input);
+    let (out, _) = machine.substitute(&input).await;
     let out = out.into_owned();
     let (_, _, _, payload) = first_frame_payload(&out[H2_PREFACE.len()..]);
     let headers = decode_headers(&payload);
@@ -640,15 +842,15 @@ mod h2_tests {
     assert_eq!(auth.1, format!("Bearer {VALUE}").as_bytes());
   }
 
-  #[test]
-  fn h2_data_substituted_with_hit() {
+  #[tokio::test]
+  async fn h2_data_substituted_with_hit() {
     let mut machine = req_machine();
     let block = encode_headers(&[(":method", "POST"), (":path", "/upload")]);
     let mut input = H2_PREFACE.to_vec();
     input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS, 1, &block));
     let payload = format!("blob-{FAKE}-blob");
     input.extend_from_slice(&frame(F_DATA, FLAG_END_STREAM, 1, payload.as_bytes()));
-    let (out, hits) = machine.substitute(&input);
+    let (out, hits) = machine.substitute(&input).await;
     let out = out.into_owned();
     // Skip the re-encoded HEADERS frame; DATA carries the real value now.
     let mut rest = &out[H2_PREFACE.len()..];
@@ -666,14 +868,14 @@ mod h2_tests {
     );
   }
 
-  #[test]
-  fn h2_data_response_redacted() {
+  #[tokio::test]
+  async fn h2_data_response_redacted() {
     let mut machine = resp_machine();
     let block = encode_headers(&[(":status", "200")]);
     let mut input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &block);
     let payload = format!("tok-{VALUE}-end");
     input.extend_from_slice(&frame(F_DATA, FLAG_END_STREAM, 1, payload.as_bytes()));
-    let (out, hits) = machine.substitute(&input);
+    let (out, hits) = machine.substitute(&input).await;
     let out = out.into_owned();
     let hlen = ((out[0] as usize) << 16) | ((out[1] as usize) << 8) | out[2] as usize;
     let (kind, _, _, data) = first_frame_payload(&out[9 + hlen..]);
@@ -682,93 +884,292 @@ mod h2_tests {
     assert!(hits.iter().any(|hit| hit.location == Location::Body));
   }
 
-  #[test]
-  fn h2_response_redacts_values() {
+  #[tokio::test]
+  async fn h2_response_redacts_values() {
     let mut machine = resp_machine();
     let block = encode_headers(&[(":status", "200"), ("x-echo", VALUE)]);
     let input = frame(F_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &block);
-    let (out, _) = machine.substitute(&input);
+    let (out, _) = machine.substitute(&input).await;
     let (_, _, _, payload) = first_frame_payload(&out);
     let headers = decode_headers(&payload);
     let echo = headers.iter().find(|(name, _)| name == b"x-echo").unwrap();
     assert_eq!(echo.1, FAKE.as_bytes());
   }
 
-  #[test]
-  fn h2_head_request_suppresses_response_data() {
+  #[tokio::test]
+  async fn h2_head_request_suppresses_response_data() {
     let mut req = req_machine();
     let block = encode_headers(&[(":method", "HEAD"), (":path", "/"), (":authority", "api.github.com")]);
     let mut input = H2_PREFACE.to_vec();
     input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &block));
-    let (_, _) = req.substitute(&input);
+    let (_, _) = req.substitute(&input).await;
     assert_eq!(req.take_head_requests(), 1);
 
     let mut resp = resp_machine();
     resp.suppress_next_bodies(1);
     let rblock = encode_headers(&[(":status", "200"), ("x-echo", VALUE)]);
     let input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &rblock);
-    let (out, _) = resp.substitute(&input);
+    let (out, _) = resp.substitute(&input).await;
     let (_, _, _, payload) = first_frame_payload(&out);
     let headers = decode_headers(&payload);
     let echo = headers.iter().find(|(name, _)| name == b"x-echo").unwrap();
     assert_eq!(echo.1, FAKE.as_bytes());
     // Stream never opened: stray DATA is not substituted, just forwarded.
     let data = frame(F_DATA, FLAG_END_STREAM, 1, format!("tok-{VALUE}-end").as_bytes());
-    let (out, _) = resp.substitute(&data);
+    let (out, _) = resp.substitute(&data).await;
     assert!(
       out.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()),
       "stray DATA must pass through"
     );
   }
 
-  #[test]
-  fn h2_garbage_goes_opaque_unchanged() {
+  #[tokio::test]
+  async fn h2_garbage_goes_opaque_unchanged() {
     let mut machine = req_machine();
     let input = b"GARBAGE-NOT-A-PREFACE-AT-ALL-!!!!";
     assert!(input.len() >= H2_PREFACE.len());
-    let (out, _) = machine.substitute(input);
+    let (out, _) = machine.substitute(input).await;
     assert_eq!(out.as_ref(), input.as_slice());
     // Stays opaque: later chunks borrowed.
-    let (out, _) = machine.substitute(b"more-bytes");
+    let (out, _) = machine.substitute(b"more-bytes").await;
     assert!(matches!(out, Cow::Borrowed(_)));
   }
 
-  #[test]
-  fn h2_push_promise_forwarded_unchanged() {
+  #[tokio::test]
+  async fn h2_push_promise_forwarded_unchanged() {
     let mut machine = req_machine();
     let mut input = H2_PREFACE.to_vec();
     let promise = frame(0x5, FLAG_END_HEADERS, 1, b"promised-payload");
     input.extend_from_slice(&promise);
-    let (out, hits) = machine.substitute(&input);
+    let (out, hits) = machine.substitute(&input).await;
     assert_eq!(out.into_owned(), input);
     assert!(hits.is_empty());
   }
 
-  #[test]
-  fn h2_data_end_stream_releases_stream_id() {
+  #[tokio::test]
+  async fn h2_data_end_stream_releases_stream_id() {
     let mut machine = req_machine();
     let block = encode_headers(&[(":method", "POST"), (":path", "/upload")]);
     let mut input = H2_PREFACE.to_vec();
     input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS, 1, &block));
-    let (_, _) = machine.substitute(&input);
+    let (_, _) = machine.substitute(&input).await;
     assert!(machine.open_streams.contains(&1), "POST stream opens");
     let data = frame(F_DATA, FLAG_END_STREAM, 1, b"payload");
-    let (_, _) = machine.substitute(&data);
+    let (_, _) = machine.substitute(&data).await;
     assert!(!machine.open_streams.contains(&1), "DATA END_STREAM must release the stream");
     assert!(machine.data_tails.is_empty());
   }
 
-  #[test]
-  fn h2_interim_103_keeps_head_suppression() {
+  #[tokio::test]
+  async fn h2_interim_103_keeps_head_suppression() {
     let mut resp = resp_machine();
     resp.suppress_next_bodies(1);
     let interim = encode_headers(&[(":status", "103")]);
     let input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &interim);
-    let (_, _) = resp.substitute(&input);
+    let (_, _) = resp.substitute(&input).await;
     assert_eq!(resp.suppress_body, 1, "interim 1xx must not consume HEAD suppression");
     let final_head = encode_headers(&[(":status", "200")]);
     let input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &final_head);
-    let (_, _) = resp.substitute(&input);
+    let (_, _) = resp.substitute(&input).await;
     assert_eq!(resp.suppress_body, 0);
+  }
+
+  /// Stage-1 hook double: appends markers, adds headers/trailers, or votes
+  /// `Close`. Wire-observable only; the machine owns the boxed hook.
+  #[derive(Default)]
+  struct MockHook {
+    add_header: Option<(String, Vec<u8>)>,
+    append_body: Vec<u8>,
+    add_trailer: Option<(String, Vec<u8>)>,
+    close_head: bool,
+    close_chunk: bool,
+  }
+
+  impl RewriteHook for MockHook {
+    fn rewrite_head<'a>(&'a mut self, head: &'a mut PluginHead) -> hodor_plugin::BoxFuture<'a, Verdict> {
+      Box::pin(async move {
+        if self.close_head {
+          return Verdict::Close;
+        }
+        if let Some((name, value)) = self.add_header.clone() {
+          let header = PluginHeader { name, value };
+          match head {
+            PluginHead::Request { headers, .. } => headers.push(header),
+            PluginHead::Response { headers, .. } => headers.push(header),
+          }
+        }
+        Verdict::Continue
+      })
+    }
+
+    fn rewrite_trailers<'a>(&'a mut self, headers: &'a mut Vec<PluginHeader>) -> hodor_plugin::BoxFuture<'a, Verdict> {
+      Box::pin(async move {
+        if let Some((name, value)) = self.add_trailer.clone() {
+          headers.push(PluginHeader { name, value });
+        }
+        Verdict::Continue
+      })
+    }
+
+    fn rewrite_chunk<'a>(&'a mut self, data: &'a mut Vec<u8>, _eof: bool) -> hodor_plugin::BoxFuture<'a, Verdict> {
+      Box::pin(async move {
+        if self.close_chunk {
+          return Verdict::Close;
+        }
+        data.extend_from_slice(&self.append_body);
+        Verdict::Continue
+      })
+    }
+  }
+
+  fn req_hooked(hook: MockHook) -> H2Machine {
+    H2Machine::new(MachineParams::new(&grants(), MachineMode::Https, "api.github.com", 443, Direction::Request).hook(Some(Box::new(hook))))
+  }
+
+  #[tokio::test]
+  async fn mock_hook_rewrites_h2_head() {
+    let mut machine = req_hooked(MockHook {
+      add_header: Some(("x-hook".to_string(), b"1".to_vec())),
+      ..Default::default()
+    });
+    let block = encode_headers(&[
+      (":method", "GET"),
+      (":scheme", "https"),
+      (":path", "/"),
+      (":authority", "api.github.com"),
+      ("x-echo", FAKE),
+    ]);
+    let mut input = H2_PREFACE.to_vec();
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &block));
+    let (out, _) = machine.substitute(&input).await;
+    let out = out.into_owned();
+    let (_, _, _, payload) = first_frame_payload(&out[H2_PREFACE.len()..]);
+    let headers = decode_headers(&payload);
+    let echo = headers.iter().find(|(name, _)| name == b"x-echo").unwrap();
+    assert_eq!(echo.1, VALUE.as_bytes(), "swap is stage 0");
+    assert!(
+      headers.iter().any(|(name, value)| name == b"x-hook" && value == b"1"),
+      "hook header present"
+    );
+    assert!(!machine.must_close());
+  }
+
+  #[tokio::test]
+  async fn mock_hook_rewrites_h2_data_frame() {
+    let mut machine = req_hooked(MockHook {
+      append_body: b"-hooked".to_vec(),
+      ..Default::default()
+    });
+    let block = encode_headers(&[
+      (":method", "POST"),
+      (":scheme", "https"),
+      (":path", "/x"),
+      (":authority", "api.github.com"),
+    ]);
+    let mut input = H2_PREFACE.to_vec();
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS, 1, &block));
+    let payload = format!("tok-{FAKE}-end").into_bytes();
+    input.extend_from_slice(&frame(F_DATA, FLAG_END_STREAM, 1, &payload));
+    let (out, _) = machine.substitute(&input).await;
+    let out = out.into_owned();
+    let expect = format!("tok-{VALUE}-end-hooked");
+    assert!(
+      out.windows(expect.len()).any(|w| w == expect.as_bytes()),
+      "swapped + hooked DATA on the wire"
+    );
+    assert!(!machine.must_close());
+  }
+
+  #[tokio::test]
+  async fn mock_hook_rewrites_h2_trailer_block() {
+    let mut machine = req_hooked(MockHook {
+      add_trailer: Some(("x-hooked-trailer".to_string(), b"1".to_vec())),
+      ..Default::default()
+    });
+    let block = encode_headers(&[
+      (":method", "POST"),
+      (":scheme", "https"),
+      (":path", "/x"),
+      (":authority", "api.github.com"),
+    ]);
+    let mut input = H2_PREFACE.to_vec();
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS, 1, &block));
+    let trailers = encode_headers(&[("x-t", "abc")]);
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &trailers));
+    let (out, _) = machine.substitute(&input).await;
+    let out = out.into_owned();
+    let needle = b"x-hooked-trailer";
+    assert!(out.windows(needle.len()).any(|w| w == needle), "hooked trailer on the wire");
+    assert!(!machine.must_close());
+  }
+
+  #[tokio::test]
+  async fn h2_trailer_flushes_held_data_tail() {
+    // DATA without END_STREAM parks the overlap window; the trailer
+    // HEADERS ends the stream and must flush those bytes — substituted —
+    // before the trailer block, not drop them.
+    let mut machine = req_machine();
+    let block = encode_headers(&[(":method", "POST"), (":path", "/x")]);
+    let mut input = H2_PREFACE.to_vec();
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS, 1, &block));
+    let payload = format!("x{FAKE}y").into_bytes();
+    input.extend_from_slice(&frame(F_DATA, 0, 1, &payload));
+    let trailers = encode_headers(&[("x-t", "abc")]);
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &trailers));
+    let (out, hits) = machine.substitute(&input).await;
+    let out = out.into_owned();
+    assert!(
+      out.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()),
+      "held tail flushed substituted"
+    );
+    assert!(hits.iter().any(|hit| hit.location == Location::Body));
+    assert!(machine.data_tails.is_empty(), "stream tail released");
+    assert!(!machine.must_close());
+  }
+
+  #[tokio::test]
+  async fn h2_needle_ending_in_hold_window_not_sliced() {
+    // The needle ends inside the (former fixed-size) hold-back window but
+    // starts before it: a window cut would emit its prefix raw and the
+    // match would never recombine. It must be substituted in frame one.
+    let mut machine = req_machine();
+    let block = encode_headers(&[(":method", "POST"), (":path", "/x")]);
+    let mut input = H2_PREFACE.to_vec();
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS, 1, &block));
+    let payload = format!("x{FAKE}y").into_bytes();
+    input.extend_from_slice(&frame(F_DATA, 0, 1, &payload));
+    input.extend_from_slice(&frame(F_DATA, FLAG_END_STREAM, 1, b"zz"));
+    let (out, hits) = machine.substitute(&input).await;
+    let out = out.into_owned();
+    assert!(
+      out.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()),
+      "needle inside one frame substituted whole"
+    );
+    assert!(hits.iter().any(|hit| hit.location == Location::Body));
+    assert!(machine.data_tails.is_empty());
+    assert!(!machine.must_close());
+  }
+
+  #[tokio::test]
+  async fn h2_needle_split_across_data_frames() {
+    // The needle straddles two DATA frames mid-token: the per-stream
+    // hold-back window must recombine it, never emit the prefix raw.
+    let mut machine = req_machine();
+    let block = encode_headers(&[(":method", "POST"), (":path", "/x")]);
+    let mut input = H2_PREFACE.to_vec();
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS, 1, &block));
+    let (a, b) = FAKE.split_at(15);
+    input.extend_from_slice(&frame(F_DATA, 0, 1, format!("pre-{a}").as_bytes()));
+    input.extend_from_slice(&frame(F_DATA, FLAG_END_STREAM, 1, format!("{b}-post").as_bytes()));
+    let (out, hits) = machine.substitute(&input).await;
+    let out = out.into_owned();
+    assert!(
+      out.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()),
+      "split needle recombined and substituted"
+    );
+    assert!(!out.windows(FAKE.len() - 1).any(|w| w == &FAKE.as_bytes()[..FAKE.len() - 1]));
+    assert!(hits.iter().any(|hit| hit.location == Location::Body));
+    assert!(machine.data_tails.is_empty());
+    assert!(!machine.must_close());
   }
 }

@@ -20,6 +20,7 @@ allow-branch = ["main"]
 pre-release-commit-message = "chore: Release {{crate_name}} version {{version}}"
 [workspace]
 members = ["crates/*"]
+exclude = ["examples/plugins"]
 # `hodor-ebpf-programs` is a member (so `aya-build` can resolve it with
 # `cargo build --package`) but never part of a host build: it only compiles for
 # the `bpf` target with nightly and `-Z build-std`, so every workspace-wide

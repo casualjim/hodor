@@ -24,6 +24,78 @@ pub enum Direction {
   Response,
 }
 
+/// What rides on the connection: picks the grant scheme, the initial
+/// framing state, and whether only equal-length substitutions are safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MachineMode {
+  /// Framed HTTP behind TLS (`https` grants).
+  Https,
+  /// Framed plain HTTP (`http` grants).
+  Http,
+  /// Raw TCP bytes (`tcp` grants, equal-length only).
+  RawTcp,
+  /// Raw bytes behind terminated TLS (`https` grants, equal-length only).
+  RawTls,
+  /// Scan-only passthrough, framing unknowable (test scaffolding).
+  #[cfg(test)]
+  Opaque,
+}
+
+impl MachineMode {
+  /// Grant scheme the mode's pairs come from.
+  fn scheme(self) -> Scheme {
+    match self {
+      Self::Https | Self::RawTls => Scheme::Https,
+      Self::Http => Scheme::Http,
+      Self::RawTcp => Scheme::Tcp,
+      #[cfg(test)]
+      Self::Opaque => Scheme::Https,
+    }
+  }
+
+  /// True when framing is unknowable, so only equal-length substitutions
+  /// preserve the byte stream.
+  fn equal_len_only(self) -> bool {
+    matches!(self, Self::RawTcp | Self::RawTls)
+  }
+}
+
+/// Construction parameters for one substitution machine.
+pub(crate) struct MachineParams<'a> {
+  /// Grant source for the eligible pair set.
+  pub(crate) grants: &'a [Grant],
+  /// Connection endpoint host.
+  pub(crate) host: &'a str,
+  /// Connection endpoint port.
+  pub(crate) port: u16,
+  /// Connection leg.
+  pub(crate) dir: Direction,
+  /// What rides on the connection.
+  pub(crate) mode: MachineMode,
+  /// Stage-1 plugin hook; `None` keeps value-swap-only behavior.
+  pub(crate) hook: Option<Box<dyn hodor_plugin::RewriteHook>>,
+}
+
+impl<'a> MachineParams<'a> {
+  /// Fresh parameters; attach the plugin hook with [`MachineParams::hook`].
+  pub(crate) fn new(grants: &'a [Grant], mode: MachineMode, host: &'a str, port: u16, dir: Direction) -> Self {
+    Self {
+      grants,
+      host,
+      port,
+      dir,
+      mode,
+      hook: None,
+    }
+  }
+
+  /// Attach the stage-1 plugin hook (builder).
+  pub(crate) fn hook(mut self, hook: Option<Box<dyn hodor_plugin::RewriteHook>>) -> Self {
+    self.hook = hook;
+    self
+  }
+}
+
 /// Where a substitution hit was found (log context only, never values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Location {
@@ -50,11 +122,12 @@ struct Pair {
   label: String,
 }
 
-/// Eligible needle→replacement pairs for a connection endpoint.
-fn eligible_pairs(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction, equal_len_only: bool) -> Vec<Pair> {
+/// Eligible needle→replacement pairs for a connection endpoint. The mode
+/// supplies the grant scheme and the equal-length-only constraint.
+fn eligible_pairs(grants: &[Grant], mode: MachineMode, host: &str, port: u16, dir: Direction) -> Vec<Pair> {
   let mut pairs = Vec::new();
   for grant in grants {
-    if !grant.matches(scheme, host, port) {
+    if !grant.matches(mode.scheme(), host, port) {
       continue;
     }
     let (needle, replacement) = match dir {
@@ -64,7 +137,7 @@ fn eligible_pairs(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: 
     if needle.is_empty() || replacement.is_empty() {
       continue;
     }
-    if equal_len_only && needle.len() != replacement.len() {
+    if mode.equal_len_only() && needle.len() != replacement.len() {
       continue;
     }
     pairs.push(Pair {
@@ -149,10 +222,45 @@ fn find_new_match(combined: &[u8], needle: &[u8], tail_len: usize) -> bool {
     .any(|(i, w)| w == needle && i + needle.len() > tail_len)
 }
 
+/// Longest suffix of `data` (bounded by `bound`) that is a proper prefix of
+/// some needle: exactly the bytes that might still grow into a match.
+fn needle_prefix_suffix_len(data: &[u8], pairs: &[Pair], bound: usize) -> usize {
+  let max = bound.min(data.len());
+  for keep in (1..=max).rev() {
+    let suffix = &data[data.len() - keep..];
+    if pairs.iter().any(|pair| pair.needle.len() > keep && pair.needle.starts_with(suffix)) {
+      return keep;
+    }
+  }
+  0
+}
+
+/// How many bytes of `data` may be emitted (and substituted) now without
+/// cutting a needle: past the end of every complete match (so each is
+/// substituted whole), and short of any trailing partial match (so it stays
+/// held until more bytes arrive). A naive fixed or prefix-only window can
+/// slice a needle that ends inside the hold-back — the prefix goes out raw
+/// and the match never recombines.
+fn needle_safe_emit_len(data: &[u8], pairs: &[Pair], tail_bound: usize) -> usize {
+  let mut emit = data.len() - needle_prefix_suffix_len(data, pairs, tail_bound);
+  for pair in pairs {
+    let needle = &pair.needle;
+    if needle.is_empty() || data.len() < needle.len() {
+      continue;
+    }
+    for i in 0..=data.len() - needle.len() {
+      if &data[i..i + needle.len()] == needle.as_slice() {
+        emit = emit.max(i + needle.len());
+      }
+    }
+  }
+  emit
+}
+
 /// Anything that substitutes one chunk: HTTP/1, raw, opaque, or H2.
 pub trait SubMachine {
   /// Process one chunk; empty input flushes held bytes at stream EOF.
-  fn substitute<'b>(&mut self, chunk: &'b [u8]) -> (Cow<'b, [u8]>, Vec<Hit>);
+  fn substitute<'a>(&mut self, chunk: &'a [u8]) -> impl Future<Output = (Cow<'a, [u8]>, Vec<Hit>)> + Send;
   /// Drain pending HEAD-request count (request side only).
   fn take_head_requests(&mut self) -> usize {
     0
@@ -175,10 +283,10 @@ pub(crate) enum AnyMachine {
 }
 
 impl SubMachine for AnyMachine {
-  fn substitute<'b>(&mut self, chunk: &'b [u8]) -> (Cow<'b, [u8]>, Vec<Hit>) {
+  async fn substitute<'a>(&mut self, chunk: &'a [u8]) -> (Cow<'a, [u8]>, Vec<Hit>) {
     match self {
-      AnyMachine::Http1(machine) => machine.substitute(chunk),
-      AnyMachine::H2(machine) => machine.substitute(chunk),
+      AnyMachine::Http1(machine) => machine.substitute(chunk).await,
+      AnyMachine::H2(machine) => machine.substitute(chunk).await,
     }
   }
   fn take_head_requests(&mut self) -> usize {

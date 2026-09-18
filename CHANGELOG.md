@@ -1,3 +1,8 @@
+## [0.1.19] - 2026-09-18
+
+### ⚙️ Miscellaneous Tasks
+
+- *(container)* Assert on markers that exist in the binary
 ## [0.1.18] - 2026-09-18
 
 ### ⚙️ Miscellaneous Tasks
@@ -5,6 +10,8 @@
 - *(dist)* Build only the root package in releases
 - *(ci)* Update the nightly version
 - *(mise)* Pin the nightly toolchain to a dated specifier
+- Update changelog for v0.1.18 [ci skip]
+- Release
 ## [0.1.17] - 2026-09-18
 
 ### 🚀 Features

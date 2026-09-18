@@ -3236,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "hodor"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "clap",
  "confique",

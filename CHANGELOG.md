@@ -1,8 +1,18 @@
+## [0.1.17] - 2026-09-18
+
+### 🚀 Features
+
+- *(capture)* [**breaking**] Add ebpf transparent backend (#32)
 ## [0.1.16] - 2026-09-16
 
 ### 🚀 Features
 
 - *(capture)* [**breaking**] Restore tun backend beside tproxy via --proxy-backend (#31)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.16 [ci skip]
+- Release hodor version 0.1.16
 ## [0.1.15] - 2026-09-16
 
 ### 🚀 Features

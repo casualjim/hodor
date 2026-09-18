@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   Ok(())
 }
 
-/// The pinned nightly from `mise.lock` (e.g. `nightly-2026-09-17`), if any.
+/// The pinned nightly from `mise.lock` (e.g. `nightly-2026-09-18`), if any.
 ///
 /// `aya-build` runs `rustup run <name>`; bare `nightly` names a different
 /// toolchain than the dated pin mise installs (the one carrying `rust-src`),

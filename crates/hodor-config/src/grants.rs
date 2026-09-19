@@ -182,6 +182,8 @@ pub struct ResolvedConfig {
   pub proxy: crate::config::ProxyCfg,
   /// Parsed per-secret grants.
   pub grants: Vec<Grant>,
+  /// Parsed plugin grants.
+  pub plugins: Vec<crate::plugins::ResolvedPlugin>,
 }
 
 /// Parse every rule's `allow` entries into grants.
@@ -212,9 +214,11 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
       allow,
     });
   }
+  let plugins = crate::plugins::resolve_plugins(cfg)?;
   Ok(ResolvedConfig {
     proxy: cfg.proxy.clone(),
     grants,
+    plugins,
   })
 }
 

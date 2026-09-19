@@ -4,10 +4,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::flow::{FlowTables, PROTO_TCP};
 use hodor_proxy::{ProxyState, serve_transparent_stream};
 use tokio::net::{TcpListener, TcpStream};
-
-use crate::flow::{FlowTables, PROTO_TCP};
 
 /// Accept redirected connections forever.
 ///

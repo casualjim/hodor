@@ -1,0 +1,22 @@
+[package]
+name = "hodor-plugin"
+version = "0.1.16"
+edition = "2024"
+description = "grant-scoped MITM proxy: WASM rewrite-plugin host (wasmtime component model)"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/hodor"
+publish = false
+
+[dependencies]
+eyre = "0.6"
+hodor-config = { path = "../hodor-config" }
+tracing = "0.1"
+wasmtime = { version = "48", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
+wasmtime-wasi = "48"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

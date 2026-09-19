@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
-#MISE description="Run the Rust tests for this project"
-#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", ".mise/tasks/test/**"]
+#MISE description="Run the Rust and plugin e2e tests for this project"
+#MISE depends=["build:plugins"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
-cargo nextest run --cargo-quiet --workspace --exclude hodor-ebpf-programs --show-progress=bar --status-level=slow "$@"
+# `HODOR_PLUGIN_FIXTURES` activates the plugin_e2e_ tests (built by the
+# build:plugins dependency); without it each prints a skip line and passes.
+HODOR_PLUGIN_FIXTURES="$proj_dir/target/plugins" cargo nextest run --cargo-quiet --workspace --exclude hodor-ebpf-programs --show-progress=bar --status-level=slow "$@"

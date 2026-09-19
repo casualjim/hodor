@@ -9,19 +9,15 @@ use crate::substitute::SubMachine;
 /// request machine, then `close_notify` + upstream shutdown while still
 /// draining server→guest; server close flushes the response machine and
 /// ends the relay.
-pub(crate) async fn relay_guarded<G, S>(
-  mut guest: G,
-  mut server: S,
-  req: &mut (dyn SubMachine + Send),
-  resp: &mut (dyn SubMachine + Send),
-  first: &[u8],
-) -> eyre::Result<()>
+pub(crate) async fn relay_guarded<G, S, M>(mut guest: G, mut server: S, req: &mut M, resp: &mut M, first: &[u8]) -> eyre::Result<()>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
+  M: SubMachine + Send,
 {
+  let eof: &[u8] = &[];
   if !first.is_empty() {
-    let (out, hits) = req.substitute(first);
+    let (out, hits) = req.substitute(first).await;
     let pending = req.take_head_requests();
     if pending > 0 {
       resp.suppress_next_bodies(pending);
@@ -31,6 +27,7 @@ where
       return Ok(());
     }
     server.write_all(&out).await.context("relay request head to upstream")?;
+    server.flush().await.context("relay request head flush")?;
   }
   let mut guest_buf = vec![0u8; 32 * 1024];
   let mut server_buf = vec![0u8; 32 * 1024];
@@ -47,7 +44,7 @@ where
         match result {
           Ok(0) => {
             guest_eof = true;
-            let (flushed, hits) = req.substitute(&[]);
+            let (flushed, hits) = req.substitute(eof).await;
             log_hits(&hits);
             server.write_all(&flushed).await.context("relay request flush to upstream")?;
             // Upstream may already have closed its write side; a failed
@@ -56,7 +53,7 @@ where
             let _ = server.shutdown().await;
           }
           Ok(n) => {
-            let (out, hits) = req.substitute(&guest_buf[..n]);
+            let (out, hits) = req.substitute(&guest_buf[..n]).await;
             let pending = req.take_head_requests();
             if pending > 0 {
               resp.suppress_next_bodies(pending);
@@ -77,7 +74,7 @@ where
         };
         match result {
           Ok(0) => {
-            let (flushed, hits) = resp.substitute(&[]);
+            let (flushed, hits) = resp.substitute(eof).await;
             log_hits(&hits);
             if resp.must_close() {
               break;
@@ -86,7 +83,7 @@ where
             break;
           }
           Ok(n) => {
-            let (out, hits) = resp.substitute(&server_buf[..n]);
+            let (out, hits) = resp.substitute(&server_buf[..n]).await;
             log_hits(&hits);
             if resp.must_close() {
               // Scan-only path hit a needle it could not rewrite: drop the

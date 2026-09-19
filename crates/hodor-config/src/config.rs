@@ -30,6 +30,10 @@ pub struct AppConfig {
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
   pub rules: BTreeMap<String, RuleCfg>,
+  /// WASM rewrite plugins by name; loaded at startup, fail closed.
+  #[config(default = {})]
+  #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+  pub plugins: BTreeMap<String, crate::plugins::PluginCfg>,
   /// Agent config mounts by directory name; extends or overrides the built-in
   /// table.
   #[config(default = {})]

@@ -1,3 +1,4 @@
 .cache
 .data
 mise.local.toml
+target/

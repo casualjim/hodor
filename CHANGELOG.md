@@ -1,8 +1,18 @@
+## [0.1.21] - 2026-09-19
+
+### 🚀 Features
+
+- *(proxy)* Add wasm rewrite plugin system + proptest fuzz suite (#34)
 ## [0.1.20] - 2026-09-18
 
 ### 🚜 Refactor
 
 - *(proxy)* [**breaking**] Replace hand-rolled TLS stack with rama + boring (#33)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.20 [ci skip]
+- Release
 ## [0.1.19] - 2026-09-18
 
 ### ⚙️ Miscellaneous Tasks

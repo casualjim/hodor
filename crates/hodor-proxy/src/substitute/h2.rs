@@ -465,35 +465,39 @@ impl H2Machine {
     }
     let mut out = Vec::new();
     if block.end_stream {
-      // Trailer-terminated stream: the DATA hold-back window still parks
-      // body bytes (no DATA END_STREAM released them). Flush them as a
-      // final DATA frame before the trailer block, or they are lost —
-      // split secrets included.
-      if let Some(held) = self.data_tails.remove(&block.stream_id)
-        && !held.is_empty()
-      {
-        let (mut new_held, mut held_hits) = replace_in(&held, &self.pairs, Location::Body);
-        hits.append(&mut held_hits);
-        let mut closed = false;
-        if let Some(hook) = self.hook.as_mut()
-          && hook.rewrite_chunk(&mut new_held, true).await == Verdict::Close
-        {
-          self.must_close = true;
-          closed = true;
-        }
-        if !closed {
-          let mut offset = 0;
-          while offset < new_held.len() {
-            let take = (new_held.len() - offset).min(0xff_ffff);
-            append_frame(&mut out, F_DATA, 0, block.stream_id, &new_held[offset..offset + take]);
-            offset += take;
-          }
-        }
-      }
+      self.flush_trailer_held(block.stream_id, &mut out, hits).await;
       self.open_streams.remove(&block.stream_id);
     }
     append_header_frames(&mut out, block.stream_id, block.end_stream, &encoded);
     Ok(out)
+  }
+
+  /// Trailer-terminated stream: the DATA hold-back window still parks body
+  /// bytes (no DATA `END_STREAM` released them). Flush them as a final DATA
+  /// frame before the trailer block, or they are lost — split secrets
+  /// included.
+  async fn flush_trailer_held(&mut self, stream_id: u32, out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
+    if let Some(held) = self.data_tails.remove(&stream_id)
+      && !held.is_empty()
+    {
+      let (mut new_held, mut held_hits) = replace_in(&held, &self.pairs, Location::Body);
+      hits.append(&mut held_hits);
+      let mut closed = false;
+      if let Some(hook) = self.hook.as_mut()
+        && hook.rewrite_chunk(&mut new_held, true).await == Verdict::Close
+      {
+        self.must_close = true;
+        closed = true;
+      }
+      if !closed {
+        let mut offset = 0;
+        while offset < new_held.len() {
+          let take = (new_held.len() - offset).min(0xff_ffff);
+          append_frame(out, F_DATA, 0, stream_id, &new_held[offset..offset + take]);
+          offset += take;
+        }
+      }
+    }
   }
 
   fn go_opaque(&mut self, out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
@@ -994,8 +998,7 @@ mod h2_tests {
         if let Some((name, value)) = self.add_header.clone() {
           let header = PluginHeader { name, value };
           match head {
-            PluginHead::Request { headers, .. } => headers.push(header),
-            PluginHead::Response { headers, .. } => headers.push(header),
+            PluginHead::Request { headers, .. } | PluginHead::Response { headers, .. } => headers.push(header),
           }
         }
         Verdict::Continue

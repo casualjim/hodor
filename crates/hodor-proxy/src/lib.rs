@@ -773,6 +773,14 @@ fn local_addr(listener: &TcpListener) -> SocketAddr {
 }
 
 #[cfg(test)]
+/// Three-byte H2 frame-length prefix (big-endian, capped at 24 bits).
+fn h2_len(len: usize) -> [u8; 3] {
+  u32::try_from(len).expect("frame length fits 24 bits").to_be_bytes()[1..4]
+    .try_into()
+    .expect("three bytes")
+}
+
+#[cfg(test)]
 mod tests {
   use super::*;
   use std::time::Duration;
@@ -1201,7 +1209,7 @@ mod tests {
     let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_addr = local_addr(&stub);
     let (proxy_addr, proxy) = run_proxy().await; // no grants: splice path
-    let blob: Vec<u8> = (0..256u32).map(|i| (i % 251) as u8).collect();
+    let blob: Vec<u8> = (0..256u32).map(|i| u8::try_from(i % 251).expect("fits u8")).collect();
     let expect = blob.clone();
     let stub_task = tokio::spawn(async move {
       let (mut conn, _) = stub.accept().await.unwrap();
@@ -1728,9 +1736,7 @@ mod tests {
 
     fn data_frame(flags: u8, payload: &[u8]) -> Vec<u8> {
       let mut frame = Vec::new();
-      frame.push(((payload.len() >> 16) & 0xff) as u8);
-      frame.push(((payload.len() >> 8) & 0xff) as u8);
-      frame.push((payload.len() & 0xff) as u8);
+      frame.extend_from_slice(&h2_len(payload.len()));
       frame.extend_from_slice(&[0x0, flags, 0, 0, 0, 1]);
       frame.extend_from_slice(payload);
       frame
@@ -1810,9 +1816,7 @@ mod tests {
         .unwrap();
     }
     let mut req = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
-    req.push(((block.len() >> 16) & 0xff) as u8);
-    req.push(((block.len() >> 8) & 0xff) as u8);
-    req.push((block.len() & 0xff) as u8);
+    req.extend_from_slice(&h2_len(block.len()));
     req.extend_from_slice(&[0x1, 0x4, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS
     req.extend_from_slice(&block);
     req.extend_from_slice(&data_frame(0x0, b"AAAAAAAA"));
@@ -1899,14 +1903,10 @@ mod tests {
       )
       .unwrap();
     let mut req = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
-    req.push(((head_block.len() >> 16) & 0xff) as u8);
-    req.push(((head_block.len() >> 8) & 0xff) as u8);
-    req.push((head_block.len() & 0xff) as u8);
+    req.extend_from_slice(&h2_len(head_block.len()));
     req.extend_from_slice(&[0x1, 0x4, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS
     req.extend_from_slice(&head_block);
-    req.push(((trailer_block.len() >> 16) & 0xff) as u8);
-    req.push(((trailer_block.len() >> 8) & 0xff) as u8);
-    req.push((trailer_block.len() & 0xff) as u8);
+    req.extend_from_slice(&h2_len(trailer_block.len()));
     req.extend_from_slice(&[0x1, 0x4 | 0x1, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS|END_STREAM
     req.extend_from_slice(&trailer_block);
     tls.write_all(&req).await.unwrap();

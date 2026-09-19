@@ -72,7 +72,7 @@ pub(crate) async fn peek_stream<G: AsyncRead + Unpin>(guest: &mut G, initial: &[
 /// SNI plus hello of a complete `ClientHello` in `buf`, via rama's parser.
 /// None while the hello is still incomplete, invalid, or carries no SNI, so
 /// the caller keeps accumulating.
-fn hello_sni(buf: &[u8]) -> Option<(String, ClientHello)> {
+pub(crate) fn hello_sni(buf: &[u8]) -> Option<(String, ClientHello)> {
   match parse_client_hello_handshake_prefix(buf) {
     ClientHelloHandshakePrefix::Complete(hello) => {
       let sni = hello.ext_server_name().map(ToString::to_string)?;

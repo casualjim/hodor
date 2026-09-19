@@ -307,7 +307,7 @@ impl SecretsMachine {
                   match self.swap_region(&[], true, hits).await {
                     None => return Step::Rest(&[]),
                     Some((_, region)) => {
-                      self.emit_data_chunk(out, &region);
+                      Self::emit_data_chunk(out, &region);
                       out.extend_from_slice(b"0\r\n");
                       self.chunk_phase = ChunkPhase::Trailers;
                     }
@@ -349,72 +349,90 @@ impl SecretsMachine {
             ChunkPhase::Data | ChunkPhase::AfterData | ChunkPhase::Broken => unreachable!("phase checked above"),
           }
         }
-        ChunkPhase::Data => {
-          if rest.is_empty() && self.data_remaining > 0 {
-            // Nothing to consume this iteration: wait for the next arrival
-            // (never spin re-emitting the held window).
-            return Step::Rest(&[]);
-          }
-          let take = self.data_remaining.min(rest.len());
-          let (payload, tail) = rest.split_at(take);
-          rest = tail;
-          self.data_remaining -= take;
-          match self.body_mode {
-            BodyMode::Substitute => match self.swap_region(payload, false, hits).await {
-              None => return Step::Rest(&[]),
-              Some((_, region)) => self.emit_data_chunk(out, &region),
-            },
-            BodyMode::ScanOnly => self.forward_scanned(payload, out, hits),
-          }
-          if self.data_remaining == 0 {
-            self.chunk_phase = ChunkPhase::AfterData;
-          }
-        }
-        ChunkPhase::AfterData => {
-          if !self.line_buf.is_empty() {
-            // A lone `\r` stashed from the previous arrival.
-            if rest.is_empty() {
-              return Step::Rest(&[]);
-            }
-            let pending = std::mem::take(&mut self.line_buf);
-            if rest[0] == b'\n' {
-              if self.body_mode == BodyMode::ScanOnly {
-                out.extend_from_slice(b"\r\n");
-              }
-              rest = &rest[1..];
-              self.chunk_phase = ChunkPhase::SizeLine;
-            } else {
-              self.forward_scanned(&pending, out, hits);
-              self.chunk_phase = ChunkPhase::Broken;
-            }
-          } else if rest.is_empty() {
-            return Step::Rest(&[]);
-          } else if rest.len() >= 2 {
-            if &rest[..2] == b"\r\n" {
-              // Substitute mode's re-chunk already closed its chunk; only
-              // the verbatim scan-only path must forward the delimiter.
-              if self.body_mode == BodyMode::ScanOnly {
-                out.extend_from_slice(b"\r\n");
-              }
-              rest = &rest[2..];
-              self.chunk_phase = ChunkPhase::SizeLine;
-            } else {
-              self.forward_scanned(&rest[..2], out, hits);
-              self.chunk_phase = ChunkPhase::Broken;
-            }
-          } else if rest[0] == b'\r' {
-            // Half a delimiter: hold for the next arrival.
-            self.line_buf.push(b'\r');
-            return Step::Rest(&[]);
-          } else {
-            self.forward_scanned(&rest[..1], out, hits);
-            self.chunk_phase = ChunkPhase::Broken;
-          }
-        }
+        ChunkPhase::Data => match self.step_chunked_data(rest, out, hits).await {
+          Some(remaining) => rest = remaining,
+          None => return Step::Rest(&[]),
+        },
+        ChunkPhase::AfterData => match self.step_chunked_after_data(rest, out, hits) {
+          Some(remaining) => rest = remaining,
+          None => return Step::Rest(&[]),
+        },
       }
     }
   }
 
+  /// `ChunkPhase::Data`: consume up to `data_remaining` bytes of payload
+  /// through the substitution window. `None` parks the parser for the next
+  /// arrival.
+  async fn step_chunked_data<'r>(&mut self, rest: &'r [u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Option<&'r [u8]> {
+    if rest.is_empty() && self.data_remaining > 0 {
+      // Nothing to consume this iteration: wait for the next arrival
+      // (never spin re-emitting the held window).
+      return None;
+    }
+    let take = self.data_remaining.min(rest.len());
+    let (payload, tail) = rest.split_at(take);
+    self.data_remaining -= take;
+    match self.body_mode {
+      BodyMode::Substitute => match self.swap_region(payload, false, hits).await {
+        None => return None,
+        Some((_, region)) => Self::emit_data_chunk(out, &region),
+      },
+      BodyMode::ScanOnly => self.forward_scanned(payload, out, hits),
+    }
+    if self.data_remaining == 0 {
+      self.chunk_phase = ChunkPhase::AfterData;
+    }
+    Some(tail)
+  }
+
+  /// `ChunkPhase::AfterData`: consume the CRLF that terminates one chunk's
+  /// data region (a lone `\r` may straddle arrivals). `None` parks.
+  fn step_chunked_after_data<'r>(&mut self, rest: &'r [u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Option<&'r [u8]> {
+    if !self.line_buf.is_empty() {
+      // A lone `\r` stashed from the previous arrival.
+      if rest.is_empty() {
+        return None;
+      }
+      let pending = std::mem::take(&mut self.line_buf);
+      if rest[0] == b'\n' {
+        if self.body_mode == BodyMode::ScanOnly {
+          out.extend_from_slice(b"\r\n");
+        }
+        self.chunk_phase = ChunkPhase::SizeLine;
+        return Some(&rest[1..]);
+      }
+      self.forward_scanned(&pending, out, hits);
+      self.chunk_phase = ChunkPhase::Broken;
+      return Some(&rest[1..]);
+    }
+    if rest.is_empty() {
+      return None;
+    }
+    if rest.len() >= 2 {
+      if &rest[..2] == b"\r\n" {
+        // Substitute mode's re-chunk already closed its chunk; only
+        // the verbatim scan-only path must forward the delimiter.
+        if self.body_mode == BodyMode::ScanOnly {
+          out.extend_from_slice(b"\r\n");
+        }
+        self.chunk_phase = ChunkPhase::SizeLine;
+        Some(&rest[2..])
+      } else {
+        self.forward_scanned(&rest[..2], out, hits);
+        self.chunk_phase = ChunkPhase::Broken;
+        Some(&rest[2..])
+      }
+    } else if rest[0] == b'\r' {
+      // Half a delimiter: hold for the next arrival.
+      self.line_buf.push(b'\r');
+      None
+    } else {
+      self.forward_scanned(&rest[..1], out, hits);
+      self.chunk_phase = ChunkPhase::Broken;
+      Some(&rest[1..])
+    }
+  }
   /// Reset the incremental chunked parser for the next message.
   fn finish_chunked_message(&mut self) {
     self.line_buf.clear();
@@ -471,7 +489,7 @@ impl SecretsMachine {
 
   /// Wrap one emitted payload region in chunked framing. Empty regions
   /// emit nothing: a zero-length chunk is the terminator, never data.
-  fn emit_data_chunk(&self, out: &mut Vec<u8>, region: &[u8]) {
+  fn emit_data_chunk(out: &mut Vec<u8>, region: &[u8]) {
     if region.is_empty() {
       return;
     }
@@ -483,7 +501,7 @@ impl SecretsMachine {
   /// Swap and hook one complete trailer block (without its final CRLF).
   /// Returns the serialized block (final CRLF included) or `None` when
   /// the hook voted `Close`.
-  async fn rewrite_trailer_block(&mut self, block: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Option<Vec<u8>> {
+  async fn rewrite_trailer_block(&mut self, block: &mut [u8], hits: &mut Vec<Hit>) -> Option<Vec<u8>> {
     let (swapped, trailer_hits) = replace_in(block, &self.pairs, Location::Body);
     hits.extend(trailer_hits);
     let mut headers = parse_trailer_block(&swapped);
@@ -812,6 +830,7 @@ impl SecretsMachine {
   }
 }
 
+#[derive(Clone, Copy)]
 enum Framing {
   Broken,
   Chunked,
@@ -1855,8 +1874,7 @@ mod tests {
         if let Some((name, value)) = self.add_header.clone() {
           let header = PluginHeader { name, value };
           match head {
-            PluginHead::Request { headers, .. } => headers.push(header),
-            PluginHead::Response { headers, .. } => headers.push(header),
+            PluginHead::Request { headers, .. } | PluginHead::Response { headers, .. } => headers.push(header),
           }
         }
         Verdict::Continue

@@ -9,9 +9,10 @@ use secrecy::ExposeSecret as _;
 
 use hodor_config::grants::{Grant, Scheme};
 
+#[cfg(test)]
+mod fuzz_props;
 mod h1;
 mod h2;
-
 pub(crate) use h1::SecretsMachine;
 pub(crate) use h2::{H2_PREFACE, H2Machine};
 

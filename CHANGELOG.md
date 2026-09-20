@@ -1,8 +1,18 @@
+## [0.1.22] - 2026-09-20
+
+### 🚀 Features
+
+- Flatten the workspace CLI, add agent --rm, fix eBPF self-exclusion in containers (#35)
 ## [0.1.21] - 2026-09-19
 
 ### 🚀 Features
 
 - *(proxy)* Add wasm rewrite plugin system + proptest fuzz suite (#34)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.21 [ci skip]
+- Release
 ## [0.1.20] - 2026-09-18
 
 ### 🚜 Refactor

@@ -5,11 +5,16 @@
 //! match, and redacts real values back to fakes on responses. Everything
 //! else splices through byte-identical.
 
-pub use hodor_config::cli::{Cli, Command, ConfineAction, ConfineArgs, FakeArgs, ProxyBackend, ServeArgs};
+pub use hodor_config::cli::{AgentArgs, Cli, Command, FakeArgs, InitArgs, LogsArgs, ProxyBackend, ServeArgs, WorkspaceArgs};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser as _;
+
+/// The workspace a command names, or the current directory.
+fn workspace_arg(workspace: Option<&Path>) -> PathBuf {
+  workspace.unwrap_or(Path::new(".")).to_path_buf()
+}
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -55,10 +60,17 @@ async fn main() -> eyre::Result<()> {
       print!("{}", hodor_compose::rules_command()?);
       Ok(())
     }
-    Command::Confine(args) => {
-      let workspace = args.workspace.clone().unwrap_or_else(|| PathBuf::from("."));
-      hodor_compose::confine_command(&args.action, &workspace)
+    Command::Init(args) => {
+      let workspace = workspace_arg(args.workspace.as_deref());
+      hodor_compose::init_command(&workspace, args.backend)
     }
+    Command::Agent(args) => {
+      let workspace = workspace_arg(args.workspace.as_deref());
+      hodor_compose::agent_command(&workspace, &args.command, args.rm)
+    }
+    Command::Up(args) => hodor_compose::up_command(&workspace_arg(args.workspace.as_deref())),
+    Command::Down(args) => hodor_compose::down_command(&workspace_arg(args.workspace.as_deref())),
+    Command::Logs(args) => hodor_compose::logs_command(&workspace_arg(args.workspace.as_deref()), &args),
     Command::Serve(args) => serve(&cli, args).await,
   }
 }
@@ -77,10 +89,10 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   }
   let (mut config, workspace) = hodor_config::config::load(cli)?;
   let registry = hodor_config::registry::Registry::load(hodor_config::config::rules_dir().as_deref())?;
-  // fnox is needed when a rule has no inline value, and when a provider
-  // credential it may declare is missing from the environment.
-  let needs_fnox =
-    config.rules.values().any(|rule| rule.value.is_none()) || hodor_fnox::FNOX_ENV.iter().any(|name| std::env::var_os(name).is_none());
+  // fnox is needed exactly when a rule has no inline value: every
+  // credential the proxy runs with resolves from fnox, age-encrypted secrets
+  // included — never from the environment that started this process.
+  let needs_fnox = config.rules.values().any(|rule| rule.value.is_none());
   let fnox = if needs_fnox { hodor_fnox::FnoxSource::open()? } else { None };
   if let Some(source) = &fnox {
     for name in hodor_fnox::export_provider_env(source).await? {

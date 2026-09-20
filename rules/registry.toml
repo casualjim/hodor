@@ -104,11 +104,14 @@ pattern = "{base62:32}"
 # note: no vendor page states a key format; the shape is generic.
 
 [providers.alibaba]
-env = ["DASHSCOPE_API_KEY"]
-hosts = ["https://*.maas.aliyuncs.com"]
+env = ["ALIBABA_API_KEY", "DASHSCOPE_API_KEY"]
+hosts = ["https://dashscope.aliyuncs.com", "https://dashscope-intl.aliyuncs.com", "https://*.maas.aliyuncs.com"]
 pattern = "sk-{base62:32}"
 # source: https://www.alibabacloud.com/help/en/model-studio/first-api-call-to-qwen
-# note: Model Studio (Qwen/DashScope) documents `export DASHSCOPE_API_KEY`; every example base URL is a workspace-prefixed per-region host (`{WorkspaceId}.ap-southeast-1`, `.cn-beijing`, `.us-east-1.maas.aliyuncs.com`), so the wildcard covers the host family.
+# source: https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope
+# note: Model Studio (Qwen/DashScope) documents `export DASHSCOPE_API_KEY`; the OpenAI-compatible base URLs are `https://dashscope.aliyuncs.com/compatible-mode/v1` (China) and `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` (international).
+# note: `ALIBABA_API_KEY` is the generic name; paired with a custom `ALIBABA_API_BASE_URL` it points at a self-hosted or private endpoint, so add that host in rules.d.
+# note: every workspace-scoped Model Studio base URL is a per-region `{WorkspaceId}...maas.aliyuncs.com` host, so the wildcard covers that host family.
 # note: the key examples render as `sk-xxx`/`sk-ee166797fe40xxx`; the body length is not stated, so the pattern approximates it.
 # note: Singapore, US (Virginia), and China (Beijing) API keys are not interchangeable.
 
@@ -336,11 +339,12 @@ pattern = "{base62:32}"
 # note: the key format is not stated in the SDK; the pattern is generic.
 
 [providers.cerebras]
-env = ["CEREBRAS_API_KEY"]
+env = ["CEREBRAS_API_KEY", "CEREBRAS_API_KEY_SUBSCRIPTION"]
 hosts = ["https://api.cerebras.ai"]
 pattern = "{base62:32}"
 # source: https://inference-docs.cerebras.ai/quickstart
-# note: the docs name the variable and host but show no key format; the shape is generic.
+# source: https://inference-docs.cerebras.ai/api-reference/authentication
+# note: `CEREBRAS_API_KEY_SUBSCRIPTION` is the subscription-plan key; it authenticates against the same inference host. The docs name the variable and host but show no key format, so the shape is generic.
 
 [providers.chutes]
 env = ["CHUTES_API_KEY"]
@@ -424,13 +428,21 @@ pattern = "{base62:64}"
 # note: the Cloud API page documents only the `Authorization: Bearer {secret_key}` header; the env name comes from CockroachDB's Terraform provider.
 # note: the docs state no key format; the provider also accepts a JWT variant (`COCKROACH_API_JWT`), which the pattern approximates.
 
+[providers.codestral]
+env = ["CODESTRAL_API_KEY"]
+hosts = ["https://codestral.mistral.ai", "https://api.mistral.ai"]
+pattern = "{base62:32}"
+# source: https://docs.mistral.ai/capabilities/coding
+# source: https://docs.mistral.ai/api/endpoint/fim
+# note: Codestral serves its FIM and chat endpoints from the dedicated `codestral.mistral.ai` host; the key also works against the shared `api.mistral.ai`. The docs state no key format, so the shape is generic.
+
 [providers.cohere]
-env = ["CO_API_KEY"]
+env = ["CO_API_KEY", "COHERE_API_KEY"]
 hosts = ["https://api.cohere.com"]
 pattern = "{base62:32}"
 # source: https://docs.cohere.com/reference/chat.md
 # source: https://raw.githubusercontent.com/cohere-ai/cohere-python/main/README.md
-# note: the SDK default variable is `CO_API_KEY`, not `COHERE_API_KEY`; the token format is not stated in the docs.
+# note: the SDK default variable is `CO_API_KEY`; `COHERE_API_KEY` is the name the wider tool ecosystem exports the same key under. The token format is not stated in the docs.
 
 [providers.context7]
 env = ["CONTEXT7_API_KEY"]
@@ -648,11 +660,11 @@ pattern = "fc-{base62:32}"
 # note: docs show `Authorization: Bearer fc-YOUR-API-KEY`; no length is documented, the shape keeps the `fc-` prefix.
 
 [providers.fireworks]
-env = ["FIREWORKS_API_KEY"]
+env = ["FIREWORKS_API_KEY", "FIREWORKS_AI_API_KEY"]
 hosts = ["https://api.fireworks.ai"]
 pattern = "{base62:32}"
 # source: https://docs.fireworks.ai/getting-started/quickstart
-# note: the quickstart documents the variable and host; the key format is not stated.
+# note: the quickstart documents the variable and host; `FIREWORKS_AI_API_KEY` is the spelling the wider tool ecosystem exports the same key under. The key format is not stated.
 
 [providers.fly]
 env = ["FLY_API_TOKEN"]
@@ -715,7 +727,7 @@ pattern = "{hex:40}"
 # note: Gitea instances are typically self-hosted; `gitea.com` is the vendor SaaS host — add explicit allow entries for your instances in rules.d.
 
 [providers.github]
-env = ["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"]
+env = ["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GITHUB_API_TOKEN"]
 hosts = ["https://api.github.com", "https://github.com", "https://uploads.github.com"]
 pattern = "ghp_{hex:40}"
 contains = ["gh_"]
@@ -745,9 +757,10 @@ pattern = "{base62:32}"
 
 [providers.google]
 env = ["GOOGLE_GENERATIVE_AI_API_KEY"]
+hosts = ["https://generativelanguage.googleapis.com"]
 pattern = "{base62:32}"
-# source: https://models.dev/api.json (curated provider catalog)
-# note: no vendor page states a key format; the shape is generic.
+# source: https://ai.google.dev/gemini-api/docs/api-key
+# note: `GOOGLE_GENERATIVE_AI_API_KEY` is the name the AI SDKs export the Google Generative Language key under; it authenticates against the same host as `GEMINI_API_KEY`. No key format is documented, so the shape is generic.
 
 [providers.grafana]
 env = ["GRAFANA_API_KEY", "GRAFANA_SERVICE_ACCOUNT_TOKEN"]
@@ -1238,13 +1251,13 @@ pattern = "{base62:32}"
 # note: no vendor page states a key format; the shape is generic.
 
 [providers.novita]
-env = ["NOVITA_API_KEY"]
+env = ["NOVITA_API_KEY", "NOVITA_AI_API_KEY"]
 hosts = ["https://api.novita.ai"]
 pattern = "sk_{base62:32}"
 # source: https://novita.ai/docs/guides/llm-api-keys
 # source: https://novita.ai/docs/guides/llm-api
 # source: https://novita.ai/docs/guides/sandbox-your-first-agent-sandbox
-# note: the keys page states every key begins with `sk_`; the length is not documented.
+# note: the keys page states every key begins with `sk_`; `NOVITA_AI_API_KEY` is the spelling the wider tool ecosystem exports the same key under. The length is not documented.
 
 [providers.npm]
 env = ["NPM_TOKEN"]
@@ -1492,6 +1505,15 @@ pattern = "{base62:32}"
 # source: https://docs.railway.com/guides/cli
 # source: https://docs.railway.com/integrations/api
 # note: `RAILWAY_TOKEN` is project-scoped, `RAILWAY_API_TOKEN` account/workspace-scoped (CLI docs). No token format is stated, so the shape is generic.
+
+[providers.reddit]
+env = ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_PASSWORD", "REDDIT_USERNAME"]
+hosts = ["https://oauth.reddit.com", "https://www.reddit.com"]
+pattern = "{base62:32}"
+# source: https://github.com/reddit-archive/reddit/wiki/OAuth2
+# source: https://github.com/praw-dev/praw/blob/master/docs/getting_started/authentication.rst
+# note: the OAuth token endpoint is `https://www.reddit.com/api/v1/access_token` (basic auth with the client id/secret; the script-app password grant also carries username/password in the body) and the API itself is `https://oauth.reddit.com`.
+# note: Reddit states no credential format; the shape is generic.
 
 [providers.redis-cloud]
 env = ["REDISCLOUD_ACCESS_KEY", "REDISCLOUD_SECRET_KEY"]
@@ -1755,6 +1777,14 @@ pattern = "{base62:32}"
 # source: https://models.dev/api.json (curated provider catalog)
 # note: no vendor page states a key format; the shape is generic.
 
+[providers.subscan]
+env = ["SUBSCAN_API_KEY"]
+hosts = ["https://api.subscan.io", "https://*.api.subscan.io", "https://pro.subscan.io"]
+pattern = "{base62:32}"
+# source: https://support.subscan.io/
+# source: https://github.com/subscan-explorer/subscan-api-docs
+# note: the docs call `https://<network>.api.subscan.io` (e.g. `polkadot.api.subscan.io`) with an `X-API-Key` header; the apex and the `pro.` console host are listed alongside. No key format is documented, so the shape is generic.
+
 [providers.supabase]
 env = ["SUPABASE_SERVICE_ROLE_KEY"]
 hosts = ["https://*.supabase.co"]
@@ -1955,6 +1985,14 @@ hosts = ["https://api.vivgrid.com"]
 pattern = "{base62:32}"
 # source: https://models.dev/api.json (curated provider catalog)
 # note: no vendor page states a key format; the shape is generic.
+
+[providers.voyage]
+env = ["VOYAGE_API_KEY"]
+hosts = ["https://api.voyageai.com"]
+pattern = "{base62:32}"
+# source: https://docs.voyageai.com/docs/api-key-and-installation
+# source: https://github.com/voyage-ai/openapi/blob/main/voyage-openapi.yml
+# note: the OpenAPI document's server is `https://api.voyageai.com/v1` and the security scheme defaults to `$VOYAGE_API_KEY`; no key format is stated.
 
 [providers.vultr]
 env = ["VULTR_API_KEY"]
@@ -7543,9 +7581,357 @@ pattern = "{base62:32}"
 
 [providers.blockscout]
 env = ["BLOCKSCOUT_ACCESS_KEY", "BLOCKSCOUT_ACCESS_TOKEN", "BLOCKSCOUT_APIKEY", "BLOCKSCOUT_API_KEY", "BLOCKSCOUT_API_TOKEN", "BLOCKSCOUT_KEY"]
-hosts = ["https://*.blockscout.com"]
+hosts = ["https://api.blockscout.com", "https://*.blockscout.com"]
 pattern = "{base62:32}"
-# source: docs.blockscout.com/devs/apis
+# source: https://docs.blockscout.com/devs/pro-api
+# source: https://github.com/blockscout/backend-configs/blob/main/pro-api/prod/chains-config.json
+# note: `api.blockscout.com` is the multichain PRO API — one key reaches every chain in the supported set via `?chain_id=` — and the vendor marks per-instance API support deprecated, so the unqualified names point there first.
+# note: PRO keys render as `proapi_<body>`; these entries mix PRO and per-instance names, whose shapes differ, so the pattern stays generic.
+# note: `*.blockscout.com` covers the per-instance family; a chain whose explorer runs on the chain's own domain is outside that wildcard and is named explicitly in its own entry below.
+
+[providers.blockscout-arbitrum]
+env = ["BLOCKSCOUT_ARBITRUM_API_KEY"]
+hosts = ["https://arbitrum.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-arbitrum-nova]
+env = ["BLOCKSCOUT_ARBITRUM_NOVA_API_KEY"]
+hosts = ["https://arbitrum-nova.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-arbitrum-sepolia]
+env = ["BLOCKSCOUT_ARBITRUM_SEPOLIA_API_KEY"]
+hosts = ["https://arbitrum-sepolia.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-astar]
+env = ["BLOCKSCOUT_ASTAR_API_KEY"]
+hosts = ["https://astar.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-awaji]
+env = ["BLOCKSCOUT_AWAJI_API_KEY"]
+hosts = ["https://awaji.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-base]
+env = ["BLOCKSCOUT_BASE_API_KEY"]
+hosts = ["https://base.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-base-sepolia]
+env = ["BLOCKSCOUT_BASE_SEPOLIA_API_KEY"]
+hosts = ["https://base-sepolia.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-celo]
+env = ["BLOCKSCOUT_CELO_API_KEY"]
+hosts = ["https://celo.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-celo-sepolia]
+env = ["BLOCKSCOUT_CELO_SEPOLIA_API_KEY"]
+hosts = ["https://celo-sepolia.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-creditcoin]
+env = ["BLOCKSCOUT_CREDITCOIN_API_KEY"]
+hosts = ["https://creditcoin.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-creditcoin-devnet]
+env = ["BLOCKSCOUT_CREDITCOIN_DEVNET_API_KEY"]
+hosts = ["https://creditcoin-devnet.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-creditcoin-testnet]
+env = ["BLOCKSCOUT_CREDITCOIN_TESTNET_API_KEY"]
+hosts = ["https://creditcoin-testnet.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-derive]
+env = ["BLOCKSCOUT_DERIVE_API_KEY"]
+hosts = ["https://derive.blockscout.com", "https://explorer.derive.xyz"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `derive.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.derive.xyz`, so both carry the key.
+
+[providers.blockscout-doma]
+env = ["BLOCKSCOUT_DOMA_API_KEY"]
+hosts = ["https://doma.blockscout.com", "https://explorer.doma.xyz"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `doma.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.doma.xyz`, so both carry the key.
+
+[providers.blockscout-eden]
+env = ["BLOCKSCOUT_EDEN_API_KEY"]
+hosts = ["https://eden.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-eden-testnet]
+env = ["BLOCKSCOUT_EDEN_TESTNET_API_KEY"]
+hosts = ["https://eden-testnet.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-etc]
+env = ["BLOCKSCOUT_ETC_API_KEY"]
+hosts = ["https://etc.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-etc-mordor]
+env = ["BLOCKSCOUT_ETC_MORDOR_API_KEY"]
+hosts = ["https://etc-mordor.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-eth]
+env = ["BLOCKSCOUT_ETH_API_KEY"]
+hosts = ["https://eth.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-eth-hoodi]
+env = ["BLOCKSCOUT_ETH_HOODI_API_KEY"]
+hosts = ["https://eth-hoodi.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-eth-sepolia]
+env = ["BLOCKSCOUT_ETH_SEPOLIA_API_KEY"]
+hosts = ["https://eth-sepolia.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-filecoin]
+env = ["BLOCKSCOUT_FILECOIN_API_KEY"]
+hosts = ["https://filecoin.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-filecoin-testnet]
+env = ["BLOCKSCOUT_FILECOIN_TESTNET_API_KEY"]
+hosts = ["https://filecoin-testnet.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-flow]
+env = ["BLOCKSCOUT_FLOW_API_KEY"]
+hosts = ["https://flow.blockscout.com", "https://evm.flow.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `flow.blockscout.com` alias redirects to the chain-hosted explorer `https://evm.flow.com`, so both carry the key.
+
+[providers.blockscout-fuse]
+env = ["BLOCKSCOUT_FUSE_API_KEY"]
+hosts = ["https://fuse.blockscout.com", "https://explorer.fuse.io"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `fuse.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.fuse.io`, so both carry the key.
+
+[providers.blockscout-gnosis]
+env = ["BLOCKSCOUT_GNOSIS_API_KEY"]
+hosts = ["https://gnosis.blockscout.com", "https://gnosisscan.io"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `gnosis.blockscout.com` alias redirects to the chain-hosted explorer `https://gnosisscan.io`, so both carry the key.
+
+[providers.blockscout-gnosis-chiado]
+env = ["BLOCKSCOUT_GNOSIS_CHIADO_API_KEY"]
+hosts = ["https://gnosis-chiado.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-hpp]
+env = ["BLOCKSCOUT_HPP_API_KEY"]
+hosts = ["https://hpp.blockscout.com", "https://explorer.hpp.io"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `hpp.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.hpp.io`, so both carry the key.
+
+[providers.blockscout-hsk]
+env = ["BLOCKSCOUT_HSK_API_KEY"]
+hosts = ["https://hsk.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-iota-evm]
+env = ["BLOCKSCOUT_IOTA_EVM_API_KEY"]
+hosts = ["https://iota-evm.blockscout.com", "https://explorer.evm.iota.org"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `iota-evm.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.evm.iota.org`, so both carry the key.
+
+[providers.blockscout-megaeth]
+env = ["BLOCKSCOUT_MEGAETH_API_KEY"]
+hosts = ["https://megaeth.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-mizuhiki]
+env = ["BLOCKSCOUT_MIZUHIKI_API_KEY"]
+hosts = ["https://mizuhiki.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-neon]
+env = ["BLOCKSCOUT_NEON_API_KEY"]
+hosts = ["https://neon.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-neon-devnet]
+env = ["BLOCKSCOUT_NEON_DEVNET_API_KEY"]
+hosts = ["https://neon-devnet.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-nexus]
+env = ["BLOCKSCOUT_NEXUS_API_KEY"]
+hosts = ["https://nexus.blockscout.com", "https://explorer.nexus.xyz"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `nexus.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.nexus.xyz`, so both carry the key.
+
+[providers.blockscout-nexus-staging-testnet]
+env = ["BLOCKSCOUT_NEXUS_STAGING_TESTNET_API_KEY"]
+hosts = ["https://nexus-staging-testnet.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-numine]
+env = ["BLOCKSCOUT_NUMINE_API_KEY"]
+hosts = ["https://numine.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-optimism]
+env = ["BLOCKSCOUT_OPTIMISM_API_KEY"]
+hosts = ["https://optimism.blockscout.com", "https://explorer.optimism.io"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `optimism.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.optimism.io`, so both carry the key.
+
+[providers.blockscout-plume]
+env = ["BLOCKSCOUT_PLUME_API_KEY"]
+hosts = ["https://plume.blockscout.com", "https://explorer.plume.org"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `plume.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.plume.org`, so both carry the key.
+
+[providers.blockscout-polygon]
+env = ["BLOCKSCOUT_POLYGON_API_KEY"]
+hosts = ["https://polygon.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-reya-cronos]
+env = ["BLOCKSCOUT_REYA_CRONOS_API_KEY"]
+hosts = ["https://reya-cronos.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-rootstock]
+env = ["BLOCKSCOUT_ROOTSTOCK_API_KEY"]
+hosts = ["https://rootstock.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-rootstock-testnet]
+env = ["BLOCKSCOUT_ROOTSTOCK_TESTNET_API_KEY"]
+hosts = ["https://rootstock-testnet.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-scroll]
+env = ["BLOCKSCOUT_SCROLL_API_KEY"]
+hosts = ["https://scroll.blockscout.com", "https://scrollscan.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `scroll.blockscout.com` alias redirects to the chain-hosted explorer `https://scrollscan.com`, so both carry the key.
+
+[providers.blockscout-shibuya]
+env = ["BLOCKSCOUT_SHIBUYA_API_KEY"]
+hosts = ["https://shibuya.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-soneium]
+env = ["BLOCKSCOUT_SONEIUM_API_KEY"]
+hosts = ["https://soneium.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-soneium-minato]
+env = ["BLOCKSCOUT_SONEIUM_MINATO_API_KEY"]
+hosts = ["https://soneium-minato.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-stability]
+env = ["BLOCKSCOUT_STABILITY_API_KEY"]
+hosts = ["https://stability.blockscout.com", "https://explorer.stabilityprotocol.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `stability.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.stabilityprotocol.com`, so both carry the key.
+
+[providers.blockscout-tac]
+env = ["BLOCKSCOUT_TAC_API_KEY"]
+hosts = ["https://tac.blockscout.com", "https://explorer.tac.build"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `tac.blockscout.com` alias redirects to the chain-hosted explorer `https://explorer.tac.build`, so both carry the key.
+
+[providers.blockscout-unichain]
+env = ["BLOCKSCOUT_UNICHAIN_API_KEY"]
+hosts = ["https://unichain.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-unichain-sepolia]
+env = ["BLOCKSCOUT_UNICHAIN_SEPOLIA_API_KEY"]
+hosts = ["https://unichain-sepolia.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-zetachain]
+env = ["BLOCKSCOUT_ZETACHAIN_API_KEY"]
+hosts = ["https://zetachain.blockscout.com", "https://zetascan.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+# note: the `zetachain.blockscout.com` alias redirects to the chain-hosted explorer `https://zetascan.com`, so both carry the key.
+
+[providers.blockscout-zilliqa]
+env = ["BLOCKSCOUT_ZILLIQA_API_KEY"]
+hosts = ["https://zilliqa.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-zksync]
+env = ["BLOCKSCOUT_ZKSYNC_API_KEY"]
+hosts = ["https://zksync.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
+
+[providers.blockscout-zksync-sepolia]
+env = ["BLOCKSCOUT_ZKSYNC_SEPOLIA_API_KEY"]
+hosts = ["https://zksync-sepolia.blockscout.com"]
+pattern = "{base62:32}"
+# source: https://chains.blockscout.com/api/chains
 
 [providers.solscan]
 env = ["SOLSCAN_ACCESS_KEY", "SOLSCAN_ACCESS_TOKEN", "SOLSCAN_APIKEY", "SOLSCAN_API_KEY", "SOLSCAN_API_TOKEN", "SOLSCAN_KEY"]

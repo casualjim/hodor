@@ -60,9 +60,15 @@ pub struct WorkspaceCfg {
   /// workspace slug.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub name: Option<String>,
-  /// Shell invoked by `hodor confine shell`; defaults to sh.
+  /// Shell `hodor agent` runs in the container when no command is given;
+  /// defaults to sh.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub shell: Option<String>,
+  /// Init script inside the agent image that the generated entrypoint chains
+  /// to after installing the CA (`HODOR_INIT`); the common entrypoint script
+  /// names are tried when unset, and the command runs directly otherwise.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub init: Option<String>,
   /// Paths included in the generated compose; `~` expands, relative paths
   /// resolve against the workspace root.
   #[config(default = [])]

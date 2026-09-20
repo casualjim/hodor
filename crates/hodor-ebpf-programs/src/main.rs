@@ -28,7 +28,7 @@
 
 use aya_ebpf::{
   EbpfContext as _,
-  helpers::{bpf_get_current_pid_tgid, bpf_get_socket_cookie},
+  helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_socket_cookie},
   macros::{cgroup_skb, cgroup_sock_addr, map},
   maps::{Array, LruHashMap},
   programs::{SkBuffContext, SockAddrContext},
@@ -39,7 +39,17 @@ use aya_ebpf::{
 #[derive(Clone, Copy)]
 pub struct Config {
   /// PID of the hodor process, so its own dials are never captured.
+  /// Meaningful only outside a PID namespace: inside one, the pid the kernel
+  /// reports is not the pid the process sees, which is what `proxy_cgroup`
+  /// covers.
   pub proxy_pid: u32,
+  /// Explicit padding: the layout is an ABI with the userspace half, and no
+  /// byte may be left to the compiler.
+  pub _pad: [u8; 4],
+  /// Cgroup id of the loader's own cgroup, as
+  /// `bpf_get_current_cgroup_id` reports it. Zero means unknown, leaving the
+  /// pid as the only guard.
+  pub proxy_cgroup: u64,
   /// Loopback port `connect4` rewrites TCP destinations to.
   pub tcp_port: u32,
   /// Loopback port `connect4` rewrites UDP destinations to.
@@ -122,14 +132,24 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// yet (map key 0 absent). Failing closed keeps hodor's own upstream dials out
 /// of the capture loop, which would otherwise recurse.
 ///
-/// The check is per *thread group*, not per thread: aya's `tgid()` is the
-/// process id, which is what the loader writes into `CONFIG`.
+/// The pid check is per *thread group*, not per thread: the tgid is the
+/// process id the loader writes into `CONFIG`. A PID namespace translates
+/// ids, so a containerized hodor never matches on pid — the cgroup id, which
+/// no namespace translates, is what carries the guard there.
 #[inline(always)]
 fn is_proxy() -> bool {
   let Some(config) = CONFIG.get(0) else {
     return true;
   };
-  bpf_get_current_pid_tgid().wrapping_shr(32) as u32 == config.proxy_pid
+  if bpf_get_current_pid_tgid().wrapping_shr(32) as u32 == config.proxy_pid {
+    return true;
+  }
+  if config.proxy_cgroup == 0 {
+    return false;
+  }
+  // SAFETY: querying the current cgroup id has no preconditions.
+  let cgroup = unsafe { bpf_get_current_cgroup_id() };
+  cgroup == config.proxy_cgroup
 }
 
 /// `127.0.0.1` in the kernel's address encoding (`user_ip4` / `skc_rcv_saddr`).

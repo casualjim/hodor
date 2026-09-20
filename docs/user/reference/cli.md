@@ -18,7 +18,7 @@ Serve the proxy.
 | `--ca-file <PATH>` | `HODOR_CA_FILE` | CA PEM path (certificate followed by key). Default `<config-dir>/hodor/ca.pem`. |
 | `--proxy-backend <BACKEND>` | `HODOR_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only), `tun`, `tproxy`, or `ebpf`. Linux only; every backend is compiled in, so no build flags are needed. |
 | `--tproxy-allow-root-netns` | `HODOR_TPROXY_ALLOW_ROOT_NETNS` | With `--proxy-backend tproxy`, allow unscoped capture rules in the host network namespace. Disposable machines only. |
-| `--ebpf-cgroup <PATH>` | `HODOR_EBPF_CGROUP` | With `--proxy-backend ebpf`, the cgroup v2 directory whose member processes get captured. Required for that backend; hodor itself must live outside it. |
+| `--ebpf-cgroup <PATH>` | `HODOR_EBPF_CGROUP` | With `--proxy-backend ebpf`, the cgroup v2 directory whose member processes get captured, or the literal `enclosing` for the cgroup this process's own cgroup lives under (what a compose stack with one `cgroup_parent` per service uses). Required for that backend; otherwise hodor itself must live outside the named cgroup. |
 
 `--proxy-backend`, `--tproxy-allow-root-netns`, and `--ebpf-cgroup` are CLI and environment only, deliberately absent from config files: capture mutates host routes, nft rules, and kernel programs, so enabling it is an explicit act, not ambient configuration.
 
@@ -48,16 +48,25 @@ Generate or load the CA, print its certificate PEM to stdout, and write `ca.crt`
 
 Print `[rules.*]` blocks for the secrets this workspace can get: the intersection of fnox declarations and the known-host registry. Values resolve from fnox at serve time; the output carries env names only. Names the registry knows but states no hosts for are printed commented out; fnox declarations no registry entry covers are listed at the end.
 
-## `hodor confine <ACTION> [WORKSPACE]`
+## `hodor init [--backend <BACKEND>] [WORKSPACE]`
 
-Confine a workspace: generate its stack once as an editable file, then start and stop the layered docker compose project. `WORKSPACE` defaults to the current directory.
+Generate the workspace stack as editable files: `[rules.*]` blocks in `<workspace>/.config/hodor.toml` when the workspace has none, the CA and the agent entrypoint when they are missing, and `<state-dir>/hodor/ws/<slug>/compose.yml`. Nothing existing is overwritten; the stack is regenerated when the workspace config changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.
 
-| Action | Meaning |
-| --- | --- |
-| `init` | Generate `<state-dir>/hodor/ws/<slug>/compose.yml` if absent, and write the CA and agent entrypoint the stack mounts when they are missing. Existing files are left untouched so edits survive. |
-| `up` | Start the layered compose project from the files on disk, creating the CA and entrypoint if they are still missing. |
-| `down` | Stop the layered compose project. |
-| `shell` | Exec the configured shell in the agent container at the translated workspace directory. |
+## `hodor agent [WORKSPACE] [--rm] [-- <COMMAND>...]`
+
+The whole lifecycle in one idempotent run: what `init` does, then `up`, then the configured shell (or `COMMAND`) in the agent. The stack keeps running when that exits, so the next call starts at the exec. `--rm` stops the stack instead: teardown runs after the shell or command exits, including when the terminal's interrupt ends it.
+
+## `hodor up [WORKSPACE]`
+
+Start the layered compose project `hodor init` generated, creating the CA and entrypoint if they are still missing. `WORKSPACE` defaults to the current directory; when no layer file exists, the compose command refuses rather than guess.
+
+## `hodor down [WORKSPACE]`
+
+Stop the layered compose project.
+
+## `hodor logs [-f] [--no-log-prefix] [--tail <N>] [--workspace <PATH>] [SERVICE...]`
+
+Read the stack's logs. `--tail` defaults to `all`; no service means every service. `--workspace` defaults to the current directory and is a flag rather than a positional because the service names already take that slot.
 
 See [how to confine a workspace](../how-to/confine-a-workspace.md).
 

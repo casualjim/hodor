@@ -10,7 +10,7 @@
 
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aya::{
@@ -30,6 +30,53 @@ mod udp;
 pub const TCP_LISTEN_PORT: u16 = 15000;
 /// Loopback port the UDP relay listens on.
 pub const UDP_LISTEN_PORT: u16 = 15001;
+
+/// The `--ebpf-cgroup` value meaning "the cgroup this process's own cgroup
+/// lives under", resolved at startup. A compose stack that gives both services
+/// one `cgroup_parent` names no host path and uses this instead: the docker
+/// daemon resolves that parent relative to its own cgroup root, so an absolute
+/// path baked at generation time is wrong wherever the daemon is nested.
+pub const ENCLOSING: &str = "enclosing";
+
+/// Where cgroup v2 is mounted; the mount point the resolved path is built on.
+const CGROUP2_MOUNT: &str = "/sys/fs/cgroup";
+
+/// Resolve the cgroup enclosing this process: the parent of its own cgroup.
+///
+/// `/proc/self/cgroup` holds this process's path inside the cgroup v2 tree
+/// (`0::<path>`), relative to the mount. The parent directory is the cgroup
+/// shared with sibling containers, which is what a stack that sets one
+/// `cgroup_parent` on both services wants attached. hodor is a member of the
+/// attached subtree here, so the recorded proxy PID is what keeps its own
+/// sockets out of the capture loop.
+fn enclosing_cgroup() -> eyre::Result<PathBuf> {
+  let content = std::fs::read_to_string("/proc/self/cgroup").wrap_err("read /proc/self/cgroup")?;
+  let own = own_cgroup_path(&content).ok_or_else(|| eyre::eyre!("no `0::<path>` line in /proc/self/cgroup: not a cgroup v2 process"))?;
+  enclosing_from(&own).ok_or_else(|| {
+    eyre::eyre!(
+      "no cgroup encloses {}: it is the cgroup root, where attaching would capture every process on the machine; pass an explicit --ebpf-cgroup path",
+      own.display()
+    )
+  })
+}
+
+/// This process's own path in the cgroup v2 tree, from the `0::<path>` line.
+fn own_cgroup_path(content: &str) -> Option<PathBuf> {
+  content.lines().find_map(|line| line.strip_prefix("0::")).map(PathBuf::from)
+}
+
+/// The cgroup directory enclosing `own`, mounted at [`CGROUP2_MOUNT`]. `None`
+/// when there is nothing worth attaching to: the cgroup root itself, or one of
+/// its direct children, where the parent is that root.
+fn enclosing_from(own: &Path) -> Option<PathBuf> {
+  let parent = own.parent()?;
+  if parent == Path::new("/") {
+    return None;
+  }
+  // `join` with an absolute path would replace the mount instead of extending
+  // it, so the leading slash comes off first.
+  Some(Path::new(CGROUP2_MOUNT).join(parent.strip_prefix("/").ok()?))
+}
 
 /// The compiled programs, embedded at build time by `build.rs`.
 static PROGRAMS: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/hodor-ebpf-programs"));
@@ -80,7 +127,9 @@ impl SelfExclusion {
   /// The value written to the programs' `CONFIG` map.
   ///
   /// "Skip nothing" is 0 because no real process has tgid 0: the idle task
-  /// never issues socket calls, so the comparison can never match.
+  /// never issues socket calls, so the comparison can never match. Inside a
+  /// PID namespace this pid never matches what the kernel reports either —
+  /// the cgroup id in [`Config`] is the guard that carries that case.
   fn pid(self) -> u32 {
     match self {
       Self::Proxy => std::process::id(),
@@ -88,6 +137,27 @@ impl SelfExclusion {
       Self::Nothing => 0,
     }
   }
+}
+
+/// The id of this process's own cgroup, as `bpf_get_current_cgroup_id`
+/// reports it: the kernfs inode of the cgroup directory. A PID namespace
+/// translates ids, so a containerized hodor never matches the pid guard —
+/// the cgroup id has no namespace of its own. `0` means it could not be
+/// determined, leaving the pid as the only guard.
+fn own_cgroup_id() -> u64 {
+  use std::os::unix::fs::MetadataExt as _;
+  let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") else {
+    return 0;
+  };
+  let Some(own) = own_cgroup_path(&content) else {
+    return 0;
+  };
+  // `join` with an absolute path would replace the mount instead of extending
+  // it, so the leading slash comes off first.
+  let Ok(relative) = own.strip_prefix("/") else {
+    return 0;
+  };
+  std::fs::metadata(Path::new(CGROUP2_MOUNT).join(relative)).map_or(0, |meta| meta.ino())
 }
 
 /// Attach the capture programs and serve captured traffic forever.
@@ -115,10 +185,11 @@ pub async fn run_ebpf(state: Arc<ProxyState>, cgroup: PathBuf) -> eyre::Result<(
 }
 
 pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> eyre::Result<()> {
-  let cgroup = options
-    .cgroup
-    .clone()
-    .ok_or_else(|| eyre::eyre!("ebpf capture needs a cgroup directory to attach to"))?;
+  let cgroup = match options.cgroup.as_deref() {
+    Some(path) if path == Path::new(ENCLOSING) => enclosing_cgroup()?,
+    Some(path) => path.to_path_buf(),
+    None => eyre::bail!("ebpf capture needs a cgroup directory to attach to, or `--ebpf-cgroup {ENCLOSING}`"),
+  };
   let tcp_port = options.tcp_port.unwrap_or(TCP_LISTEN_PORT);
   let udp_port = options.udp_port.unwrap_or(UDP_LISTEN_PORT);
 
@@ -148,6 +219,8 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> e
 fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfExclusion) -> eyre::Result<()> {
   let config = Config {
     proxy_pid: self_exclusion.pid(),
+    _pad: [0; 4],
+    proxy_cgroup: own_cgroup_id(),
     tcp_port: u32::from(tcp_port),
     udp_port: u32::from(udp_port),
   };
@@ -165,8 +238,16 @@ fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfE
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Config {
-  /// PID of this process, so the programs can skip its own dials.
+  /// PID of this process, so the programs can skip its own dials. Only
+  /// meaningful outside a PID namespace: inside one the pid the kernel-side
+  /// guard compares is not the pid this process sees.
   pub proxy_pid: u32,
+  /// Explicit padding: the layout is an ABI with `hodor-ebpf-programs`, and
+  /// no byte may be left to the compiler.
+  pub _pad: [u8; 4],
+  /// Id of this process's own cgroup, or 0 when unknown: the guard a
+  /// namespace cannot translate, which is what carries the container case.
+  pub proxy_cgroup: u64,
   /// Port `connect4` rewrites TCP destinations to.
   pub tcp_port: u32,
   /// Port `connect4` rewrites UDP destinations to.
@@ -331,6 +412,38 @@ mod live;
 mod tests {
   use super::*;
 
+  /// The stack hands hodor `--ebpf-cgroup enclosing` instead of a host path:
+  /// the docker daemon resolves `cgroup_parent` relative to its own cgroup
+  /// root, so the slice's fs path depends on where the daemon is nested. The
+  /// resolution below has to land on the cgroup both containers share.
+  #[test]
+  fn the_own_cgroup_path_is_parsed_from_the_v2_line() {
+    let own = own_cgroup_path("0::/hodor.slice/hodor-x.slice/docker-abc.scope\n").unwrap();
+    assert_eq!(own, PathBuf::from("/hodor.slice/hodor-x.slice/docker-abc.scope"));
+    assert!(own_cgroup_path("2:cpu:/\n1:name=systemd:/\n").is_none());
+    assert!(own_cgroup_path("").is_none());
+  }
+
+  #[test]
+  fn the_enclosing_cgroup_is_the_parent_of_this_processes_own_cgroup() {
+    let own = own_cgroup_path("0::/hodor.slice/hodor-x.slice/docker-abc.scope\n").unwrap();
+    assert_eq!(own, PathBuf::from("/hodor.slice/hodor-x.slice/docker-abc.scope"));
+    assert_eq!(
+      enclosing_from(&own).unwrap(),
+      PathBuf::from("/sys/fs/cgroup/hodor.slice/hodor-x.slice"),
+      "hodor's own scope is one level under the slice both services share"
+    );
+
+    // Nothing to attach to without capturing the machine: the cgroup root and
+    // its direct children have the root as their parent.
+    assert!(enclosing_from(Path::new("/")).is_none());
+    assert!(enclosing_from(Path::new("/docker-abc.scope")).is_none());
+
+    // A cgroup v1 layout has no `0::` line, and neither does an empty file.
+    assert!(own_cgroup_path("2:cpu:/\n1:name=systemd:/\n").is_none());
+    assert!(own_cgroup_path("").is_none());
+  }
+
   /// `user_ip4` carries the address bytes in network order, so a raw read is
   /// byte-reversed from the numeric address. Getting this backwards silently
   /// routes every captured connection to the wrong host.
@@ -407,10 +520,13 @@ mod tests {
     assert_eq!(offset_of!(OrigDst, proto), 8);
     assert_eq!(offset_of!(OrigDst, _pad), 9);
 
-    assert_eq!(size_of::<Config>(), 12);
+    assert_eq!(size_of::<Config>(), 24);
+    assert_eq!(align_of::<Config>(), 8);
     assert_eq!(offset_of!(Config, proxy_pid), 0);
-    assert_eq!(offset_of!(Config, tcp_port), 4);
-    assert_eq!(offset_of!(Config, udp_port), 8);
+    assert_eq!(offset_of!(Config, _pad), 4);
+    assert_eq!(offset_of!(Config, proxy_cgroup), 8);
+    assert_eq!(offset_of!(Config, tcp_port), 16);
+    assert_eq!(offset_of!(Config, udp_port), 20);
   }
 
   /// A configuration the programs cannot act on must be refused before it is
@@ -420,6 +536,8 @@ mod tests {
   fn config_validation_rejects_zero_ports() {
     let base = Config {
       proxy_pid: SelfExclusion::Proxy.pid(),
+      _pad: [0; 4],
+      proxy_cgroup: own_cgroup_id(),
       tcp_port: u32::from(TCP_LISTEN_PORT),
       udp_port: u32::from(UDP_LISTEN_PORT),
     };

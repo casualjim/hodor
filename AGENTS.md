@@ -48,9 +48,13 @@ mise run test:tun  # live TUN only: needs root, serial
 mise run test:tproxy # live TPROXY only: needs root, serial
 mise run test:ebpf # live eBPF only: needs root, a cgroup v2 tree, serial
 mise run demo      # docker compose integration demo (builds image, needs docker)
-hodor serve [--proxy-backend tun|tproxy|ebpf|none] [--ebpf-cgroup PATH] [--listen 127.0.0.1:8080] [--ca-file ...]  # serve is default
+hodor serve [--proxy-backend tun|tproxy|ebpf|none] [--ebpf-cgroup PATH|enclosing] [--listen 127.0.0.1:8080] [--ca-file ...]  # serve is default
 hodor fake <ENV> [--pattern '{hex:32}']  # deterministic fake
 hodor ca  # generate/load CA, print cert PEM (trust anchor for workload containers)
+hodor init [--backend tun|tproxy|ebpf] [workspace]  # rules config (when absent), CA, entrypoint, and the stack
+hodor agent [workspace] [--rm] [-- CMD...]  # init, up, and a shell (or CMD) in the agent, one idempotent command; --rm stops the stack on exit
+hodor up|down [workspace]  # drive the generated stack
+hodor logs [-f] [--tail N] [--no-log-prefix] [--workspace PATH] [service...]  # the stack's logs (--workspace because services take the positional)
 ```
 
 Config precedence: CLI > env (`HODOR_*`) > project (`<root>/.config/hodor.toml`) > global (`$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`). `--proxy-backend`/`HODOR_PROXY_BACKEND`, `--tproxy-allow-root-netns`, and `--ebpf-cgroup` are CLI/env only by design.

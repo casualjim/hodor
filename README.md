@@ -78,7 +78,7 @@ Everything lives under [docs/user](docs/user/README.md), arranged by what you ne
 
 Two runnable examples ship in the repository:
 
-- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to confine with `hodor confine`: one hodor container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
+- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to confine with `hodor up`: one hodor container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
 - [integration](integration/README.md) — the compose demo behind `mise run demo`, asserting four substitution scenarios and one splice scenario.
 
 ## Where the limits are

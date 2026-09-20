@@ -1,7 +1,7 @@
 //! Host-path expansion, normalization, and translation.
 
 /// One generated mount: host path, translated container path, read-only flag.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Mount {
   /// Host path as configured.
   pub(crate) host: PathBuf,

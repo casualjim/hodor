@@ -38,13 +38,13 @@ A rule wires an environment name to the hosts it may reach, the decoy shape the 
 
 ## `[workspace]`
 
-Controls the compose stack `hodor confine` generates.
+Controls the compose stack `hodor init` generates.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `home` | none | `$HOME` inside the agent container. Required for stack generation. Host paths under the host home translate into this prefix; other paths mount at their own path. |
 | `name` | workspace path slug | Compose project name. |
-| `shell` | `sh` | Shell invoked by `hodor confine shell`. |
+| `shell` | `sh` | Shell `hodor agent` runs in the container when no command is given. |
 | `include` | empty | Extra host paths the agent service mounts, translated into the container home. `~` expands; relative paths resolve against the workspace root; a trailing `:ro`/`:rw` sets the mode. Overlapping paths reuse the covering mount. A path that does not exist fails generation, because docker would mount an empty directory in its place. |
 
 ## `[agents.<name>]`

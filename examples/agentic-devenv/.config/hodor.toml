@@ -1,4 +1,4 @@
-# Workspace config for this example. `hodor confine init` reads it from the
+# Workspace config for this example. `hodor init` reads it from the
 # workspace root: `[workspace]` describes the container layout, `[rules.*]`
 # decides what gets swapped. Real values resolve from fnox at serve time, so no
 # secret belongs in this file.

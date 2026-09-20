@@ -27,7 +27,7 @@ sudo hodor serve --proxy-backend ebpf --ebpf-cgroup /sys/fs/cgroup/hodor --confi
 
 `tproxy` and `tun` install what they need themselves, over netlink: `tproxy` an `IP_TRANSPARENT` listener plus nftables rules and policy routes, `tun` the device plus policy routes. No `nft` or `ip` binary is required. Either captures every outbound TCP connection in the network namespace, LAN destinations included.
 
-`ebpf` is different in two ways that matter operationally. It touches no netfilter and no routing table: the programs are attached to a cgroup, and hodor loads them itself. And it captures by *cgroup membership*, not by namespace, so the workload has to be moved into `--ebpf-cgroup` — and hodor must stay outside it, or its own upstream dials would be redirected back into it.
+`ebpf` is different in two ways that matter operationally. It touches no netfilter and no routing table: the programs are attached to a cgroup, and hodor loads them itself. And it captures by *cgroup membership*, not by namespace, so the workload has to be moved into `--ebpf-cgroup` — and hodor must stay outside it, or its own upstream dials would be redirected back into it. `--ebpf-cgroup enclosing` is the exception: it attaches to the cgroup hodor's own cgroup lives under, for a runtime that places both hodor and its workload in one parent cgroup (a compose stack, say, where the parent's filesystem path depends on where the daemon sits). hodor is a member of the attached cgroup then, and the proxy PID recorded in the programs is what keeps its own sockets out.
 
 ```sh
 echo $$ | sudo tee /sys/fs/cgroup/hodor/cgroup.procs
@@ -41,7 +41,7 @@ With `--proxy-backend tproxy`, hodor refuses unscoped capture rules when it runs
 
 Two accepted shapes:
 
-- Run hodor in its own network namespace (a container with `cap_add: NET_ADMIN`), and share that namespace with the workload. This is what `hodor confine` and the integration demo do.
+- Run hodor in its own network namespace (a container with `cap_add: NET_ADMIN`), and share that namespace with the workload. This is what a confined workspace (`hodor init` then `hodor up`) and the integration demo do.
 - Acknowledge the risk on a disposable machine with `--tproxy-allow-root-netns` or `HODOR_TPROXY_ALLOW_ROOT_NETNS=1`.
 
 `tun` has no such guard: the policy routes it installs name the TUN device, and the teardown guard removes them on exit.

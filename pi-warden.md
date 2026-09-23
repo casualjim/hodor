@@ -1,3 +1,6 @@
+# Models may not pick models for subagents
+One model cannot pick another model for running subagent unless the user explicitly approves the agent
+
 # TODO comments need a reference
 A `TODO` or `FIXME` comment must name a ticket or issue, for example `TODO(APP-123): ...`. A bare `TODO` is a violation.
 

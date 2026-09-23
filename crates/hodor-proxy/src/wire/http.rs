@@ -1,18 +1,15 @@
-//! HTTP/1-family substitution machine (plain HTTP, TLS, raw TCP).
+//! HTTP/1-family wire format: framing plus credential rewrite.
 
 use std::borrow::Cow;
 
 use base64::Engine as _;
 
-#[cfg(test)]
-use hodor_config::grants::Grant;
+use hodor_config::grants::{Grant, Scheme};
 use hodor_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Verdict};
 
-use super::SubMachine;
-
 use super::{
-  Direction, Hit, Location, MachineMode, MachineParams, Pair, eligible_pairs, find_crossing, find_new_match, max_tail_size,
-  needle_prefix_suffix_len, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
+  CredentialPair, Direction, Hit, Location, Rewritten, Wire, eligible_pairs, max_tail_size, needle_safe_emit_len, replace_bytes,
+  replace_in, response_has_no_body, scan_with_tail,
 };
 
 /// Max buffered header block before degrading to opaque scan-only.
@@ -37,8 +34,6 @@ enum State {
   Opaque,
   /// Close-delimited response body: streams like Raw, flushes at EOF.
   CloseDelimited,
-  /// Non-HTTP TCP: equal-length replace with held-back tail.
-  Raw,
 }
 
 /// Incremental chunked-framing parse phase (resumes across arrivals). No
@@ -79,10 +74,10 @@ enum Step<'r> {
 /// Request direction substitutes eligible fakes→values; response direction
 /// substitutes values→fakes for the same eligible set (redaction). Anything
 /// unframable is forwarded unchanged with hits logged — never blocked.
-/// Call [`SecretsMachine::substitute`] with an empty chunk at stream EOF to
+/// Call [`Http::substitute`] with an empty chunk at stream EOF to
 /// flush held bytes.
-pub(crate) struct SecretsMachine {
-  pairs: Vec<Pair>,
+pub(crate) struct Http {
+  pairs: Vec<CredentialPair>,
   dir: Direction,
   state: State,
   head_buf: Vec<u8>,
@@ -114,24 +109,18 @@ pub(crate) struct SecretsMachine {
   hook: Option<Box<dyn RewriteHook>>,
 }
 
-impl SecretsMachine {
-  /// Build the machine from explicit parameters: mode picks the grant
-  /// scheme, the initial framing state, and equal-length-only safety.
+impl Http {
+  /// Build from the grants an `http://` or `https://` rule matched. The
+  /// scheme only picks pairs; framing always starts at a head.
   #[must_use]
-  pub fn new(params: MachineParams<'_>) -> Self {
-    let state = match params.mode {
-      MachineMode::Https | MachineMode::Http => State::Head,
-      MachineMode::RawTcp | MachineMode::RawTls => State::Raw,
-      #[cfg(test)]
-      MachineMode::Opaque => State::Opaque,
-    };
-    let pairs = eligible_pairs(params.grants, params.mode, params.host, params.port, params.dir);
+  pub fn new(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction, hook: Option<Box<dyn RewriteHook>>) -> Self {
+    let pairs = eligible_pairs(grants, scheme, host, port, dir);
     let tail_size = max_tail_size(&pairs);
 
     Self {
       pairs,
-      dir: params.dir,
-      state,
+      dir,
+      state: State::Head,
       head_buf: Vec::new(),
       raw_held: Vec::new(),
       line_buf: Vec::new(),
@@ -146,8 +135,17 @@ impl SecretsMachine {
       head_requests: 0,
       suppress_body: 0,
       must_close: false,
-      hook: params.hook,
+      hook,
     }
+  }
+
+  /// Scan-only variant for tests: framing unknowable from the start.
+  #[cfg(test)]
+  #[must_use]
+  pub fn opaque(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction) -> Self {
+    let mut wire = Self::new(grants, scheme, host, port, dir, None);
+    wire.state = State::Opaque;
+    wire
   }
   pub async fn substitute<'a>(&mut self, chunk: &'a [u8]) -> (Cow<'a, [u8]>, Vec<Hit>) {
     if chunk.is_empty() {
@@ -158,7 +156,7 @@ impl SecretsMachine {
     // Most close-delimited response bodies live here for their whole life.
     if self.state == State::Opaque {
       let hits = self.scan_chunk(chunk, Location::Body);
-      if self.dir == Direction::Response && !hits.is_empty() {
+      if self.dir == Direction::Upstream && !hits.is_empty() {
         self.must_close = true;
       }
       self.fail_closed_on_degrade();
@@ -179,7 +177,7 @@ impl SecretsMachine {
         State::Drain => self.step_drain(rest, &mut out, &mut hits),
         State::Opaque => {
           let scan_hits = self.scan_chunk(rest, Location::Body);
-          if self.dir == Direction::Response && !scan_hits.is_empty() {
+          if self.dir == Direction::Upstream && !scan_hits.is_empty() {
             self.must_close = true;
           }
           self.fail_closed_on_degrade();
@@ -188,7 +186,6 @@ impl SecretsMachine {
           Step::Rest(&[])
         }
         State::CloseDelimited => self.step_close(rest, &mut out, &mut hits).await,
-        State::Raw => self.step_raw(rest, &mut out, &mut hits),
       };
       match step {
         Step::Rest(remaining) => rest = remaining,
@@ -472,7 +469,8 @@ impl SecretsMachine {
     } else {
       needle_safe_emit_len(&combined, &self.pairs, self.tail_size)
     };
-    let (mut region, mut region_hits) = replace_in(&combined[..emit_len], &self.pairs, Location::Body);
+    let (region, mut region_hits) = replace_in(&combined[..emit_len], &self.pairs, Location::Body);
+    let mut region = region.into_owned();
     hits.append(&mut region_hits);
     self.raw_held = combined.split_off(emit_len);
     if region.is_empty() && !eof {
@@ -518,7 +516,7 @@ impl SecretsMachine {
   /// Scan-only forward: hits logged, response-direction hits latch close.
   fn forward_scanned(&mut self, data: &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
     let scan_hits = self.scan_chunk(data, Location::Body);
-    if self.dir == Direction::Response && !scan_hits.is_empty() {
+    if self.dir == Direction::Upstream && !scan_hits.is_empty() {
       self.must_close = true;
     }
     hits.extend(scan_hits);
@@ -567,51 +565,6 @@ impl SecretsMachine {
     Step::Rest(&[])
   }
 
-  /// Raw state: equal-length substitution with a cross-chunk hold-back window.
-  fn step_raw(&mut self, rest: &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Step<'static> {
-    // Probe for a hit without copying the whole chunk: fully-inside matches
-    // scan rest in place; boundary matches scan a tiny tail window. On a
-    // hit, fall back to the full held+rest replace. Hold back only a suffix
-    // that can still grow into a needle: a fixed window would stall
-    // lockstep protocols (send a line, wait for the reply).
-    let hit = self.pairs.iter().any(|pair| {
-      find_new_match(rest, &pair.needle, 0)
-        || (!self.raw_held.is_empty() && {
-          let old_len = self.raw_held.len();
-          let bound = self.tail_size.min(rest.len());
-          let mut window = self.raw_held.clone();
-          window.extend_from_slice(&rest[..bound]);
-          find_crossing(&window, &pair.needle, old_len)
-        })
-    });
-    if !hit {
-      let hold = if self.raw_held.is_empty() {
-        needle_prefix_suffix_len(rest, &self.pairs, self.tail_size)
-      } else {
-        let bound = self.tail_size.min(rest.len());
-        let mut window = std::mem::take(&mut self.raw_held);
-        window.extend_from_slice(&rest[..bound]);
-        needle_prefix_suffix_len(&window, &self.pairs, self.tail_size)
-      };
-      let emit_len = rest.len().saturating_sub(hold);
-      out.extend_from_slice(&rest[..emit_len]);
-      if hold > 0 {
-        self.raw_held = rest[emit_len..].to_vec();
-      }
-      return Step::Rest(&[]);
-    }
-    let mut combined = std::mem::take(&mut self.raw_held);
-    combined.extend_from_slice(rest);
-    // Emit past every complete match so none is sliced by the hold-back;
-    // a needle ending inside the window must be substituted now.
-    let emit_len = needle_safe_emit_len(&combined, &self.pairs, self.tail_size);
-    let (new_emit, mut emit_hits) = replace_in(&combined[..emit_len], &self.pairs, Location::Body);
-    hits.append(&mut emit_hits);
-    out.extend_from_slice(&new_emit);
-    self.raw_held = combined[emit_len..].to_vec();
-    Step::Rest(&[])
-  }
-
   /// Substitute a complete head block (ending exactly at the boundary) and
   /// set the body state. Returns the head bytes to emit plus hits.
   /// Stage order: value swap first (stage 0), then the plugin hook on the
@@ -656,10 +609,10 @@ impl SecretsMachine {
     // suppresses wrongly; the response no-body handling likewise runs only
     // on framable messages (Broken substitutes headers then goes opaque).
     let framable = !matches!(framing, Framing::Broken);
-    if framable && self.dir == Direction::Request && is_head_request {
+    if framable && self.dir == Direction::Downstream && is_head_request {
       self.head_requests += 1;
     }
-    if framable && self.dir == Direction::Response {
+    if framable && self.dir == Direction::Upstream {
       // 1xx/204/304 never carry a body, whatever the framing claims.
       // HEAD responses never carry a body either (signalled per-request).
       let interim = matches!(status, Some(100..200));
@@ -730,7 +683,7 @@ impl SecretsMachine {
         (new_head, hits)
       }
       Framing::None => {
-        if self.dir == Direction::Response && !response_has_no_body(status) {
+        if self.dir == Direction::Upstream && !response_has_no_body(status) {
           // Close-delimited response body: framing unknowable. With pairs,
           // stream through the hold-back window and flush at EOF; without
           // pairs, zero-copy opaque passthrough stays byte-identical.
@@ -804,12 +757,6 @@ impl SecretsMachine {
           out.extend_from_slice(&region);
         }
       }
-      State::Raw => {
-        let held = std::mem::take(&mut self.raw_held);
-        let (new_held, mut held_hits) = replace_in(&held, &self.pairs, Location::Body);
-        hits.append(&mut held_hits);
-        out.extend_from_slice(&new_held);
-      }
       _ => {}
     }
     self.state = State::Opaque;
@@ -858,7 +805,7 @@ struct ParsedHead<'h> {
 fn parse_head_fields(head: &[u8], dir: Direction) -> Result<ParsedHead<'_>, ()> {
   let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS];
   match dir {
-    Direction::Request => {
+    Direction::Downstream => {
       let mut req = httparse::Request::new(&mut scratch);
       match req.parse(head) {
         Ok(httparse::Status::Complete(_)) => Ok(ParsedHead {
@@ -872,7 +819,7 @@ fn parse_head_fields(head: &[u8], dir: Direction) -> Result<ParsedHead<'_>, ()> 
         _ => Err(()),
       }
     }
-    Direction::Response => {
+    Direction::Upstream => {
       let mut resp = httparse::Response::new(&mut scratch);
       match resp.parse(head) {
         Ok(httparse::Status::Complete(_)) => Ok(ParsedHead {
@@ -961,7 +908,7 @@ fn has_non_identity_content_encoding(headers: &[httparse::Header<'_>]) -> bool {
 /// Substitute all pairs in a head block: Basic-auth lines first (decoded),
 /// then raw byte replace on every line except `Host` (routing safety,
 /// mirroring the H2 `:authority` skip). Returns the new head + hits.
-fn substitute_head(head_str: &str, pairs: &[Pair]) -> (Vec<u8>, Vec<Hit>) {
+fn substitute_head(head_str: &str, pairs: &[CredentialPair]) -> (Vec<u8>, Vec<Hit>) {
   let mut current = head_str.to_string();
   let mut hits = Vec::new();
   for pair in pairs {
@@ -1075,12 +1022,12 @@ fn plugin_head_from_parsed(parsed: &ParsedHead<'_>, dir: Direction) -> PluginHea
     })
     .collect();
   match dir {
-    Direction::Request => PluginHead::Request {
+    Direction::Downstream => PluginHead::Request {
       method: parsed.method.unwrap_or_default().to_string(),
       path_with_query: parsed.path.unwrap_or_default().to_string(),
       headers,
     },
-    Direction::Response => PluginHead::Response {
+    Direction::Upstream => PluginHead::Response {
       status: parsed.status.unwrap_or_default(),
       headers,
     },
@@ -1135,7 +1082,7 @@ fn rebuild_head_if_changed(hooked: &PluginHead, swapped: &ParsedHead<'_>, swappe
         path_with_query,
         headers,
       },
-      Direction::Request,
+      Direction::Downstream,
     ) => {
       let same_start = Some(method.as_str()) == swapped.method && Some(path_with_query.as_str()) == swapped.path;
       if same_start && headers_unchanged(headers, &swapped.headers) {
@@ -1152,7 +1099,7 @@ fn rebuild_head_if_changed(hooked: &PluginHead, swapped: &ParsedHead<'_>, swappe
       out.extend_from_slice(b"\r\n");
       Some(out)
     }
-    (PluginHead::Response { status, headers }, Direction::Response) => {
+    (PluginHead::Response { status, headers }, Direction::Upstream) => {
       let same_start = Some(*status) == swapped.status;
       if same_start && headers_unchanged(headers, &swapped.headers) {
         return None;
@@ -1222,55 +1169,67 @@ fn serialize_trailer_block(headers: &[PluginHeader]) -> Vec<u8> {
   out
 }
 
-impl SubMachine for SecretsMachine {
-  fn substitute<'a>(&mut self, chunk: &'a [u8]) -> impl Future<Output = (Cow<'a, [u8]>, Vec<Hit>)> + Send {
-    SecretsMachine::substitute(self, chunk)
+#[cfg(test)]
+impl Http {
+  /// Fail-closed latch state.
+  pub(crate) fn must_close(&self) -> bool {
+    self.must_close
   }
+  /// Drain pending HEAD-request count.
   fn take_head_requests(&mut self) -> usize {
     std::mem::take(&mut self.head_requests)
   }
+  /// Suppress bodies for the next n responses.
   fn suppress_next_bodies(&mut self, n: usize) {
     self.suppress_body += n;
   }
-  fn must_close(&self) -> bool {
-    self.must_close
+}
+
+impl Wire for Http {
+  async fn feed<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
+    let (out, hits) = Http::substitute(self, chunk).await;
+    let rewritten = if self.must_close {
+      Rewritten::Close
+    } else if out.is_empty() {
+      Rewritten::Hold
+    } else {
+      Rewritten::Emit(out)
+    };
+    (rewritten, hits)
+  }
+  fn take_peer_note(&mut self) -> usize {
+    std::mem::take(&mut self.head_requests)
+  }
+  fn apply_peer_note(&mut self, n: usize) {
+    self.suppress_body += n;
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use hodor_config::grants::Credential;
 
   const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
   fn grants() -> Vec<Grant> {
-    vec![Grant {
-      label: "github".into(),
-      fake: FAKE.into(),
-      value: secrecy::SecretString::from(VALUE),
-      allow: vec!["https://api.github.com".parse::<hodor_config::grants::UriGrant>().unwrap()],
+    vec![Grant::Token {
+      credential: Credential {
+        label: "github".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec!["https://api.github.com".parse().unwrap()],
     }]
   }
 
-  fn req_machine() -> SecretsMachine {
-    SecretsMachine::new(MachineParams::new(
-      &grants(),
-      MachineMode::Https,
-      "api.github.com",
-      443,
-      Direction::Request,
-    ))
+  fn req_machine() -> Http {
+    Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None)
   }
 
-  fn resp_machine() -> SecretsMachine {
-    SecretsMachine::new(MachineParams::new(
-      &grants(),
-      MachineMode::Https,
-      "api.github.com",
-      443,
-      Direction::Response,
-    ))
+  fn resp_machine() -> Http {
+    Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None)
   }
 
   #[tokio::test]
@@ -1372,19 +1331,22 @@ mod tests {
     // The head goes out with its original Content-Length before the body
     // streams, so a swap that would change the length cannot be framed
     // honestly: the connection fails closed instead.
-    let short_value_grants = vec![Grant {
-      label: "g".into(),
-      fake: "LONGFAKEVALUE".into(),
-      value: secrecy::SecretString::from("short"),
-      allow: vec!["https://api.github.com".parse::<hodor_config::grants::UriGrant>().unwrap()],
+    let short_value_grants = vec![Grant::Token {
+      credential: Credential {
+        label: "g".into(),
+        fake: "LONGFAKEVALUE".into(),
+        value: secrecy::SecretString::from("short"),
+      },
+      allow: vec!["https://api.github.com".parse().unwrap()],
     }];
-    let mut machine = SecretsMachine::new(MachineParams::new(
+    let mut machine = Http::new(
       &short_value_grants,
-      MachineMode::Https,
+      Scheme::Https,
       "api.github.com",
       443,
-      Direction::Request,
-    ));
+      Direction::Downstream,
+      None,
+    );
     let body = "x=LONGFAKEVALUE";
     let input = format!("POST /x HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     let (out, _) = machine.substitute(input.as_bytes()).await;
@@ -1481,141 +1443,13 @@ mod tests {
 
   #[tokio::test]
   async fn cross_write_fake_matches_in_scan_mode() {
-    let mut opaque = SecretsMachine::new(MachineParams::new(
-      &grants(),
-      MachineMode::Opaque,
-      "api.github.com",
-      443,
-      Direction::Request,
-    ));
+    let mut opaque = Http::opaque(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream);
     let (first, second) = FAKE.split_at(20);
     let (_, hits1) = opaque.substitute(first.as_bytes()).await;
     assert!(hits1.is_empty());
     let (out2, hits2) = opaque.substitute(second.as_bytes()).await;
     assert_eq!(out2.as_ref(), second.as_bytes());
     assert_eq!(hits2.len(), 1);
-  }
-
-  #[tokio::test]
-  async fn raw_mode_replaces_equal_length_across_writes() {
-    let grants = vec![Grant {
-      label: "db".into(),
-      fake: "FAKE1234".into(),
-      value: secrecy::SecretString::from("REAL5678"),
-      allow: vec!["tcp://10.0.0.8:5432".parse::<hodor_config::grants::UriGrant>().unwrap()],
-    }];
-    let mut raw = SecretsMachine::new(MachineParams::new(
-      &grants,
-      MachineMode::RawTcp,
-      "10.0.0.8",
-      5432,
-      Direction::Request,
-    ));
-    let (out1, _) = raw.substitute(b"xxFAKE").await;
-    let out1 = out1.into_owned();
-    let (out2, _) = raw.substitute(b"1234yy").await;
-    let out2 = out2.into_owned();
-    let (flush, _) = raw.substitute(&[]).await;
-    let flush = flush.into_owned();
-    let mut full = out1;
-    full.extend_from_slice(&out2);
-    full.extend_from_slice(&flush);
-    assert_eq!(full, b"xxREAL5678yy");
-  }
-
-  #[tokio::test]
-  async fn raw_needle_ending_in_hold_window_not_sliced() {
-    // The needle ends flush with the chunk end and its last byte is also a
-    // needle prefix: a prefix-only hold-back would emit the needle minus
-    // its last byte raw. It must be substituted whole, now.
-    let grants = vec![Grant {
-      label: "t".into(),
-      fake: FAKE.into(),
-      value: secrecy::SecretString::from(VALUE),
-      allow: vec!["tcp://10.0.0.8:5432".parse::<hodor_config::grants::UriGrant>().unwrap()],
-    }];
-    let mut raw = SecretsMachine::new(MachineParams::new(
-      &grants,
-      MachineMode::RawTcp,
-      "10.0.0.8",
-      5432,
-      Direction::Request,
-    ));
-    let chunk = format!("x{FAKE}");
-    let (out, _) = raw.substitute(chunk.as_bytes()).await;
-    let out = out.into_owned();
-    let (flush, _) = raw.substitute(b"z").await;
-    let mut full = out;
-    full.extend_from_slice(&flush);
-    let text = String::from_utf8(full).unwrap();
-    assert!(text.contains(&format!("x{VALUE}z")), "{text}");
-    assert!(!text.contains(&FAKE[..FAKE.len() - 1]), "{text}");
-  }
-  #[tokio::test]
-  async fn raw_mode_skips_unequal_length() {
-    let grants = vec![Grant {
-      label: "u".into(),
-      fake: "SHORT".into(),
-      value: secrecy::SecretString::from("A-MUCH-LONGER-VALUE"),
-      allow: vec!["tcp://10.0.0.8:5432".parse::<hodor_config::grants::UriGrant>().unwrap()],
-    }];
-    let mut raw = SecretsMachine::new(MachineParams::new(
-      &grants,
-      MachineMode::RawTcp,
-      "10.0.0.8",
-      5432,
-      Direction::Request,
-    ));
-    let (out, hits) = raw.substitute(b"xxSHORTyy").await;
-    let out = out.into_owned();
-    let (flush, _) = raw.substitute(&[]).await;
-    let flush = flush.into_owned();
-    let mut full = out;
-    full.extend_from_slice(&flush);
-    assert_eq!(full, b"xxSHORTyy");
-    assert!(hits.is_empty());
-  }
-
-  #[tokio::test]
-  async fn raw_mode_flushes_complete_line_without_more_input() {
-    // Lockstep protocols send one line and wait for the reply: the fully
-    // substituted line must leave the machine before any further chunk.
-    let grants = vec![Grant {
-      label: "db".into(),
-      fake: "FAKE1234".into(),
-      value: secrecy::SecretString::from("REAL5678"),
-      allow: vec!["tcp://10.0.0.8:5432".parse::<hodor_config::grants::UriGrant>().unwrap()],
-    }];
-    let mut raw = SecretsMachine::new(MachineParams::new(
-      &grants,
-      MachineMode::RawTcp,
-      "10.0.0.8",
-      5432,
-      Direction::Request,
-    ));
-    let (out, hits) = raw.substitute(b"auth FAKE1234\n").await;
-    assert_eq!(out.as_ref(), b"auth REAL5678\n");
-    assert_eq!(hits.len(), 1);
-  }
-
-  #[tokio::test]
-  async fn raw_tls_mode_matches_https_grants() {
-    // PlainMode::Raw behind terminated TLS: the endpoint identity is an
-    // `https://` grant, so the raw machine must match it, not `tcp://`.
-    let grants = vec![Grant {
-      label: "api".into(),
-      fake: "FAKE1234".into(),
-      value: secrecy::SecretString::from("REAL5678"),
-      allow: vec!["https://api:9443".parse::<hodor_config::grants::UriGrant>().unwrap()],
-    }];
-    let mut req = SecretsMachine::new(MachineParams::new(&grants, MachineMode::RawTls, "api", 9443, Direction::Request));
-    let (out, hits) = req.substitute(b"auth FAKE1234\n").await;
-    assert_eq!(out.as_ref(), b"auth REAL5678\n");
-    assert_eq!(hits.len(), 1);
-    let mut resp = SecretsMachine::new(MachineParams::new(&grants, MachineMode::RawTls, "api", 9443, Direction::Response));
-    let (out, hits) = resp.substitute(b"ok REAL5678\n").await;
-    assert_eq!(out.as_ref(), b"ok FAKE1234\n");
-    assert_eq!(hits.len(), 1);
   }
 
   #[tokio::test]
@@ -1792,13 +1626,7 @@ mod tests {
 
   #[tokio::test]
   async fn close_delimited_without_pairs_streams_zero_copy() {
-    let mut resp = SecretsMachine::new(MachineParams::new(
-      &[],
-      MachineMode::Https,
-      "api.github.com",
-      443,
-      Direction::Response,
-    ));
+    let mut resp = Http::new(&[], Scheme::Https, "api.github.com", 443, Direction::Upstream, None);
     let _ = resp.substitute(b"HTTP/1.1 200 OK\r\n\r\n").await;
     assert!(matches!(resp.state, State::Opaque), "{:?}", resp.state);
     let (out, hits) = resp.substitute(b"body-bytes").await;
@@ -1911,9 +1739,14 @@ mod tests {
     }
   }
 
-  fn req_hooked(hook: MockHook) -> SecretsMachine {
-    SecretsMachine::new(
-      MachineParams::new(&grants(), MachineMode::Https, "api.github.com", 443, Direction::Request).hook(Some(Box::new(hook))),
+  fn req_hooked(hook: MockHook) -> Http {
+    Http::new(
+      &grants(),
+      Scheme::Https,
+      "api.github.com",
+      443,
+      Direction::Downstream,
+      Some(Box::new(hook)),
     )
   }
 
@@ -2019,10 +1852,8 @@ mod tests {
 
   #[tokio::test]
   async fn plugin_active_connection_fails_closed_on_opaque() {
-    let mut opaque = SecretsMachine::new(
-      MachineParams::new(&grants(), MachineMode::Opaque, "api.github.com", 443, Direction::Request)
-        .hook(Some(Box::new(MockHook::default()))),
-    );
+    let mut opaque = Http::opaque(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream);
+    opaque.hook = Some(Box::new(MockHook::default()));
     let (out, _) = opaque.substitute(b"unframable-bytes").await;
     assert_eq!(out.as_ref(), b"unframable-bytes");
     assert!(opaque.must_close());

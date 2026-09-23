@@ -3,7 +3,7 @@
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcgen::{CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair};
@@ -306,37 +306,102 @@ impl std::fmt::Debug for DomainCert {
 /// Returns an error when `domain` is not a valid SAN, when leaf key
 /// generation or signing fails, or when rustls rejects the resulting chain.
 pub fn generate_domain_cert(domain: &str, ca: &CertAuthority) -> eyre::Result<DomainCert> {
+  let (chain, key, expires_at) = signed_leaf(ca, domain, ExtendedKeyUsagePurpose::ServerAuth)?;
+  let server_config = rustls::ServerConfig::builder()
+    .with_no_client_auth()
+    .with_single_cert(chain, key)
+    .map_err(|err| eyre::eyre!("server config: {err}"))?;
+  Ok(DomainCert {
+    expires_at,
+    server_config: Arc::new(server_config),
+  })
+}
+
+/// Generate a client identity signed by the CA: the certificate chain (leaf
+/// plus CA) and its PKCS8 key, for the proxy's upstream mTLS leg.
+///
+/// # Errors
+///
+/// Returns an error when key generation or signing fails.
+pub fn generate_client_pair(ca: &CertAuthority, domain: &str) -> eyre::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+  let (chain, key, _) = signed_leaf(ca, domain, ExtendedKeyUsagePurpose::ClientAuth)?;
+  Ok((chain, key))
+}
+
+/// Load the guest identity `name` from `dir` (`<name>.pem` plus
+/// `<name>.key`), or mint a CA-signed client pair into those files when
+/// either is missing. Returns the two paths. An existing pair is never
+/// overwritten: minting only ever happens when a file is absent.
+///
+/// # Errors
+///
+/// Returns an error when the pair cannot be generated or written.
+pub fn load_or_generate_client_pair(ca: &CertAuthority, dir: &Path, name: &str) -> eyre::Result<(PathBuf, PathBuf)> {
+  use rama::crypto::pem::PemEncode as _;
+  let cert = dir.join(format!("{name}.pem"));
+  let key = dir.join(format!("{name}.key"));
+  if cert.is_file() && key.is_file() {
+    return Ok((cert, key));
+  }
+  let (chain, private) = generate_client_pair(ca, name)?;
+  std::fs::create_dir_all(dir).map_err(|err| eyre::eyre!("create {}: {err}", dir.display()))?;
+  let mut cert_pem = String::new();
+  for leaf in &chain {
+    cert_pem.push_str(&leaf.to_pem());
+  }
+  std::fs::write(&cert, cert_pem).map_err(|err| eyre::eyre!("write {}: {err}", cert.display()))?;
+  let mut key_file = std::fs::OpenOptions::new()
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .mode(0o600)
+    .open(&key)
+    .map_err(|err| eyre::eyre!("open {}: {err}", key.display()))?;
+  key_file
+    .write_all(private.to_pem().as_bytes())
+    .map_err(|err| eyre::eyre!("write {}: {err}", key.display()))?;
+  Ok((cert, key))
+}
+
+/// Generate a server leaf signed by the CA: the certificate chain (leaf plus
+/// CA) and its PKCS8 key, for callers that build their own server config.
+///
+/// # Errors
+///
+/// Returns an error when key generation or signing fails.
+pub fn generate_domain_pair(ca: &CertAuthority, domain: &str) -> eyre::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+  let (chain, key, _) = signed_leaf(ca, domain, ExtendedKeyUsagePurpose::ServerAuth)?;
+  Ok((chain, key))
+}
+
+/// Leaf generation shared by the pair helpers: one key, one CA signature, the
+/// named key usage, the chain with the CA appended, and the expiry the
+/// callers cache by.
+fn signed_leaf(
+  ca: &CertAuthority,
+  domain: &str,
+  usage: ExtendedKeyUsagePurpose,
+) -> eyre::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, OffsetDateTime)> {
   let now = OffsetDateTime::now_utc();
   let mut params = CertificateParams::new(vec![domain.to_string()]).map_err(|err| eyre::eyre!("bad SNI: {err}"))?;
-
   let mut dn = rcgen::DistinguishedName::new();
   dn.push(rcgen::DnType::CommonName, domain);
   params.distinguished_name = dn;
   params.is_ca = IsCa::ExplicitNoCa;
   params.use_authority_key_identifier_extension = true;
   params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature, rcgen::KeyUsagePurpose::KeyEncipherment];
-  params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-
+  params.extended_key_usages = vec![usage];
   // Backdate not_before by 2 seconds for clock skew.
   params.not_before = now - Duration::seconds(2);
   params.not_after = now + Duration::hours(LEAF_VALIDITY_HOURS.cast_signed());
   let expires_at = params.not_after;
-
   let key_pair = rcgen::KeyPair::generate().map_err(|err| eyre::eyre!("keygen: {err}"))?;
   let cert_der = params.signed_by(&key_pair, &ca.issuer).map_err(|err| eyre::eyre!("sign: {err}"))?;
-
-  let chain = vec![CertificateDer::from(cert_der.der().to_vec()), ca.cert_der.clone()];
-  let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
-
-  let server_config = rustls::ServerConfig::builder()
-    .with_no_client_auth()
-    .with_single_cert(chain, key)
-    .map_err(|err| eyre::eyre!("server config: {err}"))?;
-
-  Ok(DomainCert {
+  Ok((
+    vec![CertificateDer::from(cert_der.der().to_vec()), ca.cert_der.clone()],
+    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
     expires_at,
-    server_config: Arc::new(server_config),
-  })
+  ))
 }
 
 /// Install the aws-lc-rs crypto provider as the process default. Idempotent;
@@ -409,5 +474,67 @@ mod tests {
 
     load_or_generate(&path).unwrap();
     assert_eq!(std::fs::read(dir.path().join("ca.crt")).unwrap(), before);
+  }
+
+  /// Leaves minted for IP-look identities carry an IP SAN (rcgen's
+  /// `CertificateParams::new` IP-detects), so a hostname-verifying client
+  /// completes against them — and the same client refuses a DNS leaf. Pins
+  /// the transparent-capture shape, where the identity is the destination
+  /// address.
+  #[test]
+  fn ip_identities_mint_leaves_a_verifying_client_accepts() {
+    install_crypto_provider();
+    let ca = CertAuthority::generate().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mint = |name: &str| {
+      let (chain, key) = generate_domain_pair(&ca, name).unwrap();
+      std::sync::Arc::new(
+        rustls::ServerConfig::builder()
+          .with_no_client_auth()
+          .with_single_cert(chain, key)
+          .unwrap(),
+      )
+    };
+    let leaves = [mint("127.0.0.1"), mint("localhost")];
+
+    let server = std::thread::spawn(move || {
+      use std::io::Write as _;
+      for config in leaves {
+        let Ok((stream, _)) = listener.accept() else { return };
+        let Ok(conn) = rustls::ServerConnection::new(config) else { return };
+        let mut tls = rustls::StreamOwned::new(conn, stream);
+        let _ = tls.write_all(b"ok");
+        let _ = tls.flush();
+      }
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.cert_der().clone()).unwrap();
+    let handshake = |label: &str| {
+      use std::io::{Read as _, Write as _};
+      let stream = std::net::TcpStream::connect(addr).unwrap();
+      let conn = rustls::ClientConnection::new(
+        std::sync::Arc::new(
+          rustls::ClientConfig::builder()
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth(),
+        ),
+        rustls::pki_types::ServerName::IpAddress(addr.ip().into()),
+      )
+      .map_err(|err| format!("{label}: connect {err}"))?;
+      let mut tls = rustls::StreamOwned::new(conn, stream);
+      tls.write_all(b"x").map_err(|err| format!("{label}: write {err}"))?;
+      let mut buf = [0u8; 2];
+      tls.read_exact(&mut buf).map_err(|err| format!("{label}: read {err}"))?;
+      Ok::<(), String>(())
+    };
+
+    let ip = handshake("the ip leaf");
+    let dns = handshake("the dns leaf");
+    server.join().unwrap();
+    assert!(ip.is_ok(), "the ip leaf failed the IP check: {ip:?}");
+    assert!(dns.is_err(), "the dns leaf passed the IP hostname check");
   }
 }

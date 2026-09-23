@@ -349,7 +349,7 @@ mod tests {
   use super::*;
   use std::time::Duration;
 
-  use hodor_config::grants::{Grant, Scheme, UriGrant};
+  use hodor_config::grants::{Credential, EndpointScope, Grant, Scheme};
 
   /// Main table: the live test's scoped dst route lands here.
   const TABLE_MAIN: u8 = 254;
@@ -400,14 +400,19 @@ mod tests {
     let stub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_port = stub.local_addr().unwrap().port();
 
-    let grants = vec![Grant {
-      label: "t".into(),
-      fake: FAKE.into(),
-      value: secrecy::SecretString::from(VALUE),
-      allow: vec![UriGrant {
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec![EndpointScope {
         scheme: Scheme::Https,
         host: SNI.parse().unwrap(),
         port: stub_port,
+        client_cert: None,
+        client_key: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
     }];
     let state = Arc::new(
@@ -416,6 +421,7 @@ mod tests {
           proxy: hodor_config::config::ProxyCfg {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
+            handshake_timeout_secs: 10,
           },
           grants,
           plugins: Vec::new(),

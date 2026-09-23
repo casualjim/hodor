@@ -1,22 +1,16 @@
 //! Explicit proxy core: CONNECT splice, TLS intercept relay.
 
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use rama::error::BoxError;
-use rama::extensions::{Extensions, ExtensionsRef};
 use rama::io::BridgeIo;
-use rama::net::address::{Host, HostWithPort, SocketAddress};
-use rama::net::client::ConnectorTarget;
+use rama::net::address::SocketAddress;
 use rama::net::socket::SocketOptions;
 use rama::net::socket::opts::Domain;
 use rama::rt::Executor;
-use rama::tcp::client::TcpStreamConnector;
 pub use rama::tcp::server::TcpListener as RamaTcpListener;
 use rama::tcp::stream::TcpStream as RamaTcpStream;
-use rama::tls::boring::TlsStream;
 use rama::tls::boring::proxy::TlsMitmEgressServerAuth;
 use rama::tls::boring::proxy::TlsMitmRelay;
 use rama::tls::boring::proxy::TlsMitmRelayService;
@@ -24,26 +18,25 @@ use rama::tls::boring::proxy::cert_issuer::{CachedBoringMitmCertIssuer, InMemory
 use rama::tls::client::ServerVerifyMode;
 use rama::tls::server::InputWithClientHello;
 use rama::{Service, crypto};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 #[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
-use crate::policy::{MintBucket, Route, decide, peek_stream};
-use crate::substitute::{AnyMachine, Direction, H2_PREFACE, H2Machine, MachineMode, MachineParams, SecretsMachine};
-use hodor_config::grants::{ResolvedConfig, Scheme, intercept_candidate};
+use crate::connection::{GuestIo, PgTransport, Prefixed, PumpService, client_identity, dial_marked};
+use crate::identity::{Expect, Hello, MintBucket, expect, read_client_hello, read_http_head};
+use crate::protocol::{MAX_HEAD, PairCtx, http_pair, postgres_pair, raw_tcp_pair};
+use crate::wire::{GuestOpening, read_guest_opening, request_upstream_tls};
+use hodor_config::grants::{ResolvedConfig, Scheme, SslMode};
 use hodor_pki::ca::CertAuthority;
-use hodor_plugin::Direction as HookDirection;
-
-mod policy;
-mod substitute;
-
-mod relay;
-
 pub(crate) use relay::relay_guarded;
 
-const MAX_HEAD: usize = 64 * 1024;
-pub(crate) const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+mod connection;
+mod identity;
+mod protocol;
+mod wire;
+
+mod relay;
 
 /// Shared proxy state: live config snapshot, boring MITM relay, and the
 /// issuance burst guard.
@@ -54,6 +47,8 @@ pub(crate) const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 pub struct ProxyState {
   config: Arc<ResolvedConfig>,
   relay: TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>,
+  relay_mtls: TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>,
+  pg: Arc<PgTransport>,
   mint: MintBucket,
   fwmark: Option<u32>,
   plugins: Arc<hodor_plugin::Registry>,
@@ -83,21 +78,37 @@ impl ProxyState {
   /// # Errors
   ///
   /// Returns an error when the CA pair fails to convert to boring types,
-  /// when the egress trust policy rejects the hodor CA anchor, or when a
-  /// configured plugin cannot be loaded.
+  /// when the egress trust policy rejects the hodor CA anchor, when the CA
+  /// cannot be read back for leaf minting, or when a configured plugin cannot
+  /// be loaded.
   pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> eyre::Result<Self> {
     let plugins = Arc::new(hodor_plugin::Registry::load(&resolved.plugins)?);
-    let (crt, key) = ca.boring_pair()?;
     let anchor = crypto::pki_types::CertificateDer::from(ca.cert_der().to_vec());
+    let (crt, key) = ca.boring_pair()?;
     let egress = TlsMitmEgressServerAuth::new()
       .with_server_verify(ServerVerifyMode::Auto)
       .with_webpki_roots()
-      .try_with_extra_server_trust_anchors([anchor])
+      .try_with_extra_server_trust_anchors([anchor.clone()])
       .map_err(|err| eyre::eyre!("egress trust anchors: {err}"))?;
     let relay = TlsMitmRelay::new_cached_in_memory(crt, key).with_egress_server_auth(egress);
+    // The `mtls` guest-leg relay: same egress policy, but hodor demands a
+    // client certificate from the guest and verifies it against the same
+    // CA that mints the leaves.
+    let (crt, key) = ca.boring_pair()?;
+    let egress = TlsMitmEgressServerAuth::new()
+      .with_server_verify(ServerVerifyMode::Auto)
+      .with_webpki_roots()
+      .try_with_extra_server_trust_anchors([anchor.clone()])
+      .map_err(|err| eyre::eyre!("egress trust anchors: {err}"))?;
+    let relay_mtls = TlsMitmRelay::new_cached_in_memory(crt, key)
+      .with_egress_server_auth(egress)
+      .with_ingress_client_auth(rama::tls::server::ClientVerifyMode::ClientAuth(vec![anchor]));
+    let pg = Arc::new(PgTransport::new(ca)?);
     Ok(Self {
       config: Arc::new(resolved),
       relay,
+      relay_mtls,
+      pg,
       mint: MintBucket::new(),
       fwmark: None,
       plugins,
@@ -126,165 +137,8 @@ impl ProxyState {
   }
 }
 
-/// Guest-side adapter: any tokio stream plus a rama extension map. The relay
-/// reads the [`ConnectorTarget`] identity from these extensions to derive
-/// egress SNI and verification identity.
-struct GuestIo<S> {
-  inner: S,
-  extensions: Extensions,
-}
-
-impl<S> GuestIo<S> {
-  fn with_target(inner: S, identity: &str, port: u16) -> eyre::Result<Self> {
-    let host: Host = identity.parse().map_err(|err| eyre::eyre!("bad MITM identity {identity}: {err}"))?;
-    let extensions = Extensions::new();
-    extensions.insert(ConnectorTarget(HostWithPort::new(host, port)));
-    Ok(Self { inner, extensions })
-  }
-
-  fn bare(inner: S) -> Self {
-    Self {
-      inner,
-      extensions: Extensions::new(),
-    }
-  }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for GuestIo<S> {
-  fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-    Pin::new(&mut self.inner).poll_read(cx, buf)
-  }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for GuestIo<S> {
-  fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-    Pin::new(&mut self.inner).poll_write(cx, buf)
-  }
-
-  fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-    Pin::new(&mut self.inner).poll_flush(cx)
-  }
-
-  fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-    Pin::new(&mut self.inner).poll_shutdown(cx)
-  }
-}
-impl<S> ExtensionsRef for GuestIo<S> {
-  fn extensions(&self) -> &Extensions {
-    &self.extensions
-  }
-}
-
-/// Byte-pump service: the relay hands paired TLS streams here, and the
-/// substitution machines pump them once plaintext detection has picked the
-/// HTTP, H2, or raw arm. Decoded-request middleware is deliberately not used:
-/// a `Request<Body>` round-trips through the HTTP codec and would break the
-/// byte-identical guarantee the verbatim tests pin.
-#[derive(Debug, Clone)]
-struct PumpService {
-  snapshot: Arc<ResolvedConfig>,
-  identity: String,
-  port: u16,
-  plugins: Arc<hodor_plugin::Registry>,
-}
-impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for PumpService
-where
-  GI: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-  GE: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-  type Output = ();
-  type Error = BoxError;
-
-  async fn serve(&self, input: BridgeIo<TlsStream<GI>, TlsStream<GE>>) -> Result<Self::Output, Self::Error> {
-    let BridgeIo(mut guest_tls, mut server_tls) = input;
-    let (peeked, mode) = peek_mode(&mut guest_tls).await.map_err(|err| into_box_error(&err))?;
-    let (mut req, mut resp): (AnyMachine, AnyMachine) = match mode {
-      PlainMode::Http => (
-        AnyMachine::Http1(SecretsMachine::new(
-          MachineParams::new(
-            &self.snapshot.grants,
-            MachineMode::Https,
-            &self.identity,
-            self.port,
-            Direction::Request,
-          )
-          .hook(
-            self
-              .plugins
-              .select(Scheme::Https, &self.identity, self.port, HookDirection::Request),
-          ),
-        )),
-        AnyMachine::Http1(SecretsMachine::new(
-          MachineParams::new(
-            &self.snapshot.grants,
-            MachineMode::Https,
-            &self.identity,
-            self.port,
-            Direction::Response,
-          )
-          .hook(
-            self
-              .plugins
-              .select(Scheme::Https, &self.identity, self.port, HookDirection::Response),
-          ),
-        )),
-      ),
-      // Raw TLS has no HTTP structure to hook: machines only.
-      PlainMode::Raw => (
-        AnyMachine::Http1(SecretsMachine::new(MachineParams::new(
-          &self.snapshot.grants,
-          MachineMode::RawTls,
-          &self.identity,
-          self.port,
-          Direction::Request,
-        ))),
-        AnyMachine::Http1(SecretsMachine::new(MachineParams::new(
-          &self.snapshot.grants,
-          MachineMode::RawTls,
-          &self.identity,
-          self.port,
-          Direction::Response,
-        ))),
-      ),
-      PlainMode::H2 => (
-        AnyMachine::H2(H2Machine::new(
-          MachineParams::new(
-            &self.snapshot.grants,
-            MachineMode::Https,
-            &self.identity,
-            self.port,
-            Direction::Request,
-          )
-          .hook(
-            self
-              .plugins
-              .select(Scheme::Https, &self.identity, self.port, HookDirection::Request),
-          ),
-        )),
-        AnyMachine::H2(H2Machine::new(
-          MachineParams::new(
-            &self.snapshot.grants,
-            MachineMode::Https,
-            &self.identity,
-            self.port,
-            Direction::Response,
-          )
-          .hook(
-            self
-              .plugins
-              .select(Scheme::Https, &self.identity, self.port, HookDirection::Response),
-          ),
-        )),
-      ),
-    };
-    relay_guarded(&mut guest_tls, &mut server_tls, &mut req, &mut resp, &peeked)
-      .await
-      .map_err(|err| into_box_error(&err))
-  }
-}
-
 /// Box an eyre report for a rama service error, preserving its debug chain.
-fn into_box_error(err: &eyre::Report) -> BoxError {
+pub(crate) fn into_box_error(err: &eyre::Report) -> BoxError {
   BoxError::from(format!("{err:?}"))
 }
 /// Serve the explicit listener until its executor shuts down. Accept errors
@@ -338,14 +192,18 @@ impl Service<RamaTcpStream> for ExplicitService {
 
 async fn dispatch(mut client: TcpStream, state: &ProxyState) -> eyre::Result<()> {
   let snapshot = state.snapshot();
-  let head = read_head(&mut client).await?;
+  let head = read_head(
+    &mut client,
+    std::time::Duration::from_secs(state.snapshot().proxy.handshake_timeout_secs),
+  )
+  .await?;
   let mut headers = [httparse::EMPTY_HEADER; 64];
-  let mut req = httparse::Request::new(&mut headers);
-  let parsed = req.parse(&head)?;
+  let mut request = httparse::Request::new(&mut headers);
+  let parsed = request.parse(&head)?;
   if !parsed.is_complete() {
     return Ok(()); // over cap without a full head: close, no response
   }
-  let (Some(method), Some(target)) = (req.method, req.path) else {
+  let (Some(method), Some(target)) = (request.method, request.path) else {
     return Ok(()); // malformed request line: close, no response
   };
   if method.eq_ignore_ascii_case("connect") {
@@ -353,7 +211,7 @@ async fn dispatch(mut client: TcpStream, state: &ProxyState) -> eyre::Result<()>
       return Ok(());
     };
     let tail = head_tail(&head).to_vec();
-    if !intercept_candidate(&snapshot.grants, &host, port) {
+    if expect(&snapshot.grants, Some(&host), port) == Expect::Splice {
       let mut upstream = dial_marked(&host, port, state.fwmark).await?;
       client.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
       // Client bytes already read past the head (pipelined payloads) must not
@@ -375,8 +233,8 @@ fn head_tail(head: &[u8]) -> &[u8] {
   head.windows(4).position(|w| w == b"\r\n\r\n").map_or(&[], |pos| &head[pos + 4..])
 }
 
-/// Serve a post-200 CONNECT stream: peek TLS vs plain, route through the
-/// policy table with the CONNECT authority enforced as SNI identity, then
+/// Serve a post-200 CONNECT stream: peek TLS vs plain, resolve the identity
+/// from the CONNECT authority (enforced against the SNI), then
 /// MITM / splice / machines as appropriate. `initial` replays pipelined
 /// bytes read past the CONNECT head.
 ///
@@ -395,11 +253,23 @@ pub async fn serve_connect_stream<G>(
 where
   G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-  drive_candidate_stream(guest, state, snapshot, host, port, Some(host), host, initial).await
+  drive_candidate_stream(
+    guest,
+    CandidateParams {
+      state,
+      snapshot,
+      dial_host: host,
+      port,
+      host: Some(host),
+      raw_host: host,
+      initial,
+    },
+  )
+  .await
 }
 
 /// Serve a transparently captured stream (TUN/TPROXY/eBPF leg): peek TLS vs
-/// plain, route through the policy table with the SNI itself as identity,
+/// plain, resolve the identity from the SNI or the HTTP `Host` head,
 /// then MITM / splice / machines as appropriate. `dial_host` is the upstream
 /// TCP target, `raw_host` the hostname for tcp:// grant matching.
 ///
@@ -418,86 +288,140 @@ pub async fn serve_transparent_stream<G>(
 where
   G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-  drive_candidate_stream(guest, state, snapshot, dial_host, port, None, raw_host, &[]).await
+  drive_candidate_stream(
+    guest,
+    CandidateParams {
+      state,
+      snapshot,
+      dial_host,
+      port,
+      host: None,
+      raw_host,
+      initial: &[],
+    },
+  )
+  .await
 }
 
-/// Shared candidate core behind the two entries above.
+/// Connection-gating context for one candidate stream: targets, identity
+/// material, and the replay buffer. A struct, not eight params.
+pub(crate) struct CandidateParams<'a> {
+  /// Shared proxy state (mint guard, plugins, dial mark).
+  pub(crate) state: &'a ProxyState,
+  /// Live config snapshot.
+  pub(crate) snapshot: &'a ResolvedConfig,
+  /// Upstream TCP target.
+  pub(crate) dial_host: &'a str,
+  /// Upstream port.
+  pub(crate) port: u16,
+  /// Identity the ingress already knows, or None when only the capture
+  /// destination is known and the identity has to be read from the protocol.
+  pub(crate) host: Option<&'a str>,
+  /// Hostname for raw `tcp://` scope matching.
+  pub(crate) raw_host: &'a str,
+  /// Pipelined bytes read past the ingress head.
+  pub(crate) initial: &'a [u8],
+}
+
+/// Shared candidate core behind the two entries above. The grant scopes
+/// covering the destination name the protocol, so the arm comes from the
+/// config; identity comes from the opening bytes of that protocol.
 #[expect(
-  clippy::too_many_arguments,
-  reason = "connection gating context: stream, state, targets, identity hint, replay buffer"
+  clippy::too_many_lines,
+  reason = "linear dispatch over the arm per protocol, a split would obscure the flow"
 )]
-async fn drive_candidate_stream<G>(
-  mut guest: G,
-  state: &ProxyState,
-  snapshot: &ResolvedConfig,
-  dial_host: &str,
-  port: u16,
-  enforce_host: Option<&str>,
-  raw_host: &str,
-  initial: &[u8],
-) -> eyre::Result<()>
+async fn drive_candidate_stream<G>(mut guest: G, params: CandidateParams<'_>) -> eyre::Result<()>
 where
   G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-  let Some(peeked) = peek_stream(&mut guest, initial).await? else {
-    return Ok(());
-  };
-  let Some(route) = decide(snapshot, port, enforce_host, peeked) else {
-    return Ok(());
-  };
-  match route {
-    Route::Splice { buf } => {
-      let mut upstream = dial_marked(dial_host, port, state.fwmark).await?;
-      upstream.write_all(&buf).await?;
-      tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
-      Ok(())
-    }
-    Route::RawTcpMachines { buf } => {
+  let CandidateParams {
+    state,
+    snapshot,
+    dial_host,
+    port,
+    host,
+    raw_host,
+    initial,
+  } = params;
+  let budget = std::time::Duration::from_secs(snapshot.proxy.handshake_timeout_secs);
+  match expect(&snapshot.grants, host, port) {
+    // No scope covers this destination: copy the bytes unchanged.
+    Expect::Splice => splice_replay(guest, dial_host, port, state.fwmark, initial).await,
+    // Opaque bytes: nothing is read, the machines scan as the stream arrives.
+    Expect::Raw => {
       let upstream = dial_marked(dial_host, port, state.fwmark).await?;
-      // Raw TCP has no HTTP structure to hook: machines only.
-      let mut req = AnyMachine::Http1(SecretsMachine::new(MachineParams::new(
-        &snapshot.grants,
-        MachineMode::RawTcp,
-        raw_host,
+      let ctx = PairCtx {
+        grants: &snapshot.grants,
+        host: raw_host,
         port,
-        Direction::Request,
-      )));
-      let mut resp = AnyMachine::Http1(SecretsMachine::new(MachineParams::new(
-        &snapshot.grants,
-        MachineMode::RawTcp,
-        raw_host,
-        port,
-        Direction::Response,
-      )));
-      relay_guarded(guest, upstream, &mut req, &mut resp, &buf).await
+        plugins: &state.plugins,
+      };
+      let (mut downstream_machine, mut upstream_machine) = raw_tcp_pair(&ctx);
+      relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, initial).await
     }
-    Route::PlainHttpMachines { host, port: hport, buf } => {
+    // Declared HTTP: the `Host` head names the peer. A head that never
+    // completes is not HTTP, so the connection closes; a host the config does
+    // not name falls to the raw scopes for this destination.
+    Expect::Plain => {
+      let Some((head, head_host, head_port)) = read_http_head(&mut guest, initial, budget, port).await? else {
+        return Ok(());
+      };
+      let named = snapshot
+        .grants
+        .iter()
+        .any(|grant| grant.endpoint(Scheme::Http, Some(&head_host), head_port).is_some());
       let upstream = dial_marked(dial_host, port, state.fwmark).await?;
-      let mut req = AnyMachine::Http1(SecretsMachine::new(
-        MachineParams::new(&snapshot.grants, MachineMode::Http, &host, hport, Direction::Request).hook(state.plugins.select(
-          Scheme::Http,
-          &host,
-          hport,
-          HookDirection::Request,
-        )),
-      ));
-      let mut resp = AnyMachine::Http1(SecretsMachine::new(
-        MachineParams::new(&snapshot.grants, MachineMode::Http, &host, hport, Direction::Response).hook(state.plugins.select(
-          Scheme::Http,
-          &host,
-          hport,
-          HookDirection::Response,
-        )),
-      ));
-      relay_guarded(guest, upstream, &mut req, &mut resp, &buf).await
+      let ctx = PairCtx {
+        grants: &snapshot.grants,
+        host: if named { &head_host } else { raw_host },
+        port: if named { head_port } else { port },
+        plugins: &state.plugins,
+      };
+      let (mut downstream_machine, mut upstream_machine) = if named { http_pair(&ctx) } else { raw_tcp_pair(&ctx) };
+      relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, &head).await
     }
-    Route::MitmTls { identity, buf, hello } => {
+    // Declared TLS: the ClientHello names the peer. Bytes that never complete
+    // a hello cannot be served here, and an identity no scope names is copied.
+    Expect::Tls => {
+      let Some(read) = read_client_hello(&mut guest, initial, budget).await? else {
+        return Ok(());
+      };
+      let (buf, sni, parsed) = match read {
+        Hello::Named { buf, sni, hello } => (buf, Some(sni), Some(hello)),
+        Hello::Unnamed { buf } => (buf, None, None),
+      };
+      if let (Some(authority), Some(sni)) = (host, sni.as_deref())
+        && !sni.eq_ignore_ascii_case(authority)
+      {
+        tracing::debug!(authority, sni, "CONNECT authority differs from SNI; closing");
+        return Ok(());
+      }
+      let Some(identity) = host.or(sni.as_deref()) else {
+        // Transparent capture with a hello that carries no SNI: there is no
+        // identity to mint for, so the bytes are copied.
+        return splice_replay(guest, dial_host, port, state.fwmark, &buf).await;
+      };
+      let Some(scope) = snapshot
+        .grants
+        .iter()
+        .find_map(|grant| grant.endpoint(Scheme::Https, Some(identity), port))
+      else {
+        // No https scope names this identity: nothing to substitute.
+        return splice_replay(guest, dial_host, port, state.fwmark, &buf).await;
+      };
+      let identity = identity.to_string();
       if !state.mint.allow() {
         eyre::bail!("MITM issuance burst exceeded for {identity}");
       }
       state.mint.record();
       let upstream = dial_marked(dial_host, port, state.fwmark).await?;
       let guest_io = GuestIo::with_target(Prefixed::new(buf, guest), &identity, port)?;
+      // The entry can name the proxy's upstream client identity; the relay
+      // reads it off the guest leg's extensions and presents it on egress.
+      let guest_io = match (&scope.client_cert, &scope.client_key) {
+        (Some(cert), Some(key)) => guest_io.with_egress_client_auth(client_identity(cert, key)?),
+        _ => guest_io,
+      };
       let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
       let pump = PumpService {
         snapshot: state.snapshot(),
@@ -505,8 +429,12 @@ where
         port,
         plugins: Arc::clone(&state.plugins),
       };
-      let relay = TlsMitmRelayService::new(state.relay.clone(), pump);
-      match hello {
+      let relay = match scope.guest_tls {
+        hodor_config::grants::GuestTlsMode::Tls => state.relay.clone(),
+        hodor_config::grants::GuestTlsMode::Mtls => state.relay_mtls.clone(),
+      };
+      let relay = TlsMitmRelayService::new(relay, pump);
+      match parsed {
         Some(hello) => relay
           .serve(InputWithClientHello {
             input: bridge,
@@ -517,130 +445,131 @@ where
         None => relay.serve(bridge).await.map_err(|err| eyre::eyre!("MITM relay: {err}")),
       }
     }
-  }
-}
+    // Declared Postgres. The entry states the far side's transport and the guest
+    // states its own, so both legs are settled here and the wire machine then
+    // works on plaintext whichever way either arrived.
+    Expect::Postgres(scope) => {
+      let Some(opening) = read_guest_opening(&mut guest, initial, budget).await? else {
+        return Ok(());
+      };
+      let mut server_name = host.map(ToString::to_string);
+      // Guest leg: everything already read past the opening, plus the name to
+      // mint for when the guest asked for TLS. Those bytes were consumed from
+      // the guest stream, so they are replayed into whichever leg follows.
+      let mut guest_tls: Option<(Vec<u8>, String)> = None;
+      let mut guest_head = Vec::new();
+      if let GuestOpening::Tls(buf) = opening {
+        let Some(read) = read_client_hello(&mut guest, &buf, budget).await? else {
+          return Ok(());
+        };
+        let (hello_buf, sni) = match read {
+          Hello::Named { buf, sni, .. } => (buf, Some(sni)),
+          Hello::Unnamed { buf } => (buf, None),
+        };
+        if let (Some(authority), Some(sni)) = (host, sni.as_deref())
+          && !sni.eq_ignore_ascii_case(authority)
+        {
+          tracing::debug!(authority, sni, "CONNECT authority differs from SNI; closing");
+          return Ok(());
+        }
+        server_name = server_name.or_else(|| sni.clone());
+        // The leaf has to carry the name the guest verified, so the guest's own
+        // SNI wins and the authority is the fallback for a hello without one.
+        let Some(identity) = sni.or_else(|| server_name.clone()) else {
+          tracing::debug!("guest TLS with no name to mint for; closing");
+          return Ok(());
+        };
+        if !state.mint.allow() {
+          eyre::bail!("MITM issuance burst exceeded for {identity}");
+        }
+        state.mint.record();
+        guest_tls = Some((hello_buf, identity));
+      } else if let GuestOpening::Cleartext(buf) = opening {
+        guest_head = buf;
+      }
 
-/// Dial upstream, applying the fwmark when set (TUN self-exclusion).
-/// Mark failures are fatal: silently unmarked dials would loop back into TUN.
-///
-/// # Errors
-///
-/// Returns an error when DNS resolution fails, when every resolved address
-/// fails to connect within the overall budget, or when applying the fwmark
-/// fails.
-pub async fn dial_marked(host: &str, port: u16, fwmark: Option<u32>) -> std::io::Result<TcpStream> {
-  const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-  // One total budget across DNS + every address attempt: N blackholed
-  // addresses must cost 10s total, not 10s each.
-  let deadline = tokio::time::Instant::now() + DIAL_TIMEOUT;
-  let mut last_err = std::io::Error::new(std::io::ErrorKind::NotFound, "DNS returned no addresses");
-  let addrs = tokio::time::timeout(DIAL_TIMEOUT, tokio::net::lookup_host((host, port)))
-    .await
-    .map_err(|_elapsed| std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS lookup timed out"))??;
-  for addr in addrs {
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-      last_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "dial budget exhausted");
-      break;
-    }
-    match tokio::time::timeout(remaining, dial_one(addr, fwmark)).await {
-      Ok(Ok(stream)) => return Ok(stream),
-      Ok(Err(err)) => last_err = err,
-      Err(_) => {
-        last_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP dial timed out");
+      // The real string states the far end: the dial follows its host and
+      // port, not the destination the guest aimed at.
+      let mut upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
+      // `disable` never asks. `allow` mimics libpq statelessly: the guest's
+      // own escalation decides the upstream leg. A cleartext guest gets
+      // cleartext upstream — a hostssl-only refusal is relayed honestly, and
+      // it is the guest's libpq that reconnects with an SSLRequest — while a
+      // guest that asked for TLS escalates the upstream to TLS too.
+      let asks_tls = match scope.ssl {
+        SslMode::Disable => false,
+        SslMode::Allow => guest_tls.is_some(),
+        SslMode::Prefer | SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => true,
+      };
+      let accepted = if asks_tls {
+        request_upstream_tls(&mut upstream, scope.negotiation, budget).await?
+      } else {
+        false
+      };
+      let needed = matches!(scope.ssl, SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull);
+      if needed && !accepted {
+        tracing::debug!(host = %scope.upstream.host, "server refused TLS on an entry that requires it; closing");
+        return Ok(());
+      }
+
+      let ctx = PairCtx {
+        grants: &snapshot.grants,
+        host: server_name.as_deref().unwrap_or(raw_host),
+        port,
+        plugins: &state.plugins,
+      };
+      // The upstream leg verifies against the real string's host, which its
+      // certificate must carry.
+      let upstream_name = scope.upstream.host.as_str();
+      match (guest_tls, accepted) {
+        (None, false) => relay_pg(Prefixed::new(guest_head, guest), upstream, &ctx).await,
+        (Some((hello_buf, identity)), false) => {
+          let plain = state
+            .pg
+            .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
+            .await?;
+          relay_pg(plain, upstream, &ctx).await
+        }
+        (None, true) => {
+          let plain = state.pg.connect_server(scope, upstream_name, upstream).await?;
+          relay_pg(Prefixed::new(guest_head, guest), plain, &ctx).await
+        }
+        (Some((hello_buf, identity)), true) => {
+          let guest_plain = state
+            .pg
+            .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
+            .await?;
+          let server_plain = state.pg.connect_server(scope, upstream_name, upstream).await?;
+          relay_pg(guest_plain, server_plain, &ctx).await
+        }
       }
     }
   }
-  Err(last_err)
 }
 
-async fn dial_one(addr: SocketAddr, fwmark: Option<u32>) -> std::io::Result<TcpStream> {
-  if fwmark.is_none() {
-    return TcpStream::connect(addr).await;
+/// Pump one settled Postgres pair: both legs are plaintext by the time this
+/// runs, whichever transports carried them there.
+async fn relay_pg<G, S>(guest: G, server: S, ctx: &PairCtx<'_>) -> eyre::Result<()>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let (mut downstream_machine, mut upstream_machine) = postgres_pair(ctx);
+  relay_guarded(guest, server, &mut downstream_machine, &mut upstream_machine, &[]).await
+}
+
+/// Copy bytes unchanged, replaying whatever was already read past the ingress
+/// head so no guest byte is dropped.
+async fn splice_replay<G>(mut guest: G, dial_host: &str, port: u16, fwmark: Option<u32>, read: &[u8]) -> eyre::Result<()>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  let mut upstream = dial_marked(dial_host, port, fwmark).await?;
+  if !read.is_empty() {
+    upstream.write_all(read).await?;
   }
-  let opts = Arc::new(SocketOptions {
-    mark: fwmark,
-    ..SocketOptions::default_tcp()
-  });
-  // The mark lives on the fd, so the tokio stream unwraps losslessly.
-  opts.connect(addr).await.map(|stream| stream.stream).map_err(std::io::Error::other)
-}
-
-/// Plaintext protocol detected from the first client bytes.
-enum PlainMode {
-  Http,
-  H2,
-  Raw,
-}
-
-/// Read the first plaintext chunk and detect HTTP/1 vs H2 preface vs raw.
-async fn peek_mode<G: AsyncRead + Unpin>(guest: &mut G) -> eyre::Result<(Vec<u8>, PlainMode)> {
-  let mut peeked = Vec::new();
-  let mut chunk = [0u8; 4096];
-  // Total budget: same slow-drip concern as `sniff_stream`.
-  let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
-  loop {
-    if peeked.len() >= H2_PREFACE.len() {
-      if peeked.starts_with(H2_PREFACE) {
-        return Ok((peeked, PlainMode::H2));
-      }
-      match try_parse_request(&peeked) {
-        HeadPeek::Complete => return Ok((peeked, PlainMode::Http)),
-        HeadPeek::NotHttp => return Ok((peeked, PlainMode::Raw)),
-        HeadPeek::Partial if peeked.len() > MAX_HEAD => return Ok((peeked, PlainMode::Raw)),
-        HeadPeek::Partial => {}
-      }
-    } else if !H2_PREFACE.starts_with(&peeked) {
-      match try_parse_request(&peeked) {
-        HeadPeek::Complete => return Ok((peeked, PlainMode::Http)),
-        HeadPeek::NotHttp => return Ok((peeked, PlainMode::Raw)),
-        HeadPeek::Partial => {}
-      }
-    }
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-      return Ok(decide_partial(peeked));
-    }
-    let read = tokio::time::timeout(remaining, guest.read(&mut chunk)).await;
-    let Ok(n) = read else {
-      return Ok(decide_partial(peeked));
-    };
-    let n = n?;
-    if n == 0 {
-      return Ok(decide_partial(peeked));
-    }
-    peeked.extend_from_slice(&chunk[..n]);
-  }
-}
-
-/// Outcome of trying to parse the peeked bytes as a request head.
-enum HeadPeek {
-  /// Complete request head: HTTP/1.
-  Complete,
-  /// Definitively not HTTP.
-  NotHttp,
-  /// Syntactically plausible so far: keep reading.
-  Partial,
-}
-
-fn try_parse_request(data: &[u8]) -> HeadPeek {
-  let mut headers = [httparse::EMPTY_HEADER; 64];
-  let mut req = httparse::Request::new(&mut headers);
-  match req.parse(data) {
-    Ok(status) if status.is_complete() => HeadPeek::Complete,
-    Ok(_) => HeadPeek::Partial,
-    Err(_) => HeadPeek::NotHttp,
-  }
-}
-
-fn decide_partial(peeked: Vec<u8>) -> (Vec<u8>, PlainMode) {
-  if peeked.len() >= H2_PREFACE.len() && peeked.starts_with(H2_PREFACE) {
-    return (peeked, PlainMode::H2);
-  }
-  match try_parse_request(&peeked) {
-    HeadPeek::Complete => (peeked, PlainMode::Http),
-    HeadPeek::NotHttp | HeadPeek::Partial => (peeked, PlainMode::Raw),
-  }
+  tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
+  Ok(())
 }
 
 async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &ProxyState, snapshot: &ResolvedConfig) -> eyre::Result<()> {
@@ -660,30 +589,21 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     return Ok(());
   }
-  let mut req = AnyMachine::Http1(SecretsMachine::new(
-    MachineParams::new(&snapshot.grants, MachineMode::Http, &host, port, Direction::Request).hook(state.plugins.select(
-      Scheme::Http,
-      &host,
-      port,
-      HookDirection::Request,
-    )),
-  ));
-  let mut resp = AnyMachine::Http1(SecretsMachine::new(
-    MachineParams::new(&snapshot.grants, MachineMode::Http, &host, port, Direction::Response).hook(state.plugins.select(
-      Scheme::Http,
-      &host,
-      port,
-      HookDirection::Response,
-    )),
-  ));
-  relay_guarded(client, upstream, &mut req, &mut resp, head).await
+  let ctx = PairCtx {
+    grants: &snapshot.grants,
+    host: &host,
+    port,
+    plugins: &state.plugins,
+  };
+  let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
+  relay_guarded(client, upstream, &mut downstream_machine, &mut upstream_machine, head).await
 }
 
 /// Read until the end of the HTTP head (`\r\n\r\n`) or `MAX_HEAD` bytes.
 /// Returns whatever was read; caller checks completeness. Bounded by the
 /// handshake timeout: this runs pre-auth on unauthenticated client bytes.
-async fn read_head(stream: &mut TcpStream) -> eyre::Result<Vec<u8>> {
-  tokio::time::timeout(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS), read_head_inner(stream))
+async fn read_head(stream: &mut TcpStream, budget: std::time::Duration) -> eyre::Result<Vec<u8>> {
+  tokio::time::timeout(budget, read_head_inner(stream))
     .await
     .map_err(|_elapsed| eyre::eyre!("client head read timed out"))?
 }
@@ -726,46 +646,6 @@ fn parse_authority(authority: &str, default_port: Option<u16>) -> Option<(String
   Some((host, port))
 }
 
-/// A stream prefixed with already-read bytes (replays `initial_buf` first).
-struct Prefixed<S> {
-  prefix: Vec<u8>,
-  pos: usize,
-  inner: S,
-}
-
-impl<S> Prefixed<S> {
-  fn new(prefix: Vec<u8>, inner: S) -> Self {
-    Self { prefix, pos: 0, inner }
-  }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
-  fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-    if self.pos < self.prefix.len() {
-      let remaining = &self.prefix[self.pos..];
-      let n = remaining.len().min(buf.remaining());
-      buf.put_slice(&remaining[..n]);
-      self.pos += n;
-      return Poll::Ready(Ok(()));
-    }
-    Pin::new(&mut self.inner).poll_read(cx, buf)
-  }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
-  fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-    Pin::new(&mut self.inner).poll_write(cx, buf)
-  }
-
-  fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-    Pin::new(&mut self.inner).poll_flush(cx)
-  }
-
-  fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-    Pin::new(&mut self.inner).poll_shutdown(cx)
-  }
-}
-
 #[cfg(test)]
 /// Test helper: bound address of a listener.
 fn local_addr(listener: &TcpListener) -> SocketAddr {
@@ -785,13 +665,12 @@ mod tests {
   use super::*;
   use std::time::Duration;
 
-  use hodor_config::grants::{Grant, UriGrant};
+  use crate::wire::{Direction, Http, Wire};
+  use hodor_config::grants::{Credential, EndpointScope, Grant};
   use hodor_config::{PluginDirection, ResolvedPlugin};
   use hodor_pki::ca::install_crypto_provider;
   use rustls::pki_types::ServerName;
   use tokio_rustls::{TlsAcceptor, TlsConnector};
-
-  use crate::substitute::SubMachine;
 
   #[test]
   fn parse_authority_bracketed_v6_default_port() {
@@ -816,6 +695,17 @@ mod tests {
   }
 
   fn test_state_with_plugins(grants: Vec<Grant>, plugins: Vec<ResolvedPlugin>, ca: &CertAuthority) -> Arc<ProxyState> {
+    test_state_with_budget(grants, plugins, ca, 10)
+  }
+
+  /// [`test_state_with_plugins`] with an explicit handshake budget, for the
+  /// tests that pin timeout behavior.
+  fn test_state_with_budget(
+    grants: Vec<Grant>,
+    plugins: Vec<ResolvedPlugin>,
+    ca: &CertAuthority,
+    handshake_timeout_secs: u64,
+  ) -> Arc<ProxyState> {
     install_crypto_provider();
     Arc::new(
       ProxyState::new(
@@ -823,6 +713,7 @@ mod tests {
           proxy: hodor_config::config::ProxyCfg {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
+            handshake_timeout_secs,
           },
           grants,
           plugins,
@@ -872,10 +763,57 @@ mod tests {
     connector: TlsConnector,
   }
 
+  /// ALPN a fixture's TLS pair negotiates: what a real client offers and a real
+  /// server selects. The pump frames an HTTPS scope by this and by nothing
+  /// else, so [`Alpn::None`] models a protocol that is not HTTP.
+  #[derive(Clone, Copy, PartialEq, Eq)]
+  enum Alpn {
+    /// `http/1.1`, the ordinary HTTPS negotiation.
+    Http1,
+    /// `h2`.
+    H2,
+    /// No protocol agreed.
+    None,
+  }
+
+  impl Alpn {
+    fn protocols(self) -> Vec<Vec<u8>> {
+      match self {
+        Alpn::Http1 => vec![b"http/1.1".to_vec()],
+        Alpn::H2 => vec![b"h2".to_vec()],
+        Alpn::None => Vec::new(),
+      }
+    }
+  }
+
+  /// Stub server config that selects `alpn`, like a real HTTPS server.
+  fn stub_server_config(base: &rustls::ServerConfig, alpn: Alpn) -> rustls::ServerConfig {
+    let mut config = base.clone();
+    config.alpn_protocols = alpn.protocols();
+    config
+  }
+
+  /// Guest client config that offers `alpn`, like a real HTTPS client.
+  fn guest_client_config(roots: rustls::RootCertStore, alpn: Alpn) -> Arc<rustls::ClientConfig> {
+    let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    config.alpn_protocols = alpn.protocols();
+    Arc::new(config)
+  }
+
   /// Proxy + TLS stub presenting a hodor-signed localhost cert; client
   /// connector trusts the hodor CA. Grants built with the stub port.
   async fn mitm_fixture(make_grants: impl Fn(u16) -> Vec<Grant>) -> MitmFixture {
-    mitm_fixture_with_plugins(make_grants, |_| Vec::new()).await
+    mitm_fixture_alpn(make_grants, |_| Vec::new(), Alpn::Http1).await
+  }
+
+  /// [`mitm_fixture`] negotiating `h2`.
+  async fn mitm_fixture_h2(make_grants: impl Fn(u16) -> Vec<Grant>) -> MitmFixture {
+    mitm_fixture_alpn(make_grants, |_| Vec::new(), Alpn::H2).await
+  }
+
+  /// [`mitm_fixture`] with no ALPN agreed at all.
+  async fn mitm_fixture_no_alpn(make_grants: impl Fn(u16) -> Vec<Grant>) -> MitmFixture {
+    mitm_fixture_alpn(make_grants, |_| Vec::new(), Alpn::None).await
   }
 
   /// [`mitm_fixture`] plus plugin fixtures built with the stub port.
@@ -883,11 +821,28 @@ mod tests {
     make_grants: impl Fn(u16) -> Vec<Grant>,
     make_plugins: impl Fn(u16) -> Vec<ResolvedPlugin>,
   ) -> MitmFixture {
+    mitm_fixture_alpn(make_grants, make_plugins, Alpn::Http1).await
+  }
+
+  /// [`mitm_fixture_with_plugins`] negotiating `h2`.
+  async fn mitm_fixture_with_plugins_h2(
+    make_grants: impl Fn(u16) -> Vec<Grant>,
+    make_plugins: impl Fn(u16) -> Vec<ResolvedPlugin>,
+  ) -> MitmFixture {
+    mitm_fixture_alpn(make_grants, make_plugins, Alpn::H2).await
+  }
+
+  /// Fixture body shared by the flavors above.
+  async fn mitm_fixture_alpn(
+    make_grants: impl Fn(u16) -> Vec<Grant>,
+    make_plugins: impl Fn(u16) -> Vec<ResolvedPlugin>,
+    alpn: Alpn,
+  ) -> MitmFixture {
     install_crypto_provider();
     let ca = CertAuthority::generate().unwrap();
     let ca_der = ca.cert_der().clone();
     let stub_cert = ca.generate_domain_cert("localhost").unwrap();
-    let stub_acceptor = TlsAcceptor::from(Arc::clone(&stub_cert.server_config));
+    let stub_acceptor = TlsAcceptor::from(Arc::new(stub_server_config(&stub_cert.server_config, alpn)));
     let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_port = local_addr(&stub).port();
     let grants = make_grants(stub_port);
@@ -895,8 +850,7 @@ mod tests {
     let (proxy_addr, proxy) = run_proxy_with(test_state_with_plugins(grants, plugins, &ca)).await;
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca_der).unwrap();
-    let client_config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(client_config));
+    let connector = TlsConnector::from(guest_client_config(roots, alpn));
     MitmFixture {
       proxy_addr,
       proxy,
@@ -908,14 +862,19 @@ mod tests {
   }
 
   fn localhost_grant(port: u16, fake: &str, value: &str) -> Vec<Grant> {
-    vec![Grant {
-      label: "t".into(),
-      fake: fake.into(),
-      value: secrecy::SecretString::from(value.to_string()),
-      allow: vec![UriGrant {
+    vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: fake.into(),
+        value: secrecy::SecretString::from(value.to_string()),
+      },
+      allow: vec![EndpointScope {
         scheme: Scheme::Https,
         host: "localhost".parse().unwrap(),
         port,
+        client_cert: None,
+        client_key: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
     }]
   }
@@ -1015,12 +974,12 @@ mod tests {
       .write_all(format!("GET http://{stub_addr}/x HTTP/1.1\r\nHost: {stub_addr}\r\n\r\n").as_bytes())
       .await
       .unwrap();
-    let mut resp = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
       .await
       .unwrap()
       .unwrap();
-    assert!(resp.starts_with(b"HTTP/1.1 200 OK"), "{}", resp.escape_ascii());
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"), "{}", response.escape_ascii());
 
     stub_task.await.unwrap();
     proxy.abort();
@@ -1031,12 +990,12 @@ mod tests {
     let (proxy_addr, proxy) = run_proxy().await;
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
-    let mut resp = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
       .await
       .unwrap()
       .unwrap();
-    assert!(resp.is_empty());
+    assert!(response.is_empty());
     proxy.abort();
   }
 
@@ -1065,9 +1024,9 @@ mod tests {
       .write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer hello\r\n\r\n")
       .await
       .unwrap();
-    let resp = read_head_from(&mut tls).await;
-    assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", resp.escape_ascii());
-    assert_eq!(read_body(&mut tls, &resp, 2).await, b"hi");
+    let response = read_head_from(&mut tls).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", response.escape_ascii());
+    assert_eq!(read_body(&mut tls, &response, 2).await, b"hi");
     stub_task.await.unwrap();
     proxy.abort();
   }
@@ -1104,24 +1063,29 @@ mod tests {
       .write_all(format!("GET /x HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {FAKE}\r\n\r\n").as_bytes())
       .await
       .unwrap();
-    let resp = read_head_from(&mut tls).await;
-    let resp_str = String::from_utf8_lossy(&resp);
+    let response = read_head_from(&mut tls).await;
+    let resp_str = String::from_utf8_lossy(&response);
     assert!(!resp_str.contains(VALUE), "{resp_str}");
     let expect_body = format!("echo:{FAKE}");
-    assert_eq!(read_body(&mut tls, &resp, expect_body.len()).await, expect_body.as_bytes());
+    assert_eq!(read_body(&mut tls, &response, expect_body.len()).await, expect_body.as_bytes());
     stub_task.await.unwrap();
     proxy.abort();
   }
 
   fn localhost_tcp_grant(port: u16, fake: &str, value: &str) -> Vec<Grant> {
-    vec![Grant {
-      label: "t".into(),
-      fake: fake.into(),
-      value: secrecy::SecretString::from(value.to_string()),
-      allow: vec![UriGrant {
+    vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: fake.into(),
+        value: secrecy::SecretString::from(value.to_string()),
+      },
+      allow: vec![EndpointScope {
         scheme: Scheme::Tcp,
         host: "localhost".parse().unwrap(),
         port,
+        client_cert: None,
+        client_key: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
     }]
   }
@@ -1160,11 +1124,11 @@ mod tests {
       .write_all(format!("GET /x HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {FAKE}\r\n\r\n").as_bytes())
       .await
       .unwrap();
-    let resp = read_head_from(&mut tls).await;
-    let resp_str = String::from_utf8_lossy(&resp);
+    let response = read_head_from(&mut tls).await;
+    let resp_str = String::from_utf8_lossy(&response);
     assert!(resp_str.contains(VALUE), "{resp_str}");
     let expect_body = format!("echo:{VALUE}");
-    assert_eq!(read_body(&mut tls, &resp, expect_body.len()).await, expect_body.as_bytes());
+    assert_eq!(read_body(&mut tls, &response, expect_body.len()).await, expect_body.as_bytes());
     stub_task.await.unwrap();
     proxy.abort();
   }
@@ -1258,11 +1222,281 @@ mod tests {
       .write_all(format!("GET /x HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {FAKE}\r\n\r\n").as_bytes())
       .await
       .unwrap();
-    let resp = read_head_from(&mut tls).await;
-    assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", resp.escape_ascii());
-    assert_eq!(read_body(&mut tls, &resp, 2).await, b"hi");
+    let response = read_head_from(&mut tls).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", response.escape_ascii());
+    assert_eq!(read_body(&mut tls, &response, 2).await, b"hi");
     stub_task.await.unwrap();
     proxy.abort();
+  }
+
+  #[tokio::test]
+  async fn https_scope_without_alpn_relays_raw() {
+    // No ALPN agreed, so nothing proves the plaintext is HTTP and the pump
+    // frames it raw: bytes swap in place, with no head parsed and none waited
+    // for. That last part is what lets a non-HTTP protocol on an https scope
+    // flow immediately instead of stalling on a head that never comes.
+    const FAKE: &str = "$$CREDENTIAL_DODSZYJGK2D0:L$$";
+    const VALUE: &str = "$$CREDENTIAL_C1YI2U4SC3JE:L$$";
+    let fx = mitm_fixture_no_alpn(|port| localhost_grant(port, FAKE, VALUE)).await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let mut tls = stub_acceptor.accept(conn).await.unwrap();
+      let mut auth = vec![0u8; 5 + VALUE.len() + 1];
+      tls.read_exact(&mut auth).await.unwrap();
+      assert_eq!(auth, format!("AUTH {VALUE}\n").into_bytes(), "upstream sees the real value");
+      tls.write_all(format!("TOKEN {VALUE}\n").as_bytes()).await.unwrap();
+    });
+    let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    tls.write_all(format!("AUTH {FAKE}\n").as_bytes()).await.unwrap();
+    let mut token = vec![0u8; 6 + VALUE.len() + 1];
+    tls.read_exact(&mut token).await.unwrap();
+    assert_eq!(token, format!("TOKEN {FAKE}\n").into_bytes(), "guest sees the fake back");
+    stub_task.await.unwrap();
+    proxy.abort();
+  }
+
+  /// The entry's `sslcert`/`sslkey` pair is the proxy's upstream client
+  /// identity: the stub demands a client certificate the hodor CA signed, and
+  /// the substitution round trip only completes when the egress leg presents
+  /// exactly the entry's.
+  #[tokio::test]
+  async fn https_entry_presents_its_client_identity_upstream() {
+    const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    use rama::crypto::pem::PemEncode as _;
+    install_crypto_provider();
+    let ca = CertAuthority::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (client_chain, client_key) = hodor_pki::ca::generate_client_pair(&ca, "hodor-client").unwrap();
+    let mut cert_pem = Vec::new();
+    for cert in &client_chain {
+      cert_pem.extend_from_slice(cert.to_pem().as_bytes());
+    }
+    let cert_path = dir.path().join("client.pem");
+    let key_path = dir.path().join("client.key");
+    std::fs::write(&cert_path, &cert_pem).unwrap();
+    std::fs::write(&key_path, client_key.to_pem()).unwrap();
+
+    let (server_chain, server_key) = hodor_pki::ca::generate_domain_pair(&ca, "localhost").unwrap();
+    let mut client_roots = rustls::RootCertStore::empty();
+    client_roots.add(ca.cert_der().clone()).unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+      .build()
+      .unwrap();
+    let server_config = rustls::ServerConfig::builder()
+      .with_client_cert_verifier(verifier)
+      .with_single_cert(server_chain, server_key)
+      .unwrap();
+    let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub.local_addr().unwrap().port();
+    let stub_task = tokio::spawn(async move {
+      let (stream, _) = stub.accept().await.unwrap();
+      let mut tls = TlsAcceptor::from(Arc::new(server_config)).accept(stream).await.unwrap();
+      let peer = tls.get_ref().1.peer_certificates().and_then(|certs| certs.first().cloned());
+      let head = read_head_from(&mut tls).await;
+      assert!(head.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()));
+      tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.unwrap();
+      peer
+    });
+
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE.to_string()),
+      },
+      allow: vec![EndpointScope {
+        scheme: Scheme::Https,
+        host: "localhost".parse().unwrap(),
+        port: stub_port,
+        client_cert: Some(cert_path.clone()),
+        client_key: Some(key_path.clone()),
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
+      }],
+    }];
+    let state = test_state_with_plugins(grants, Vec::new(), &ca);
+    let (proxy_addr, _proxy) = run_proxy_with(state).await;
+
+    let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+    guest
+      .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    let mut ok = [0u8; 19];
+    guest.read_exact(&mut ok).await.unwrap();
+    assert_eq!(&ok, b"HTTP/1.1 200 OK\r\n\r\n");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.cert_der().clone()).unwrap();
+    let connector = TlsConnector::from(guest_client_config(roots, Alpn::Http1));
+    let mut tls = connector
+      .connect(rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(), guest)
+      .await
+      .unwrap();
+    tls
+      .write_all(format!("GET / HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {FAKE}\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    let head = read_head_from(&mut tls).await;
+    assert!(head.starts_with(b"HTTP/1.1 200 OK"));
+
+    let peer = stub_task.await.unwrap();
+    assert_eq!(peer.as_ref(), client_chain.first());
+  }
+
+  /// `guest_tls_mode = "mtls"` on an https entry: hodor demands a client
+  /// certificate from the guest and admits only ones its own CA signs.
+  ///
+  /// TLS 1.3 hands the guest the server Finished before the server
+  /// validates the guest certificate, so a refused guest's `connect` can
+  /// still return `Ok` — the refusal surfaces on the read after, never in
+  /// the connect result. The assertion point is therefore the request
+  /// round trip, not the handshake.
+  #[tokio::test]
+  #[expect(clippy::too_many_lines, reason = "linear test script, split would obscure the flow")]
+  async fn https_guest_mtls_admits_only_ca_signed_guests() {
+    // CONNECT, guest TLS, one GET, then read until the response head is
+    // whole; a refused guest never gets that far.
+    async fn guest_round_trip(
+      proxy_addr: SocketAddr,
+      stub_port: u16,
+      config: Arc<rustls::ClientConfig>,
+      token: &'static str,
+    ) -> std::io::Result<Vec<u8>> {
+      let mut guest = TcpStream::connect(proxy_addr).await?;
+      guest
+        .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\n\r\n").as_bytes())
+        .await?;
+      let mut ok = [0u8; 19];
+      guest.read_exact(&mut ok).await?;
+      let mut tls = TlsConnector::from(config)
+        .connect(rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(), guest)
+        .await?;
+      tls
+        .write_all(format!("GET / HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\r\n").as_bytes())
+        .await?;
+      let mut head = Vec::new();
+      let mut chunk = [0u8; 4096];
+      loop {
+        let n = match tokio::time::timeout(Duration::from_secs(5), tls.read(&mut chunk)).await {
+          Ok(read) => read?,
+          Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer")),
+        };
+        if n == 0 {
+          return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "refused"));
+        }
+        head.extend_from_slice(&chunk[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+          return Ok(head);
+        }
+      }
+    }
+    const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    install_crypto_provider();
+    let ca = CertAuthority::generate().unwrap();
+
+    let (server_chain, server_key) = hodor_pki::ca::generate_domain_pair(&ca, "localhost").unwrap();
+    let server_config = Arc::new(
+      rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(server_chain, server_key)
+        .unwrap(),
+    );
+    let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let seen_later = Arc::clone(&seen);
+    // One upstream connection per guest attempt (the relay dials upstream
+    // before answering the guest); refused guests leave the handler on
+    // EOF or timeout instead of an HTTP exchange.
+    let stub_task = tokio::spawn(async move {
+      loop {
+        let Ok((conn, _)) = stub.accept().await else { return };
+        let seen = Arc::clone(&seen);
+        let acceptor = TlsAcceptor::from(Arc::clone(&server_config));
+        tokio::spawn(async move {
+          let Ok(mut tls) = acceptor.accept(conn).await else { return };
+          let mut buf = Vec::new();
+          let mut chunk = [0u8; 4096];
+          loop {
+            let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut chunk)).await else {
+              return;
+            };
+            if n == 0 {
+              return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+              break;
+            }
+          }
+          seen.lock().await.extend(buf);
+          tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.unwrap();
+        });
+      }
+    });
+
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE.to_string()),
+      },
+      allow: vec![EndpointScope {
+        scheme: Scheme::Https,
+        host: "localhost".parse().unwrap(),
+        port: stub_port,
+        client_cert: None,
+        client_key: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Mtls,
+      }],
+    }];
+    let state = test_state_with_plugins(grants, Vec::new(), &ca);
+    let (proxy_addr, _proxy) = run_proxy_with(state).await;
+
+    // CA-signed guest: full round trip with fake-to-real substitution.
+    let (chain, key) = hodor_pki::ca::generate_client_pair(&ca, "guest").unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.cert_der().clone()).unwrap();
+    let mut config = rustls::ClientConfig::builder()
+      .with_root_certificates(roots)
+      .with_client_auth_cert(chain, key)
+      .unwrap();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let head = guest_round_trip(proxy_addr, stub_port, Arc::new(config), FAKE).await.unwrap();
+    assert!(head.starts_with(b"HTTP/1.1 200 OK"));
+    assert!(seen_later.lock().await.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()));
+
+    // Certless guest: refused — the read after connect dies.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.cert_der().clone()).unwrap();
+    guest_round_trip(proxy_addr, stub_port, guest_client_config(roots, Alpn::Http1), FAKE)
+      .await
+      .expect_err("the certless guest must not round-trip");
+
+    // Guest with a certificate hodor's CA did not sign: refused too.
+    let stranger = CertAuthority::generate().unwrap();
+    let (chain, key) = hodor_pki::ca::generate_client_pair(&stranger, "guest").unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.cert_der().clone()).unwrap();
+    let mut config = rustls::ClientConfig::builder()
+      .with_root_certificates(roots)
+      .with_client_auth_cert(chain, key)
+      .unwrap();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    guest_round_trip(proxy_addr, stub_port, Arc::new(config), FAKE)
+      .await
+      .expect_err("an untrusted guest must not round-trip");
+
+    stub_task.abort();
   }
 
   #[tokio::test]
@@ -1271,7 +1505,7 @@ mod tests {
 
     const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let fx = mitm_fixture(|port| localhost_grant(port, FAKE, VALUE)).await;
+    let fx = mitm_fixture_h2(|port| localhost_grant(port, FAKE, VALUE)).await;
     let MitmFixture {
       proxy_addr,
       proxy,
@@ -1363,12 +1597,12 @@ mod tests {
     });
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     client.write_all(request.as_bytes()).await.unwrap();
-    let mut resp = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
       .await
       .unwrap()
       .unwrap();
-    assert!(resp.starts_with(b"HTTP/1.1 200 OK"), "{}", resp.escape_ascii());
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"), "{}", response.escape_ascii());
     stub_task.await.unwrap();
     proxy.abort();
   }
@@ -1415,14 +1649,19 @@ mod tests {
     let ca = CertAuthority::generate().unwrap();
     let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_port = local_addr(&stub).port();
-    let grants = vec![Grant {
-      label: "t".into(),
-      fake: FAKE.into(),
-      value: secrecy::SecretString::from(VALUE),
-      allow: vec![UriGrant {
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec![EndpointScope {
         scheme: Scheme::Http,
         host: "127.0.0.1".parse().unwrap(),
         port: stub_port,
+        client_cert: None,
+        client_key: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
     }];
     let state = test_state_with(grants, &ca);
@@ -1450,11 +1689,11 @@ mod tests {
       )
       .await
       .unwrap();
-    let resp = read_head_from(&mut client_end).await;
-    let resp_str = String::from_utf8_lossy(&resp);
+    let response = read_head_from(&mut client_end).await;
+    let resp_str = String::from_utf8_lossy(&response);
     assert!(!resp_str.contains(VALUE), "{resp_str}");
     let expect = format!("echo:{FAKE}");
-    assert_eq!(read_body(&mut client_end, &resp, expect.len()).await, expect.as_bytes());
+    assert_eq!(read_body(&mut client_end, &response, expect.len()).await, expect.as_bytes());
     stub_task.await.unwrap();
     serve.await.unwrap().unwrap();
   }
@@ -1468,17 +1707,22 @@ mod tests {
     let ca = CertAuthority::generate().unwrap();
     let ca_der = ca.cert_der().clone();
     let stub_cert = ca.generate_domain_cert(SNI).unwrap();
-    let stub_acceptor = TlsAcceptor::from(Arc::clone(&stub_cert.server_config));
+    let stub_acceptor = TlsAcceptor::from(Arc::new(stub_server_config(&stub_cert.server_config, Alpn::Http1)));
     let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_port = local_addr(&stub).port();
-    let grants = vec![Grant {
-      label: "t".into(),
-      fake: FAKE.into(),
-      value: secrecy::SecretString::from(VALUE),
-      allow: vec![UriGrant {
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec![EndpointScope {
         scheme: Scheme::Https,
         host: SNI.parse().unwrap(),
         port: stub_port,
+        client_cert: None,
+        client_key: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
     }];
     let state = test_state_with(grants, &ca);
@@ -1504,9 +1748,7 @@ mod tests {
     });
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca_der).unwrap();
-    let connector = TlsConnector::from(Arc::new(
-      rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth(),
-    ));
+    let connector = TlsConnector::from(guest_client_config(roots, Alpn::Http1));
     let server_name = ServerName::try_from(SNI.to_string()).unwrap();
     let mut tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, client_end))
       .await
@@ -1517,21 +1759,21 @@ mod tests {
       .await
       .unwrap();
     stub_task.await.unwrap();
-    let mut resp = Vec::new();
+    let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
       let n = tokio::time::timeout(Duration::from_secs(10), tls.read(&mut chunk))
         .await
         .unwrap()
         .unwrap();
-      resp.extend_from_slice(&chunk[..n]);
-      if resp.windows(4).any(|w| w == b"\r\n\r\n") {
+      response.extend_from_slice(&chunk[..n]);
+      if response.windows(4).any(|w| w == b"\r\n\r\n") {
         break;
       }
     }
-    let head_end = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head_end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let expect = format!("echo:{FAKE}");
-    let mut body = Vec::from(&resp[head_end..]);
+    let mut body = Vec::from(&response[head_end..]);
     while body.len() < expect.len() {
       let n = tokio::time::timeout(Duration::from_secs(10), tls.read(&mut chunk))
         .await
@@ -1567,14 +1809,15 @@ mod tests {
   async fn plugin_e2e_close_verdict_drops_connection() {
     let (guest_end, mut client_end) = tokio::io::duplex(64 * 1024);
     let (server_end, mut stub_end) = tokio::io::duplex(64 * 1024);
-    let mut req =
-      SecretsMachine::new(MachineParams::new(&[], MachineMode::Http, "x", 80, Direction::Request).hook(Some(Box::new(CloseHook))));
-    let mut resp = SecretsMachine::new(MachineParams::new(&[], MachineMode::Http, "x", 80, Direction::Response));
-    let (relay_out, ()) = tokio::join!(relay_guarded(guest_end, server_end, &mut req, &mut resp, b""), async {
+    let (mut request, mut response) = (
+      Http::new(&[], Scheme::Http, "x", 80, Direction::Downstream, Some(Box::new(CloseHook))),
+      Http::new(&[], Scheme::Http, "x", 80, Direction::Upstream, None),
+    );
+    let (relay_out, ()) = tokio::join!(relay_guarded(guest_end, server_end, &mut request, &mut response, b""), async {
       client_end.write_all(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
     });
     relay_out.unwrap();
-    assert!(req.must_close());
+    assert!(matches!(request.feed(&[]).await, (crate::wire::Rewritten::Close, _)));
     // The latched head never reached the wire: upstream sees nothing.
     // The relay already returned, dropping its server half, so the read
     // resolves as EOF — zero bytes means `Ok(0)`, a leak would be `Ok(n)`.
@@ -1592,11 +1835,14 @@ mod tests {
 
   /// Plugin allow list mirroring [`localhost_grant`]: the MITM leg selects
   /// hooks with the same identity the machine receives.
-  fn plugin_allow(port: u16) -> Vec<UriGrant> {
-    vec![UriGrant {
+  fn plugin_allow(port: u16) -> Vec<EndpointScope> {
+    vec![EndpointScope {
       scheme: Scheme::Https,
       host: "localhost".parse().unwrap(),
       port,
+      client_cert: None,
+      client_key: None,
+      guest_tls: hodor_config::grants::GuestTlsMode::Tls,
     }]
   }
 
@@ -1668,9 +1914,9 @@ mod tests {
       )
       .await
       .unwrap();
-    let resp = read_head_from(&mut tls).await;
-    assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", resp.escape_ascii());
-    assert_eq!(read_body(&mut tls, &resp, 2).await, b"hi");
+    let response = read_head_from(&mut tls).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", response.escape_ascii());
+    assert_eq!(read_body(&mut tls, &response, 2).await, b"hi");
     stub_task.await.unwrap();
     proxy.abort();
   }
@@ -1710,11 +1956,11 @@ mod tests {
     });
     let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
     tls.write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
-    let resp = read_head_from(&mut tls).await;
-    let resp_str = String::from_utf8_lossy(&resp);
+    let response = read_head_from(&mut tls).await;
+    let resp_str = String::from_utf8_lossy(&response);
     assert!(resp_str.contains("x-hodor-response-plugin: marker\r\n"), "{resp_str}");
     // The chunk hook grew the body; chunked framing carries the new size.
-    let mut message = resp;
+    let mut message = response;
     while !message.ends_with(b"0\r\n\r\n") {
       let mut chunk = [0u8; 4096];
       let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut chunk))
@@ -1746,7 +1992,7 @@ mod tests {
       println!("skip: HODOR_PLUGIN_FIXTURES missing marker-request.wasm");
       return;
     };
-    let fx = mitm_fixture_with_plugins(
+    let fx = mitm_fixture_with_plugins_h2(
       |port| localhost_grant(port, "fake", "value"),
       |port| vec![plugin_entry("marker-request", port, fixture.clone())],
     )
@@ -1815,14 +2061,14 @@ mod tests {
         )
         .unwrap();
     }
-    let mut req = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
-    req.extend_from_slice(&h2_len(block.len()));
-    req.extend_from_slice(&[0x1, 0x4, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS
-    req.extend_from_slice(&block);
-    req.extend_from_slice(&data_frame(0x0, b"AAAAAAAA"));
-    req.extend_from_slice(&data_frame(0x0, b"BBBBBBBB"));
-    req.extend_from_slice(&data_frame(0x1, b"C"));
-    tls.write_all(&req).await.unwrap();
+    let mut request = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
+    request.extend_from_slice(&h2_len(block.len()));
+    request.extend_from_slice(&[0x1, 0x4, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS
+    request.extend_from_slice(&block);
+    request.extend_from_slice(&data_frame(0x0, b"AAAAAAAA"));
+    request.extend_from_slice(&data_frame(0x0, b"BBBBBBBB"));
+    request.extend_from_slice(&data_frame(0x1, b"C"));
+    tls.write_all(&request).await.unwrap();
     tls.flush().await.unwrap();
     let mut one = [0u8; 1];
     assert_eq!(tls.read(&mut one).await.unwrap(), 0);
@@ -1838,7 +2084,7 @@ mod tests {
       println!("skip: HODOR_PLUGIN_FIXTURES missing marker-request.wasm");
       return;
     };
-    let fx = mitm_fixture_with_plugins(
+    let fx = mitm_fixture_with_plugins_h2(
       |port| localhost_grant(port, "fake", "value"),
       |port| vec![plugin_entry("marker-request", port, fixture.clone())],
     )
@@ -1902,14 +2148,14 @@ mod tests {
         &mut trailer_block,
       )
       .unwrap();
-    let mut req = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
-    req.extend_from_slice(&h2_len(head_block.len()));
-    req.extend_from_slice(&[0x1, 0x4, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS
-    req.extend_from_slice(&head_block);
-    req.extend_from_slice(&h2_len(trailer_block.len()));
-    req.extend_from_slice(&[0x1, 0x4 | 0x1, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS|END_STREAM
-    req.extend_from_slice(&trailer_block);
-    tls.write_all(&req).await.unwrap();
+    let mut request = Vec::from(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..]);
+    request.extend_from_slice(&h2_len(head_block.len()));
+    request.extend_from_slice(&[0x1, 0x4, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS
+    request.extend_from_slice(&head_block);
+    request.extend_from_slice(&h2_len(trailer_block.len()));
+    request.extend_from_slice(&[0x1, 0x4 | 0x1, 0, 0, 0, 1]); // HEADERS stream 1 END_HEADERS|END_STREAM
+    request.extend_from_slice(&trailer_block);
+    tls.write_all(&request).await.unwrap();
     tls.flush().await.unwrap();
     let mut one = [0u8; 1];
     assert_eq!(tls.read(&mut one).await.unwrap(), 0);
@@ -1929,10 +2175,13 @@ mod tests {
         vec![ResolvedPlugin {
           name: "marker-request".to_string(),
           path: fixture.clone(),
-          allow: vec![UriGrant {
+          allow: vec![EndpointScope {
             scheme: Scheme::Https,
             host: "other.invalid".parse().unwrap(),
             port,
+            client_cert: None,
+            client_key: None,
+            guest_tls: hodor_config::grants::GuestTlsMode::Tls,
           }],
           direction: PluginDirection::Both,
         }]
@@ -1960,9 +2209,9 @@ mod tests {
     });
     let mut tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
     tls.write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
-    let resp = read_head_from(&mut tls).await;
-    assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", resp.escape_ascii());
-    assert_eq!(read_body(&mut tls, &resp, 2).await, b"hi");
+    let response = read_head_from(&mut tls).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", response.escape_ascii());
+    assert_eq!(read_body(&mut tls, &response, 2).await, b"hi");
     stub_task.await.unwrap();
     proxy.abort();
   }
@@ -2005,5 +2254,940 @@ mod tests {
     assert!(matches!(res, Ok(0)) || res.is_err(), "guest connection must drop, got {res:?}");
     stub_task.await.unwrap();
     proxy.abort();
+  }
+
+  use std::pin::Pin;
+  use std::task::{Context, Poll};
+
+  use bytes::Bytes;
+
+  /// Request or response body with no declared length, so hyper frames it
+  /// chunked and the de-chunking on the far side is a real implementation's.
+  struct Chunks(Vec<Bytes>);
+
+  impl hyper::body::Body for Chunks {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+      let this = self.get_mut();
+      Poll::Ready(if this.0.is_empty() {
+        None
+      } else {
+        Some(Ok(hyper::body::Frame::data(this.0.remove(0))))
+      })
+    }
+  }
+
+  /// Real hyper client and real hyper server through the MITM, chunked in both
+  /// directions, with the needle split across chunk boundaries. The proxy
+  /// re-chunks around its hold-back window, so the framing on the wire is
+  /// hodor's own output and has to be accepted by an independent HTTP/1
+  /// implementation on either side.
+  #[tokio::test]
+  async fn http1_real_client_and_server_round_trip_chunked() {
+    use http_body_util::BodyExt as _;
+    use hyper::body::Incoming;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+
+    const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let fx = mitm_fixture(|port| localhost_grant(port, FAKE, VALUE)).await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+
+    let stub_task = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.unwrap();
+      let tls = stub_acceptor.accept(conn).await.unwrap();
+      let service = service_fn(|req: Request<Incoming>| async move {
+        assert_eq!(
+          req.headers().get("authorization").unwrap().to_str().unwrap(),
+          format!("Bearer {VALUE}")
+        );
+        // The proxy re-emitted this request's chunked framing itself.
+        assert_eq!(req.headers().get("transfer-encoding").unwrap().to_str().unwrap(), "chunked");
+        let body = req.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), format!("upload:{VALUE}"));
+        let parts = format!("download:{VALUE}")
+          .as_bytes()
+          .chunks(8)
+          .map(Bytes::copy_from_slice)
+          .collect();
+        Ok::<_, std::io::Error>(Response::new(Chunks(parts)))
+      });
+      hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(tls), service)
+        .await
+        .unwrap();
+    });
+
+    let tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.unwrap();
+    let client_task = tokio::spawn(conn);
+    let parts: Vec<Bytes> = format!("upload:{FAKE}").as_bytes().chunks(7).map(Bytes::copy_from_slice).collect();
+    let request = Request::builder()
+      .method("POST")
+      .uri("/x")
+      .header("host", "localhost")
+      .header("authorization", format!("Bearer {FAKE}"))
+      .body(Chunks(parts))
+      .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    // The chunked path, not a fixed-length fallback: the response body below
+    // is framed by hodor, not passed through.
+    assert_eq!(response.headers().get("transfer-encoding").unwrap().to_str().unwrap(), "chunked");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(String::from_utf8(body.to_vec()).unwrap(), format!("download:{FAKE}"));
+    drop(sender);
+    let _ = client_task.await;
+    tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+    proxy.abort();
+  }
+
+  /// Real h2 client and real h2 server through the MITM, needle split across
+  /// DATA frames in both directions. h2 is a full HTTP/2 implementation: it
+  /// judges the HPACK blocks hodor re-encodes and the frame framing it emits.
+  #[tokio::test]
+  async fn http2_real_client_and_server_round_trip_split_data() {
+    const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let fx = mitm_fixture_h2(|port| localhost_grant(port, FAKE, VALUE)).await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      stub_acceptor,
+      connector,
+    } = fx;
+
+    let stub_task: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.map_err(|err| format!("accept: {err}"))?;
+      let tls = stub_acceptor.accept(conn).await.map_err(|err| format!("tls: {err}"))?;
+      let mut server = h2::server::handshake(tls).await.map_err(|err| format!("h2 handshake: {err}"))?;
+      let Some(result) = server.accept().await else {
+        return Err(String::from("no request"));
+      };
+      let (request, mut respond) = result.map_err(|err| format!("accept request: {err}"))?;
+      let (parts, mut body) = request.into_parts();
+      let mut received = Vec::new();
+      while let Some(chunk) = body.data().await {
+        match chunk {
+          Ok(chunk) => received.extend_from_slice(&chunk),
+          Err(err) => return Err(format!("body: {err}")),
+        }
+      }
+      let auth = parts
+        .headers
+        .get("authorization")
+        .map(|value| value.to_str().unwrap_or("?").to_string());
+      let response = hyper::Response::builder().status(200).body(()).unwrap();
+      let mut stream = respond.send_response(response, false).map_err(|err| format!("respond: {err}"))?;
+      let reply = format!("download:{VALUE}");
+      let (first, second) = reply.as_bytes().split_at(12);
+      stream
+        .send_data(Bytes::copy_from_slice(first), false)
+        .map_err(|err| format!("send reply 1: {err}"))?;
+      stream
+        .send_data(Bytes::copy_from_slice(second), true)
+        .map_err(|err| format!("send reply 2: {err}"))?;
+      // h2 flushes writes by driving the connection, so give it a bounded turn
+      // rather than relying on what a drop happens to do with the buffer.
+      let _ = tokio::time::timeout(Duration::from_millis(300), server.accept()).await;
+      if auth.as_deref() != Some(format!("Bearer {VALUE}").as_str()) {
+        return Err(format!("authorization header is {auth:?}"));
+      }
+      if received != format!("upload:{VALUE}").as_bytes() {
+        return Err(format!("request body is {:?}", String::from_utf8_lossy(&received)));
+      }
+      Ok(())
+    });
+
+    let tls = mitm_client_tls(proxy_addr, stub_port, &connector).await;
+    let (mut sender, conn) = h2::client::handshake(tls).await.unwrap();
+    let client_task = tokio::spawn(async move {
+      let _ = conn.await;
+    });
+    let request = hyper::Request::builder()
+      .method("POST")
+      .uri("https://localhost/x")
+      .header("authorization", format!("Bearer {FAKE}"))
+      .body(())
+      .unwrap();
+    let (response, mut stream) = sender.send_request(request, false).unwrap();
+    let upload = format!("upload:{FAKE}");
+    let (first, second) = upload.as_bytes().split_at(12);
+    stream.send_data(Bytes::copy_from_slice(first), false).unwrap();
+    stream.send_data(Bytes::copy_from_slice(second), true).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), response).await.unwrap().unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    while let Some(chunk) = body.data().await {
+      received.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(String::from_utf8(received).unwrap(), format!("download:{FAKE}"));
+    // The stub's report is the assertion that substitution reached the
+    // upstream, so await it rather than ending the test on the client alone.
+    let stub_result = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+    client_task.abort();
+    stub_result.unwrap().unwrap().unwrap();
+    proxy.abort();
+  }
+
+  /// Real Postgres client and real Postgres server through the MITM on the
+  /// cleartext path. tokio-postgres judges the startup handshake hodor parses
+  /// and the relay; pgwire serves it. The fake travels out in the statement
+  /// and the real value travels back in the row, so both substitution
+  /// directions are exercised end to end.
+  #[tokio::test]
+  #[expect(clippy::too_many_lines, reason = "linear test script, split would obscure the flow")]
+  async fn postgres_real_client_and_server_round_trip() {
+    use std::sync::Mutex;
+
+    use futures::Sink;
+    use futures::stream;
+    use pgwire::api::query::SimpleQueryHandler;
+    use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
+    use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
+    use pgwire::error::{PgWireError, PgWireResult};
+    use pgwire::messages::PgWireBackendMessage;
+
+    const FAKE: &str = "$$CREDENTIAL_DODSZYJGK2D0:L$$";
+    const VALUE: &str = "$$CREDENTIAL_C1YI2U4SC3JE:L$$";
+
+    /// Answers every statement with one row carrying the real value, and
+    /// records the statement it was handed.
+    struct StubQueryHandler {
+      seen: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SimpleQueryHandler for StubQueryHandler {
+      async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+      where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+      {
+        *self.seen.lock().unwrap() = Some(query.to_string());
+        let field = FieldInfo::new("token".into(), None, None, Type::VARCHAR, FieldFormat::Text);
+        let schema = Arc::new(vec![field]);
+        let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
+        encoder.encode_field(&VALUE.to_string())?;
+        let row = encoder.take_row();
+        Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(vec![Ok(row)])))])
+      }
+    }
+
+    struct StubHandlers {
+      query: Arc<StubQueryHandler>,
+    }
+
+    impl PgWireServerHandlers for StubHandlers {
+      fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        Arc::clone(&self.query)
+      }
+    }
+
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let handler = Arc::new(StubQueryHandler { seen: Arc::clone(&seen) });
+    let fx = mitm_fixture(|port| {
+      vec![Grant::Database {
+        credential: Credential {
+          label: "pg".into(),
+          fake: FAKE.into(),
+          value: secrecy::SecretString::from(VALUE),
+        },
+        scope: Box::new(
+          hodor_config::grants::DatabaseScope::from_strings(
+            &format!("postgres://app:{FAKE}@localhost:{port}/main"),
+            &format!("postgres://app:{VALUE}@localhost:{port}/main?sslmode=disable"),
+          )
+          .unwrap(),
+        ),
+      }]
+    })
+    .await;
+    let MitmFixture {
+      proxy_addr,
+      proxy,
+      stub,
+      stub_port,
+      ..
+    } = fx;
+
+    // Cleartext `sslmode=disable`: the stub speaks Postgres on the raw socket.
+    let stub_task: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+      let (conn, _) = stub.accept().await.map_err(|err| format!("accept: {err}"))?;
+      pgwire::tokio::process_socket(conn, None, StubHandlers { query: handler })
+        .await
+        .map_err(|err| format!("pgwire server: {err}"))
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+      .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    let mut head = [0u8; 19];
+    stream.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+    let config: tokio_postgres::Config = format!("host=localhost port={stub_port} user=stubuser dbname=stubdb sslmode=disable")
+      .parse()
+      .unwrap();
+    let (client, connection) = config.connect_raw(stream, tokio_postgres::NoTls).await.unwrap();
+    let conn_task = tokio::spawn(async move {
+      let _ = connection.await;
+    });
+    let rows = client.simple_query(&format!("SELECT '{FAKE}'")).await.unwrap();
+    let mut token = None;
+    for message in rows {
+      if let tokio_postgres::SimpleQueryMessage::Row(row) = message {
+        token = row.get("token").map(str::to_string);
+      }
+    }
+    assert_eq!(token.as_deref(), Some(FAKE), "response row must carry the fake");
+    assert_eq!(
+      seen.lock().unwrap().as_deref(),
+      Some(format!("SELECT '{VALUE}'").as_str()),
+      "upstream must receive the real value"
+    );
+    drop(client);
+    conn_task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+    proxy.abort();
+  }
+  /// Real TLS Postgres on both ends: a TLS-capable client against a TLS-capable
+  /// server, for each handshake shape the entry URL and the guest can ask for.
+  ///
+  /// The entry's `sslmode` is the statement about the far side and the guest
+  /// states its own transport, so the same proxy is exercised in all four
+  /// combinations.
+  mod pg_tls {
+    use futures::Sink;
+    use futures::stream;
+    use pgwire::api::query::SimpleQueryHandler;
+    use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
+    use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
+    use pgwire::error::{PgWireError, PgWireResult};
+    use pgwire::messages::PgWireBackendMessage;
+    use tokio::io::ReadBuf;
+    use tokio_postgres::tls::MakeTlsConnect as _;
+
+    use super::*;
+
+    const FAKE: &str = "$$CREDENTIAL_DODSZYJGK2D0:L$$";
+    const VALUE: &str = "$$CREDENTIAL_C1YI2U4SC3JE:L$$";
+
+    /// Answers every statement with one row carrying the real value, and
+    /// records the statement it was handed.
+    struct StubQueryHandler {
+      seen: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SimpleQueryHandler for StubQueryHandler {
+      async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+      where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+      {
+        *self.seen.lock().unwrap() = Some(query.to_string());
+        let field = FieldInfo::new("token".into(), None, None, Type::VARCHAR, FieldFormat::Text);
+        let schema = Arc::new(vec![field]);
+        let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
+        encoder.encode_field(&VALUE.to_string())?;
+        let row = encoder.take_row();
+        Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(vec![Ok(row)])))])
+      }
+    }
+
+    struct StubHandlers {
+      query: Arc<StubQueryHandler>,
+    }
+
+    impl PgWireServerHandlers for StubHandlers {
+      fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        Arc::clone(&self.query)
+      }
+    }
+
+    /// Client-side TLS for a real Postgres client: rustls trusting the CA the
+    /// proxy mints from, which is what a `sslmode=require` client needs once
+    /// the server's certificate is ours.
+    #[derive(Clone)]
+    struct PgTls {
+      connector: TlsConnector,
+    }
+
+    struct PgTlsStream(tokio_rustls::client::TlsStream<TcpStream>);
+
+    impl tokio_postgres::tls::TlsStream for PgTlsStream {
+      fn channel_binding(&self) -> tokio_postgres::tls::ChannelBinding {
+        tokio_postgres::tls::ChannelBinding::none()
+      }
+    }
+
+    impl AsyncRead for PgTlsStream {
+      fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+      }
+    }
+
+    impl AsyncWrite for PgTlsStream {
+      fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+      }
+
+      fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+      }
+
+      fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+      }
+    }
+
+    struct PgConnect {
+      connector: TlsConnector,
+      server_name: rustls::pki_types::ServerName<'static>,
+    }
+
+    impl tokio_postgres::tls::MakeTlsConnect<TcpStream> for PgTls {
+      type Stream = PgTlsStream;
+      type TlsConnect = PgConnect;
+      type Error = std::io::Error;
+
+      fn make_tls_connect(&mut self, domain: &str) -> Result<PgConnect, std::io::Error> {
+        let server_name = rustls::pki_types::ServerName::try_from(domain.to_string())
+          .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+        Ok(PgConnect {
+          connector: self.connector.clone(),
+          server_name,
+        })
+      }
+    }
+
+    impl tokio_postgres::tls::TlsConnect<TcpStream> for PgConnect {
+      type Stream = PgTlsStream;
+      type Error = std::io::Error;
+      type Future = Pin<Box<dyn Future<Output = Result<PgTlsStream, std::io::Error>> + Send>>;
+
+      fn connect(self, stream: TcpStream) -> Self::Future {
+        Box::pin(async move { Ok(PgTlsStream(self.connector.connect(self.server_name, stream).await?)) })
+      }
+    }
+
+    /// Everything a Postgres handshake test needs: the proxy in front of a
+    /// pgwire listener, the stub's TLS acceptor when the test wants a TLS
+    /// server, and a client connector trusting the CA.
+    struct PgStack {
+      proxy_addr: SocketAddr,
+      proxy: tokio::task::JoinHandle<()>,
+      stub: Arc<TcpListener>,
+      stub_port: u16,
+      seen: Arc<std::sync::Mutex<Option<String>>>,
+      acceptor: Option<TlsAcceptor>,
+      connector: PgTls,
+    }
+
+    /// What the far side speaks, which the entry URL has to describe
+    /// truthfully for the handshake to complete.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Stub {
+      /// A server without TLS: it answers `N` to an `SSLRequest`.
+      Cleartext,
+      /// A TLS server reached the libpq way, with no ALPN to negotiate.
+      Tls,
+      /// A PostgreSQL 17 direct-TLS server: the handshake comes first, and the
+      /// `postgresql` identifier is mandatory on both ends.
+      Direct,
+      /// A TLS server that admits no client without a certificate the hodor
+      /// CA signed: only an entry-supplied identity gets through.
+      TlsRequiresClientAuth,
+    }
+
+    /// Both legs of a database rule from its two strings, both dialing the
+    /// stub, with the needles the pg fixtures swap.
+    fn db_scope(port: u16, query: &str) -> hodor_config::grants::DatabaseScope {
+      hodor_config::grants::DatabaseScope::from_strings(
+        &format!("postgres://app:{FAKE}@localhost:{port}/stubdb"),
+        &format!("postgres://app:{VALUE}@localhost:{port}/stubdb?{query}"),
+      )
+      .unwrap()
+    }
+
+    /// Start the stack for one `sslmode`/`sslnegotiation` shape and one kind of
+    /// server.
+    async fn pg_stack(ca: &CertAuthority, query: &str, server: Stub) -> PgStack {
+      pg_stack_scope(ca, move |port| db_scope(port, query), server).await
+    }
+
+    /// [`pg_stack`] with the entry scope built by hand, for entries whose
+    /// facts do not all fit in a URL.
+    async fn pg_stack_scope(ca: &CertAuthority, make_scope: impl Fn(u16) -> hodor_config::grants::DatabaseScope, server: Stub) -> PgStack {
+      install_crypto_provider();
+      let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+      let acceptor = match server {
+        Stub::Cleartext => None,
+        Stub::TlsRequiresClientAuth => Some({
+          let (chain, key) = hodor_pki::ca::generate_domain_pair(ca, "localhost").unwrap();
+          let mut roots = rustls::RootCertStore::empty();
+          roots.add(ca.cert_der().clone()).unwrap();
+          let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build().unwrap();
+          let config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(chain, key)
+            .unwrap();
+          TlsAcceptor::from(Arc::new(config))
+        }),
+        Stub::Tls | Stub::Direct => Some({
+          let mut config = (*stub_cert.server_config).clone();
+          config.alpn_protocols = if server == Stub::Direct {
+            vec![b"postgresql".to_vec()]
+          } else {
+            Vec::new()
+          };
+          TlsAcceptor::from(Arc::new(config))
+        }),
+      };
+      let stub = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+      let stub_port = local_addr(&stub).port();
+      let grants = vec![Grant::Database {
+        credential: Credential {
+          label: "pg".into(),
+          fake: FAKE.into(),
+          value: secrecy::SecretString::from(VALUE),
+        },
+        scope: Box::new(make_scope(stub_port)),
+      }];
+      let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, ca)).await;
+      let mut roots = rustls::RootCertStore::empty();
+      roots.add(ca.cert_der().clone()).unwrap();
+      let mut client_config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+      if server == Stub::Direct {
+        // A direct-TLS client offers the same identifier the server requires.
+        client_config.alpn_protocols = vec![b"postgresql".to_vec()];
+      }
+      let connector = PgTls {
+        connector: TlsConnector::from(Arc::new(client_config)),
+      };
+      PgStack {
+        proxy_addr,
+        proxy,
+        stub,
+        stub_port,
+        seen: Arc::new(std::sync::Mutex::new(None)),
+        acceptor,
+        connector,
+      }
+    }
+
+    /// Serve one Postgres connection on the stub listener, TLS or not.
+    fn serve_stub(stack: &PgStack) -> tokio::task::JoinHandle<Result<(), String>> {
+      let query = Arc::new(StubQueryHandler {
+        seen: Arc::clone(&stack.seen),
+      });
+      let acceptor = stack.acceptor.clone();
+      let stub = Arc::clone(&stack.stub);
+      tokio::spawn(async move {
+        let (conn, _) = stub.accept().await.map_err(|err| format!("accept: {err}"))?;
+        pgwire::tokio::process_socket(conn, acceptor, StubHandlers { query })
+          .await
+          .map_err(|err| format!("pgwire server: {err}"))
+      })
+    }
+
+    /// Run one statement through the proxy as the real client, returning the
+    /// row's token and the statement the server saw.
+    async fn round_trip(stack: &PgStack, connect: &str) -> Result<(String, Option<String>), String> {
+      round_trip_with(stack, connect, stack.connector.clone()).await
+    }
+
+    /// [`round_trip`] with the client's TLS connector replaced.
+    async fn round_trip_with(stack: &PgStack, connect: &str, mut connector: PgTls) -> Result<(String, Option<String>), String> {
+      let mut stream = TcpStream::connect(stack.proxy_addr)
+        .await
+        .map_err(|err| format!("proxy connect: {err}"))?;
+      stream
+        .write_all(format!("CONNECT localhost:{} HTTP/1.1\r\nHost: localhost\r\n\r\n", stack.stub_port).as_bytes())
+        .await
+        .map_err(|err| format!("CONNECT: {err}"))?;
+      let mut head = [0u8; 19];
+      stream.read_exact(&mut head).await.map_err(|err| format!("CONNECT head: {err}"))?;
+      if &head != b"HTTP/1.1 200 OK\r\n\r\n" {
+        return Err(format!("CONNECT reply: {}", String::from_utf8_lossy(&head)));
+      }
+      let config: tokio_postgres::Config = format!("host=localhost port={} user=stubuser dbname=stubdb {connect}", stack.stub_port)
+        .parse()
+        .map_err(|err| format!("config: {err}"))?;
+      let tls = connector
+        .make_tls_connect("localhost")
+        .map_err(|err| format!("client tls: {err}"))?;
+      let (client, connection) = config
+        .connect_raw(stream, tls)
+        .await
+        .map_err(|err| format!("client connect: {err}"))?;
+      let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+      });
+      let rows = client
+        .simple_query(&format!("SELECT '{FAKE}'"))
+        .await
+        .map_err(|err| format!("query: {err}"))?;
+      let mut token = None;
+      for message in rows {
+        if let tokio_postgres::SimpleQueryMessage::Row(row) = message {
+          token = row.get("token").map(ToString::to_string);
+        }
+      }
+      conn_task.abort();
+      let token = token.ok_or_else(|| "no row came back".to_string())?;
+      let seen = stack.seen.lock().unwrap().clone();
+      Ok((token, seen))
+    }
+
+    /// Assert one happy round trip: fake in, real upstream, fake back.
+    async fn assert_round_trip(stack: &PgStack, connect: &str) {
+      let stub_task = serve_stub(stack);
+      let (token, seen) = round_trip(stack, connect).await.unwrap();
+      assert_eq!(token, FAKE, "the row must carry the fake");
+      assert_eq!(
+        seen.as_deref(),
+        Some(format!("SELECT '{VALUE}'").as_str()),
+        "the server must see the real value"
+      );
+      let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+      stack.proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn postgres_tls_classic_negotiation_round_trip() {
+      // libpq's SSLRequest, on a TLS server: the shape every client uses.
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack(&ca, "sslmode=require", Stub::Tls).await;
+      assert_round_trip(&stack, "sslmode=require").await;
+    }
+
+    /// The entry's `sslcert`/`sslkey` pair is the proxy's identity to the
+    /// server: this stub admits no one without a client certificate the
+    /// hodor CA signed, so the round trip only completes when the upstream
+    /// leg presents the entry's.
+    #[tokio::test]
+    async fn postgres_entry_presents_its_client_identity_to_the_server() {
+      use rama::crypto::pem::PemEncode as _;
+      let ca = CertAuthority::generate().unwrap();
+      let dir = tempfile::tempdir().unwrap();
+      let (chain, key) = hodor_pki::ca::generate_client_pair(&ca, "hodor-client").unwrap();
+      let mut cert_pem = Vec::new();
+      for cert in &chain {
+        cert_pem.extend_from_slice(cert.to_pem().as_bytes());
+      }
+      let cert_path = dir.path().join("client.pem");
+      let key_path = dir.path().join("client.key");
+      std::fs::write(&cert_path, &cert_pem).unwrap();
+      std::fs::write(&key_path, key.to_pem()).unwrap();
+      let query = format!("sslmode=require&sslcert={}&sslkey={}", cert_path.display(), key_path.display());
+      let stack = pg_stack(&ca, &query, Stub::TlsRequiresClientAuth).await;
+      assert_round_trip(&stack, "sslmode=require").await;
+    }
+
+    /// `sslrootcert=system` names the platform trust store, not the hodor
+    /// CA: a verify-full entry holds the self-signed stub against it and
+    /// the session cannot complete, proving the store was loaded and enforced.
+    #[tokio::test]
+    async fn postgres_verify_full_system_store_rejects_the_stub() {
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack(&ca, "sslmode=verify-full&sslrootcert=system", Stub::Tls).await;
+      let stub_task = serve_stub(&stack);
+      round_trip(&stack, "sslmode=require").await.unwrap_err();
+      let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+      stack.proxy.abort();
+    }
+
+    /// A silent upstream — TCP accepted, `SSLRequest` never answered — must
+    /// close the leg inside the entry-configured budget instead of holding
+    /// the connection forever.
+    #[tokio::test]
+    async fn postgres_silent_upstream_closes_within_the_budget() {
+      let ca = CertAuthority::generate().unwrap();
+      let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let stub_port = stub.local_addr().unwrap().port();
+      tokio::spawn(async move {
+        let (_stream, _) = stub.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+      });
+      let grants = vec![Grant::Database {
+        credential: Credential {
+          label: "pg".into(),
+          fake: FAKE.into(),
+          value: secrecy::SecretString::from(VALUE),
+        },
+        scope: Box::new(db_scope(stub_port, "sslmode=require")),
+      }];
+      let state = test_state_with_budget(grants, Vec::new(), &ca, 1);
+      let (proxy_addr, _proxy) = run_proxy_with(state).await;
+
+      let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+      guest
+        .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+      let mut head = [0u8; 19];
+      guest.read_exact(&mut head).await.unwrap();
+      assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+      // A cleartext guest greeting settles the guest leg; the arm then asks
+      // the silent upstream for TLS and must hit the 1s budget.
+      guest.write_all(&[0u8; 8]).await.unwrap();
+      let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut buf = [0u8; 1];
+        guest.read(&mut buf).await
+      })
+      .await
+      .expect("the budget must close the leg");
+      assert_eq!(result.unwrap(), 0, "the guest must see EOF, not silence");
+    }
+
+    /// `guest_tls_mode = "mtls"` on a postgres entry: hodor asks the guest
+    /// for a client certificate and admits only ones its own CA signs. A
+    /// client with a hodor-CA-signed identity gets through; one without is
+    /// refused by the guest handshake itself.
+    #[tokio::test]
+    async fn postgres_guest_mtls_admits_only_ca_signed_guests() {
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack_scope(
+        &ca,
+        |port| hodor_config::grants::DatabaseScope {
+          downstream: hodor_config::grants::DbLeg {
+            host: "localhost".to_string(),
+            port,
+            user: Some("app".to_string()),
+            password: secrecy::SecretString::from(FAKE),
+            database: None,
+          },
+          upstream: hodor_config::grants::DbLeg {
+            host: "localhost".to_string(),
+            port,
+            user: Some("app".to_string()),
+            password: secrecy::SecretString::from(VALUE),
+            database: None,
+          },
+          ssl: hodor_config::grants::SslMode::Prefer,
+          negotiation: hodor_config::grants::SslNegotiation::Postgres,
+          root_cert: None,
+          client_cert: None,
+          client_key: None,
+          guest_tls: hodor_config::grants::GuestTlsMode::Mtls,
+        },
+        Stub::Tls,
+      )
+      .await;
+
+      // Present a hodor-CA-signed identity: the session completes.
+      let stub_task = serve_stub(&stack);
+      let (chain, key) = hodor_pki::ca::generate_client_pair(&ca, "guest").unwrap();
+      let mut roots = rustls::RootCertStore::empty();
+      roots.add(ca.cert_der().clone()).unwrap();
+      let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(chain, key)
+        .unwrap();
+      let connector = PgTls {
+        connector: TlsConnector::from(Arc::new(client_config)),
+      };
+      let (token, seen) = round_trip_with(&stack, "sslmode=require", connector).await.unwrap();
+      assert_eq!(token, FAKE, "the row must carry the fake");
+      assert_eq!(seen.as_deref(), Some(format!("SELECT '{VALUE}'").as_str()));
+      let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+
+      // No client identity: hodor's own handshake refuses the guest.
+      let stub_task = serve_stub(&stack);
+      round_trip(&stack, "sslmode=require").await.unwrap_err();
+      let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+      stack.proxy.abort();
+    }
+
+    /// `sslmode=allow` with a cleartext guest: the upstream leg stays
+    /// cleartext — the greeting relays on with no `SSLRequest` in front of it.
+    #[tokio::test]
+    async fn postgres_allow_with_a_cleartext_guest_never_asks_upstream_for_tls() {
+      let ca = CertAuthority::generate().unwrap();
+      let spy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let spy_port = spy.local_addr().unwrap().port();
+      let seen = tokio::spawn(async move {
+        let (mut stream, _) = spy.accept().await.unwrap();
+        let mut buf = [0u8; 8];
+        let _ = stream.read_exact(&mut buf).await;
+        buf
+      });
+      let grants = vec![Grant::Database {
+        credential: Credential {
+          label: "pg".into(),
+          fake: FAKE.into(),
+          value: secrecy::SecretString::from(VALUE),
+        },
+        scope: Box::new(db_scope(spy_port, "sslmode=allow")),
+      }];
+      let state = test_state_with_budget(grants, Vec::new(), &ca, 10);
+      let (proxy_addr, _proxy) = run_proxy_with(state).await;
+
+      let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+      guest
+        .write_all(format!("CONNECT localhost:{spy_port} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+      let mut head = [0u8; 19];
+      guest.read_exact(&mut head).await.unwrap();
+      assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+      // A real cleartext startup: length 23, protocol 3.0, user stubuser.
+      let mut startup = Vec::new();
+      startup.extend(23u32.to_be_bytes());
+      startup.extend(196_608u32.to_be_bytes());
+      startup.extend(b"user\0stubuser\0\0");
+      guest.write_all(&startup).await.unwrap();
+      let upstream_first8 = seen.await.unwrap();
+      assert_ne!(
+        &upstream_first8[4..8],
+        &pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes(),
+        "allow with a cleartext guest must not ask the server for TLS"
+      );
+    }
+
+    /// `sslmode=allow` with a guest that asked for TLS: the upstream leg
+    /// escalates too — the first bytes upstream are the `SSLRequest`.
+    #[tokio::test]
+    async fn postgres_allow_with_a_tls_guest_escalates_upstream_to_tls() {
+      let ca = CertAuthority::generate().unwrap();
+      let spy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let spy_port = spy.local_addr().unwrap().port();
+      let seen = tokio::spawn(async move {
+        let (mut stream, _) = spy.accept().await.unwrap();
+        let mut buf = [0u8; 8];
+        let _ = stream.read_exact(&mut buf).await;
+        buf
+      });
+      let grants = vec![Grant::Database {
+        credential: Credential {
+          label: "pg".into(),
+          fake: FAKE.into(),
+          value: secrecy::SecretString::from(VALUE),
+        },
+        scope: Box::new(db_scope(spy_port, "sslmode=allow")),
+      }];
+      let state = test_state_with_budget(grants, Vec::new(), &ca, 10);
+      let (proxy_addr, _proxy) = run_proxy_with(state).await;
+
+      let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+      guest
+        .write_all(format!("CONNECT localhost:{spy_port} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+      let mut head = [0u8; 19];
+      guest.read_exact(&mut head).await.unwrap();
+      assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+      // libpq's escalation shape: SSLRequest, one 'S' answer, then TLS.
+      let mut request = Vec::new();
+      request.extend(8u32.to_be_bytes());
+      request.extend(pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes());
+      guest.write_all(&request).await.unwrap();
+      let mut answer = [0u8; 1];
+      guest.read_exact(&mut answer).await.unwrap();
+      assert_eq!(answer[0], b'S');
+      let mut roots = rustls::RootCertStore::empty();
+      roots.add(ca.cert_der().clone()).unwrap();
+      let connector = TlsConnector::from(guest_client_config(roots, Alpn::None));
+      let result = connector
+        .connect(rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(), guest)
+        .await;
+      // The spy never answers its SSLRequest, so the arm fails closed — but
+      // the escalation ask is already on record.
+      assert!(result.is_err(), "the silent upstream must close the leg");
+      let upstream_first8 = seen.await.unwrap();
+      assert_eq!(
+        &upstream_first8[4..8],
+        &pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes(),
+        "allow with a TLS guest must ask the server for TLS"
+      );
+    }
+
+    #[tokio::test]
+    async fn postgres_tls_direct_negotiation_round_trip() {
+      // PostgreSQL 17 direct TLS: no SSLRequest, `postgresql` in ALPN.
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack(&ca, "sslmode=require&sslnegotiation=direct", Stub::Direct).await;
+      assert_round_trip(&stack, "sslmode=require sslnegotiation=direct").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_prefer_uses_tls_when_the_server_offers_it() {
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack(&ca, "sslmode=prefer", Stub::Tls).await;
+      assert_round_trip(&stack, "sslmode=prefer").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_prefer_falls_back_when_the_server_refuses_tls() {
+      // The other half of `prefer`: a server that answers `N` still gets the
+      // session, which is what makes the mode usable against cleartext servers.
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack(&ca, "sslmode=prefer", Stub::Cleartext).await;
+      assert_round_trip(&stack, "sslmode=prefer").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_verify_full_round_trip_against_the_entry_anchor() {
+      let ca = CertAuthority::generate().unwrap();
+      let dir = tempfile::tempdir().unwrap();
+      let anchor = dir.path().join("root.pem");
+      std::fs::write(&anchor, ca.cert_pem()).unwrap();
+      let stack = pg_stack(&ca, &format!("sslmode=verify-full&sslrootcert={}", anchor.display()), Stub::Tls).await;
+      // The client states its own policy; this one has no `verify-full` of its
+      // own, and it is the entry that asks the proxy to verify.
+      assert_round_trip(&stack, "sslmode=require").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_tls_client_on_a_cleartext_entry_still_reaches_the_server() {
+      // The entry says the far side is cleartext; the guest asks for TLS
+      // anyway, and a real server would have answered `S` too.
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack(&ca, "sslmode=disable", Stub::Cleartext).await;
+      assert_round_trip(&stack, "sslmode=require").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_cleartext_client_on_a_tls_entry_still_reaches_the_server() {
+      // The entry says the far side needs TLS; the guest opens cleartext.
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack(&ca, "sslmode=require", Stub::Tls).await;
+      assert_round_trip(&stack, "sslmode=disable").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_require_closes_when_the_server_refuses_tls() {
+      // A cleartext-only server under an entry that requires TLS: no session,
+      // and no statement — and no credential — reaches the server.
+      let ca = CertAuthority::generate().unwrap();
+      let stack = pg_stack(&ca, "sslmode=require", Stub::Cleartext).await;
+      let stub_task = serve_stub(&stack);
+      assert!(
+        round_trip(&stack, "sslmode=require").await.is_err(),
+        "a refused TLS leg cannot carry a session"
+      );
+      assert_eq!(stack.seen.lock().unwrap().as_deref(), None, "no statement may reach the server");
+      let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+      stack.proxy.abort();
+    }
   }
 }

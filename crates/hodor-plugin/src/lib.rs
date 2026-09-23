@@ -135,8 +135,9 @@ struct LoadedPlugin {
   name: String,
   /// Component compiled once at load.
   component: Component,
-  /// Parsed allow entries.
-  allow: Vec<hodor_config::grants::UriGrant>,
+  /// Parsed allow entries. Plugin matching reads scheme, host and port, so a
+  /// database entry just scopes the plugin to that endpoint.
+  allow: Vec<hodor_config::grants::EndpointScope>,
   /// Direction gate from config.
   direction: PluginDirection,
   /// Probed world support.
@@ -574,7 +575,7 @@ impl RewriteHook for PluginInstance {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use hodor_config::grants::UriGrant;
+  use hodor_config::grants::EndpointScope;
 
   /// Empty load: no components, no epoch thread.
   fn empty_registry() -> Registry {
@@ -591,7 +592,7 @@ mod tests {
   #[test]
   fn select_rejects_non_matching_grant() {
     let registry = empty_registry();
-    let allow: UriGrant = "https://other.example.com".parse().unwrap();
+    let allow: EndpointScope = "https://other.example.com".parse().unwrap();
     assert!(!uri_match(&[allow], Scheme::Https, "api.example.com", 443));
     assert!(registry.select(Scheme::Https, "api.example.com", 443, Direction::Request).is_none());
   }

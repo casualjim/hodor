@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 eyre = "0.6"
-rama = { git = "https://github.com/plabayo/rama", default-features = false, features = ["boring"] }
+rama = { git = "https://github.com/lotsaai/rama", rev = "be3aa5b82f587f3688980db74e8c9e530cd7ac77", default-features = false, features = ["boring"] } # fork of plabayo/rama: mTLS client identity on the MITM egress leg; switch back once upstreamed
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 time = "=0.3.47" # pinned: rama main requires exactly 0.3.47; bump together with Cargo.lock's rama rev

@@ -66,6 +66,7 @@ mod tests {
       mounts: Vec::new(),
       agent_configs: Vec::new(),
       fnox: FnoxBinds::default(),
+      guest: Vec::new(),
       init: None,
     }
   }

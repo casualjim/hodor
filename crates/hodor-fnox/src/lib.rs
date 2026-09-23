@@ -251,7 +251,7 @@ pub async fn resolve(config: &mut hodor_config::config::AppConfig, registry: &Re
   let keys = config
     .rules
     .iter()
-    .filter(|(_, rule)| rule.value.is_none())
+    .filter(|(_, rule)| rule.value.is_none() || rule.is_database())
     .map(|(label, rule)| (label.clone(), fnox_key(rule)))
     .collect::<Vec<_>>();
   let mut values = BTreeMap::new();
@@ -265,6 +265,24 @@ pub async fn resolve(config: &mut hodor_config::config::AppConfig, registry: &Re
 
   let mut dropped = Vec::new();
   for (label, rule) in &mut config.rules {
+    if rule.is_database() {
+      // Database rule: `value` holds the stated fake string; the real
+      // connection string comes from fnox and never overwrites it. No
+      // registry hosts, no pattern — the connection string is the grant.
+      if let Some(value) = values.remove(label).flatten() {
+        rule.real = Some(SecretString::from(value));
+        tracing::info!(label, env = %rule.env, "database rule resolved: stated fake string, real connection string from fnox");
+      } else {
+        let what = if fnox.is_some() {
+          "no resolved real connection string and fnox does not declare its key"
+        } else {
+          "no resolved real connection string and fnox has no configuration"
+        };
+        skip(label, rule, what)?;
+        dropped.push(label.clone());
+      }
+      continue;
+    }
     let inline = rule.value.is_some();
     if !inline {
       if let Some(value) = values.remove(label).flatten() {
@@ -405,11 +423,13 @@ mod tests {
     RuleCfg {
       env: env.to_string(),
       value: Some(secrecy::SecretString::from("inline")),
+      real: None,
       fnox_key: None,
       allow: Vec::new(),
       pattern: None,
       registry: None,
       if_missing: hodor_config::config::IfMissing::Error,
+      tls: std::collections::BTreeMap::new(),
     }
   }
 
@@ -418,6 +438,7 @@ mod tests {
       proxy: hodor_config::config::ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        handshake_timeout_secs: 10,
       },
       workspace: hodor_config::config::WorkspaceCfg::default(),
       rules: BTreeMap::new(),

@@ -10,6 +10,7 @@ import { readFile } from "node:fs/promises";
 
 const FAKE = process.env.HODOR_FAKE ?? "";
 const CERT_DIR = process.env.CERT_DIR ?? "/certs";
+const PG_URL = process.env.DATABASE_URL ?? ""; // the fake connection string
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
@@ -160,6 +161,94 @@ await retry("grantless tls splices untouched", async () => {
   const tls = await tlsTo("api", 9444, ca);
   return (await exchange(tls, `AUTH ${FAKE}\n`)) === `ERR ${FAKE}\n`;
 });
+
+// 6. Database rule against real PostgreSQL (the compose demo only — bwrap
+//    has no postgres, so no DATABASE_URL means the scenario is skipped).
+//    The client consumes exactly what the guest holds: its DATABASE_URL,
+//    the rule's stated FAKE connection string. Hodor captures the dial,
+//    matches the rule on the fake string's port, and swaps the fake
+//    password for the real one from the secret source. PostgreSQL rejects
+//    the fake password, so an opened session proves the swap. The guest
+//    dials by the URL's hostname, and hodor mints the leaf for that name,
+//    so full hostname verification stays on — no IPs anywhere.
+if (PG_URL) {
+
+  function pgFrame(type: number, body: Buffer): Buffer {
+    const len = Buffer.alloc(4);
+    len.writeInt32BE(body.length + 4);
+    return Buffer.concat([Buffer.from([type]), len, body]);
+  }
+  function pgStartup(params: Record<string, string>): Buffer {
+    const body = Buffer.concat([
+      Buffer.from([0, 3, 0, 0]),
+      ...Object.entries(params).map(([key, value]) => Buffer.from(`${key}\0${value}\0`, "utf8")),
+      Buffer.from([0]),
+    ]);
+    const len = Buffer.alloc(4);
+    len.writeInt32BE(body.length + 4);
+    return Buffer.concat([len, body]);
+  }
+  function pgRead(sock: Socket | TLSSocket, n: number): Promise<Buffer> {
+    return race("pg read", new Promise<Buffer>((resolve, reject) => {
+      let buf = Buffer.alloc(0);
+      const onData = (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (buf.length >= n) {
+          sock.off("data", onData);
+          resolve(buf.subarray(0, n));
+        }
+      };
+      sock.on("data", onData);
+      sock.once("error", reject);
+    }));
+  }
+  await retry("postgres mitm swaps the password for a real server", async () => {
+    stage(`pg ${db.hostname}:${db.port || 5432} connecting`);
+    const db = new URL(PG_URL);
+      const sock = await race("pg connect", new Promise<Socket>((resolve, reject) => {
+        const s = connect(Number(db.port || 5432), db.hostname);
+      s.once("connect", () => resolve(s));
+      s.once("error", reject);
+    }));
+    stage("pg sslRequest");
+    sock.write(Buffer.from([0, 0, 0, 8, 4, 0xd2, 0x16, 0x2f]));
+    const answer = (await pgRead(sock, 1)).toString("latin1");
+    if (answer !== "S") throw new Error(`server refused TLS: ${answer}`);
+    const tls = tlsConnect({ socket: sock, servername: db.hostname, ca, rejectUnauthorized: true });
+    await race("pg tls handshake", new Promise<void>((resolve, reject) => {
+      tls.once("secureConnect", () => resolve());
+      tls.once("error", reject);
+    }));
+    stage("pg tls ok (hodor's minted leaf)");
+    tls.write(pgStartup({ user: db.username, database: db.pathname.slice(1) }));
+    const auth = await pgRead(tls, 9);
+    if (auth[0] !== 0x52 || auth.readUInt32BE(5) !== 3) throw new Error(`expected cleartext password auth, got ${auth.toString("latin1")}`);
+    stage("pg cleartext auth requested");
+    tls.write(pgFrame(0x70, Buffer.from(`${db.password}\0`, "utf8")));
+    const ok = await pgRead(tls, 9);
+    if (ok[0] !== 0x52 || ok.readUInt32BE(5) !== 0) throw new Error(`auth rejected: ${ok.toString("latin1")}`);
+    stage("pg authenticated - the fake was swapped for the real");
+    tls.write(pgFrame(0x51, Buffer.from("SELECT 'ok'\0", "utf8")));
+    const result = await race("pg query reply", new Promise<Buffer>((resolve, reject) => {
+      let buf = Buffer.alloc(0);
+      const onData = (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (buf.includes(0x5a)) {
+          tls.off("data", onData);
+          resolve(buf);
+        }
+      };
+      tls.on("data", onData);
+      tls.once("error", reject);
+    }));
+    tls.destroy();
+    sock.destroy();
+    stage("pg query ok");
+    return result.includes(Buffer.from("ok"));
+  });
+} else {
+  stage("pg scenario skipped: no DATABASE_URL (bwrap)");
+}
 
 console.log("all scenarios passed");
 process.exit(0);

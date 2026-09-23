@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml = "0.8"
 tracing = "0.1"
 url = "2"
+validator = { version = "0.20", features = ["derive"] }
 
 [dev-dependencies]
 pretty_assertions = "1"

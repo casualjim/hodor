@@ -22,14 +22,18 @@ services:
     build:
       context: ./docker
       dockerfile: ../../Dockerfile
-    command: ["serve", "--proxy-backend", "tproxy", "--config", "/etc/hodor/hodor.toml"]
+    command: ["serve", "--proxy-backend", "tproxy"]
     environment:
       RUST_LOG: debug
+      # The config dir holds hodor.toml plus fnox.toml — hodor's secret
+      # source, where the database rule's real connection string lives.
+      HODOR_CONFIG: /etc/hodor/hodor.toml
     stop_grace_period: 1s
     cap_add:
       - NET_ADMIN
     volumes:
       - ./hodor.toml:/etc/hodor/hodor.toml:ro
+      - ./fnox.toml:/etc/hodor/fnox.toml:ro
       - certs:/certs:ro
     networks:
       default: {}
@@ -55,17 +59,52 @@ services:
       certs:
         condition: service_completed_successfully
 
+  db:
+    image: postgres:17-alpine
+    # `POSTGRES_HOST_AUTH_METHOD=password` keeps auth to the cleartext
+    # PasswordMessage inside TLS — the exact bytes hodor's machine rewrites;
+    # scram's challenge dance would hide them. The key is copied out of the
+    # shared volume and re-owned: postgres refuses a private key it does not
+    # own, and the volume file is root-owned.
+    command:
+      - sh
+      - -c
+      - cp /certs/pg.key /tmp/pg.key && chown postgres:postgres /tmp/pg.key && chmod 600 /tmp/pg.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/pg.crt -c ssl_key_file=/tmp/pg.key
+    environment:
+      POSTGRES_USER: hodor
+      POSTGRES_PASSWORD: hodor_real_password_01
+      POSTGRES_DB: demo
+      POSTGRES_HOST_AUTH_METHOD: password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hodor -d demo"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    volumes:
+      - certs:/certs:ro
+    networks:
+      server:
+        ipv4_address: 10.202.0.30
+
   client:
     image: oven/bun:1
     working_dir: /srv
     command: ["run", "run.ts"]
     environment:
       HODOR_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `hodor fake GH_TOKEN`, not a credential
+      DATABASE_URL: postgres://hodor:hodor_fake_password_01@db:5432/demo?sslmode=require # nosemgrep: deterministic demo decoy, not a credential
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
     network_mode: service:hodor
-    depends_on: [hodor, api]
+    depends_on:
+      hodor:
+        condition: service_started
+      api:
+        condition: service_started
+      db:
+        condition: service_healthy
 
 networks:
   server:

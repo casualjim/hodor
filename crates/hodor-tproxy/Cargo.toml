@@ -17,7 +17,7 @@ libc = "0.2"
 netlink-packet-core = "0.9"
 netlink-packet-netfilter = "0.4"
 netlink-sys = "0.8"
-rama = { git = "https://github.com/plabayo/rama", default-features = false, features = ["tcp"] }
+rama = { git = "https://github.com/lotsaai/rama", rev = "be3aa5b82f587f3688980db74e8c9e530cd7ac77", default-features = false, features = ["tcp"] } # fork of plabayo/rama: mTLS client identity on the MITM egress leg; switch back once upstreamed
 rtnetlink = "0.23.0"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 secrecy = { version = "0.10", features = ["serde"] }

@@ -1,8 +1,18 @@
+## [0.1.23] - 2026-09-25
+
+### 🚀 Features
+
+- *(proxy)* Tcp, mTLS, and postgres wire substitution (#36)
 ## [0.1.22] - 2026-09-20
 
 ### 🚀 Features
 
 - Flatten the workspace CLI, add agent --rm, fix eBPF self-exclusion in containers (#35)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.22 [ci skip]
+- Release
 ## [0.1.21] - 2026-09-19
 
 ### 🚀 Features

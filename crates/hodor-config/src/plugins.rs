@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::grants::UriGrant;
+use crate::grants::EndpointScope;
 
 /// Which direction a plugin rewrites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -47,8 +47,9 @@ pub struct ResolvedPlugin {
   pub name: String,
   /// Component path as configured.
   pub path: PathBuf,
-  /// Parsed allow entries.
-  pub allow: Vec<UriGrant>,
+  /// Parsed allow entries. A plugin matches on scheme, host and port, so a
+  /// database entry scopes it to that endpoint and carries no extra meaning.
+  pub allow: Vec<EndpointScope>,
   /// Direction gate.
   pub direction: PluginDirection,
 }
@@ -65,7 +66,7 @@ pub fn resolve_plugins(cfg: &AppConfig) -> eyre::Result<Vec<ResolvedPlugin>> {
     eyre::ensure!(!plugin.allow.is_empty(), "plugin `{name}`: `allow` must not be empty");
     let mut allow = Vec::with_capacity(plugin.allow.len());
     for entry in &plugin.allow {
-      let uri: UriGrant = entry
+      let uri: EndpointScope = entry
         .parse()
         .map_err(|err| eyre::eyre!("plugin `{name}`: invalid allow entry `{entry}`: {err}"))?;
       allow.push(uri);
@@ -86,6 +87,10 @@ mod tests {
 
   use super::*;
   use crate::grants::Scheme;
+
+  fn endpoint(scope: &EndpointScope) -> &EndpointScope {
+    scope
+  }
   fn cfg_with(name: &str, path: &str, allow: Vec<&str>, direction: Option<PluginDirection>) -> AppConfig {
     let mut plugins = BTreeMap::new();
     plugins.insert(
@@ -100,6 +105,7 @@ mod tests {
       proxy: crate::config::ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        handshake_timeout_secs: 10,
       },
       workspace: crate::config::WorkspaceCfg::default(),
       rules: BTreeMap::new(),
@@ -119,9 +125,9 @@ mod tests {
     let resolved = resolve_plugins(&cfg).unwrap();
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].name, "sigv4");
-    assert_eq!(resolved[0].allow[0].scheme, Scheme::Https);
-    assert_eq!(resolved[0].allow[0].port, 443);
-    assert_eq!(resolved[0].allow[1].port, 8443);
+    assert_eq!(endpoint(&resolved[0].allow[0]).scheme, Scheme::Https);
+    assert_eq!(endpoint(&resolved[0].allow[0]).port, 443);
+    assert_eq!(endpoint(&resolved[0].allow[1]).port, 8443);
   }
 
   #[test]

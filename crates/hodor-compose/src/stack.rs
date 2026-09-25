@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use hodor_config::cli::ProxyBackend;
 use hodor_config::config::AgentCfg;
+use hodor_config::grants::GuestTlsMode;
 
 use crate::paths::{Mount, covering, expand, translate};
 
@@ -94,6 +95,53 @@ pub(crate) fn split_mode(entry: &Path) -> (PathBuf, bool) {
     return (PathBuf::from(rest), false);
   }
   (entry.to_path_buf(), false)
+}
+
+/// The agent-side mounts carrying each mtls rule's guest identity: one pair
+/// minted per rule (`<guests-dir>/<label>.pem` plus `.key`, load-or-generate),
+/// mounted read-only at the container paths the rule's entries declare, or
+/// `{home}/.config/hodor/guest/<label>.pem` and `.key` when an entry states
+/// none. Compose is a placement consumer only: hodor-proxy reads the mode, the
+/// agent holds the identity files.
+///
+/// # Errors
+///
+/// Returns an error when a pair cannot be minted or written.
+pub(crate) fn guest_identity_mounts(
+  rules: &BTreeMap<String, hodor_config::config::RuleCfg>,
+  ca: &hodor_pki::ca::CertAuthority,
+  guests_dir: &Path,
+  home: &str,
+) -> eyre::Result<Vec<Mount>> {
+  let mut mounts = Vec::new();
+  for (label, rule) in rules {
+    let mtls: Vec<&hodor_config::config::HostTlsCfg> = rule.tls.values().filter(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls).collect();
+    if mtls.is_empty() {
+      continue;
+    }
+    let (cert, key) = hodor_pki::ca::load_or_generate_client_pair(ca, guests_dir, label)?;
+    for tls in mtls {
+      let cert_container = tls
+        .guest_cert
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("{home}/.config/hodor/guest/{label}.pem")));
+      let key_container = tls
+        .guest_key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("{home}/.config/hodor/guest/{label}.key")));
+      mounts.push(Mount {
+        host: cert.clone(),
+        container: cert_container,
+        ro: true,
+      });
+      mounts.push(Mount {
+        host: key.clone(),
+        container: key_container,
+        ro: true,
+      });
+    }
+  }
+  Ok(mounts)
 }
 
 /// Generate the stack for a workspace directory: decoys for every
@@ -198,6 +246,19 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> eyre::Result
   );
   let decoys = with_rule_patterns(select(open_fnox()?.as_ref(), &registry), &registry, &config.rules);
   let agent_configs = agent_config_mounts(hodor_config::config::config_dir().as_deref(), &config.agents, &home)?;
+  let guest = if config
+    .rules
+    .values()
+    .any(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls))
+  {
+    let ca_path = hodor_config::config::config_dir()
+      .ok_or_else(|| eyre::eyre!("a guest identity needs the hodor config directory to load the CA from"))?
+      .join("ca.pem");
+    let ca = hodor_pki::ca::load_or_generate(&ca_path).map_err(|err| eyre::eyre!("guest identity CA `{}`: {err}", ca_path.display()))?;
+    guest_identity_mounts(&config.rules, &ca, &workspace_state_dir(root).join("guests"), &home)?
+  } else {
+    Vec::new()
+  };
   let fnox = fnox_binds(
     fnox_config_dir(host_home.as_deref()).as_deref(),
     hodor_config::config::config_dir().as_deref(),
@@ -220,6 +281,7 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> eyre::Result
       mounts,
       agent_configs,
       fnox,
+      guest,
       init: config.workspace.init.clone(),
     }
     .render(),
@@ -346,6 +408,7 @@ pub(crate) struct Stack<'a> {
   pub(crate) mounts: Vec<Mount>,
   pub(crate) agent_configs: Vec<Mount>,
   pub(crate) fnox: FnoxBinds,
+  pub(crate) guest: Vec<Mount>,
   pub(crate) init: Option<String>,
 }
 
@@ -458,7 +521,7 @@ impl Stack<'_> {
       let _ = writeln!(out, "      {}: \"{}\"", decoy.env, decoy.value);
     }
     out.push_str("    volumes:\n");
-    for mount in self.mounts.iter().chain(&self.agent_configs) {
+    for mount in self.mounts.iter().chain(&self.agent_configs).chain(&self.guest) {
       let mode = if mount.ro { "ro" } else { "rw" };
       let _ = writeln!(out, "      - {}:{}:{mode}", mount.host.display(), mount.container.display());
     }
@@ -652,4 +715,72 @@ pub(crate) fn workspace_config(root: &Path) -> eyre::Result<hodor_config::config
     command: None,
   };
   Ok(hodor_config::config::load(&cli)?.0)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::guest_identity_mounts;
+  use hodor_config::grants::GuestTlsMode;
+  use std::collections::BTreeMap;
+  use std::path::PathBuf;
+
+  fn mtls_rule(guest_cert: Option<&str>, guest_key: Option<&str>) -> BTreeMap<String, hodor_config::config::RuleCfg> {
+    let mut tls = BTreeMap::new();
+    tls.insert(
+      "https://api.github.com".to_string(),
+      hodor_config::config::HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        guest_tls_mode: GuestTlsMode::Mtls,
+        guest_cert: guest_cert.map(PathBuf::from),
+        guest_key: guest_key.map(PathBuf::from),
+      },
+    );
+    let rule = hodor_config::config::RuleCfg {
+      env: "GITHUB_TOKEN".into(),
+      value: None,
+      real: None,
+      fnox_key: None,
+      allow: vec!["https://api.github.com".to_string()],
+      pattern: None,
+      registry: None,
+      tls,
+      if_missing: hodor_config::config::IfMissing::default(),
+    };
+    let mut rules = BTreeMap::new();
+    rules.insert("github".to_string(), rule);
+    rules
+  }
+
+  /// One minted pair per rule, mounted read-only at the declared container
+  /// paths, and the second call is a no-op: the pair on disk is kept.
+  #[test]
+  fn guest_identity_mounts_declared_paths_and_keeps_an_existing_pair() {
+    let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let guests = dir.path().join("guests");
+    let rules = mtls_rule(Some("/safe/cert.pem"), Some("/safe/cert.key"));
+    let mounts = guest_identity_mounts(&rules, &ca, &guests, "/root").unwrap();
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0].container, PathBuf::from("/safe/cert.pem"));
+    assert_eq!(mounts[1].container, PathBuf::from("/safe/cert.key"));
+    assert!(mounts.iter().all(|mount| mount.ro));
+    assert!(mounts[0].host.is_file() && mounts[1].host.is_file());
+    let cert_before = std::fs::read(&mounts[0].host).unwrap();
+    let again = guest_identity_mounts(&rules, &ca, &guests, "/root").unwrap();
+    assert_eq!(again[0].host, mounts[0].host);
+    assert_eq!(std::fs::read(&mounts[0].host).unwrap(), cert_before);
+  }
+
+  /// An entry that declares no container paths gets the per-rule default
+  /// under the agent's home.
+  #[test]
+  fn guest_identity_defaults_the_container_paths_when_none_declared() {
+    let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let rules = mtls_rule(None, None);
+    let mounts = guest_identity_mounts(&rules, &ca, &dir.path().join("guests"), "/root").unwrap();
+    assert_eq!(mounts[0].container, PathBuf::from("/root/.config/hodor/guest/github.pem"));
+    assert_eq!(mounts[1].container, PathBuf::from("/root/.config/hodor/guest/github.key"));
+  }
 }

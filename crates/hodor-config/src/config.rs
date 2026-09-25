@@ -10,6 +10,7 @@ use eyre::WrapErr as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use validator::{Validate, ValidationError};
 
 use crate::cli::{Cli, Command};
 use code_workspace::{Workspace, resolve_root};
@@ -92,25 +93,42 @@ pub struct ProxyCfg {
   #[config(layer_attr(arg(long = "ca-file", help = "CA PEM path (default <config-dir>/hodor/ca.pem)")))]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub ca_file: Option<PathBuf>,
+  /// Seconds the pre-auth or handshake reads may wait on a peer before the
+  /// connection closes: the TLS `ClientHello`, the HTTP head, the Postgres
+  /// greeting, and the upstream `SSLRequest` answer all share this budget.
+  #[config(default = 10, env = "HODOR_HANDSHAKE_TIMEOUT_SECS")]
+  #[config(layer_attr(arg(long = "handshake-timeout", help = "seconds a handshake read may wait before closing")))]
+  pub handshake_timeout_secs: u64,
 }
 
 /// One rule: env name, allowed hosts, decoy shape, and value source.
-#[derive(confique::Config, Debug, Clone, Deserialize, Serialize)]
+#[derive(confique::Config, Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct RuleCfg {
   /// Env var name: decoy seed, registry key, and default fnox key.
+  #[validate(length(min = 1, message = "env must not be empty"))]
   pub env: String,
-  /// Inline real secret value (never serialized). Wins over fnox.
+  /// Endpoint rules: the inline real secret (never serialized), winning over
+  /// fnox. Database rules: the FAKE connection string the rule states — a
+  /// proper `postgres://` URL, so the env var holds a URL — while the real
+  /// connection string resolves from the secret source into `real`.
   #[serde(default, skip_serializing)]
   pub value: Option<SecretString>,
+  /// Database rules only: the REAL connection string, resolved from the
+  /// secret source (fnox) under `env`/`fnox_key` at load time. Never
+  /// serialized, never stated in config.
+  #[serde(default, skip_serializing)]
+  pub real: Option<SecretString>,
   /// fnox secret name; defaults to `env`.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub fnox_key: Option<String>,
   /// Raw `scheme://host[:port]` allow entries; unioned with registry hosts.
   #[serde(default)]
+  #[validate(custom(function = "validate_allow"))]
   pub allow: Vec<String>,
   /// Explicit fake pattern overriding the registry.
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  #[validate(custom(function = "validate_opt_pattern"))]
   pub pattern: Option<String>,
   /// Consult the host registry for this rule (default true).
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,6 +136,70 @@ pub struct RuleCfg {
   /// What to do when the value or the hosts are missing.
   #[serde(default)]
   pub if_missing: IfMissing,
+  /// Per-entry TLS configuration keyed by the exact `allow` entry string.
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub tls: BTreeMap<String, HostTlsCfg>,
+}
+
+impl RuleCfg {
+  /// A database rule states its fake as a `postgres://` connection string in
+  /// `value`; endpoint rules carry bare tokens.
+  #[must_use]
+  pub fn is_database(&self) -> bool {
+    self
+      .value
+      .as_ref()
+      .is_some_and(|value| value.expose_secret().starts_with("postgres://"))
+  }
+}
+
+/// Per-entry TLS configuration, keyed by the rule's own `allow` entry string.
+/// The proxy reads `client_cert`, `client_key` and `guest_tls_mode`;
+/// `guest_cert` and `guest_key` are compose-only mount targets inside the
+/// guest container and no proxy behavior reads them.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostTlsCfg {
+  /// Upstream client certificate (hodor → host), for endpoint entries.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub client_cert: Option<PathBuf>,
+  /// Upstream client key, paired with `client_cert`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub client_key: Option<PathBuf>,
+  /// How the guest leg treats client certificates.
+  #[serde(default)]
+  pub guest_tls_mode: crate::grants::GuestTlsMode,
+  /// Container-internal path the guest's minted certificate mounts at.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub guest_cert: Option<PathBuf>,
+  /// Container-internal path the guest's minted key mounts at.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub guest_key: Option<PathBuf>,
+}
+
+/// `allow` entries must all parse as URI grants.
+fn validate_allow(entries: &Vec<String>) -> Result<(), ValidationError> {
+  for entry in entries {
+    entry.parse::<crate::grants::EndpointScope>().map_err(|err| {
+      let mut error = ValidationError::new("allow");
+      error.message = Some(format!("bad allow entry `{entry}`: {err}").into());
+      error
+    })?;
+  }
+  Ok(())
+}
+
+/// Present fake patterns must compile as templates. The validator derive
+/// unwraps `Option` fields: `None` skips the check, `Some` lands here.
+fn validate_opt_pattern(pattern: &String) -> Result<(), ValidationError> {
+  if !pattern.is_empty() {
+    validate_pattern(pattern).map_err(|err| {
+      let mut error = ValidationError::new("pattern");
+      error.message = Some(format!("bad pattern `{pattern}`: {err}").into());
+      error
+    })?;
+  }
+  Ok(())
 }
 
 /// What to do when a rule cannot be fully resolved.
@@ -254,10 +336,10 @@ impl AppConfig {
         eyre::ensure!(!value.expose_secret().is_empty(), "rule `{label}`: `value` must not be empty");
       }
       for entry in &rule.allow {
-        let grant: crate::grants::UriGrant = entry
+        let scope: crate::grants::EndpointScope = entry
           .parse()
           .map_err(|err| eyre::eyre!("rule `{label}`: bad allow entry `{entry}`: {err}"))?;
-        if matches!(grant.host, crate::grants::HostPat::Any) {
+        if matches!(scope.host, crate::grants::HostPat::Any) {
           tracing::warn!(label, entry, "grant matches any host; secret is exfil-risky");
         }
       }
@@ -283,14 +365,14 @@ pub fn fake_for(env_name: &str, pattern: Option<&str>) -> String {
   render_template(template, &seed)
 }
 /// Validate an explicit `pattern` template: every `{...}` must be a known
-/// verb (`hex`, `d`, `base62`) with a nonzero count. Rejects typos that
+/// encoding (`hex`, `d`, `base62`) with a nonzero count. Rejects typos that
 /// would otherwise render silently wrong (`{bogus:10}` → base62) or empty
 /// (`{hex:0}` → skipped grant).
 ///
 /// # Errors
 ///
-/// Returns the offending verb or count as a message when a `{...}` segment is
-/// not a known verb or carries a zero count.
+/// Returns the offending encoding or count as a message when a `{...}` segment
+/// names no known encoding or carries a zero count.
 pub fn validate_pattern(pattern: &str) -> Result<(), String> {
   let mut rest = pattern;
   while let Some(open) = rest.find('{') {
@@ -307,7 +389,7 @@ pub fn validate_pattern(pattern: &str) -> Result<(), String> {
     };
     if !valid {
       return Err(format!(
-        "bad verb `{{{body}}}`: expected {{hex:N}}, {{d:N}}, or {{base62:N}} with N > 0"
+        "bad encoding `{{{body}}}`: expected {{hex:N}}, {{d:N}}, or {{base62:N}} with N > 0"
       ));
     }
     rest = &after[close + 1..];
@@ -315,31 +397,31 @@ pub fn validate_pattern(pattern: &str) -> Result<(), String> {
   Ok(())
 }
 
-/// A validated fake-template verb: only these three render.
+/// A validated fake-template encoding: only these three render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verb {
+enum Encoding {
   Hex,
   Decimal,
   Base62,
 }
 
-impl Verb {
-  /// Parse a verb name; `None` for anything `validate_pattern` rejects.
+impl Encoding {
+  /// Parse an encoding name; `None` for anything `validate_pattern` rejects.
   fn parse(kind: &str) -> Option<Self> {
     match kind {
-      "hex" => Some(Verb::Hex),
-      "d" => Some(Verb::Decimal),
-      "base62" => Some(Verb::Base62),
+      "hex" => Some(Self::Hex),
+      "d" => Some(Self::Decimal),
+      "base62" => Some(Self::Base62),
       _ => None,
     }
   }
 
-  /// Stable seed tag so each verb streams independently per index.
+  /// Stable seed tag so each encoding streams independently per index.
   fn tag(self) -> &'static str {
     match self {
-      Verb::Hex => "hex",
-      Verb::Decimal => "d",
-      Verb::Base62 => "base62",
+      Self::Hex => "hex",
+      Self::Decimal => "d",
+      Self::Base62 => "base62",
     }
   }
 }
@@ -355,7 +437,7 @@ fn render_template(template: &str, seed: &str) -> String {
       return out;
     };
     let body = &after[..close];
-    // Unknown verbs and unparseable counts render literally: silently
+    // Unknown encodings and unparseable counts render literally: silently
     // emitting base62 (or nothing) would mint the wrong decoy shape.
     let literal = |out: &mut String| {
       out.push('{');
@@ -364,15 +446,15 @@ fn render_template(template: &str, seed: &str) -> String {
     };
     let validated = match body.split_once(':') {
       Some((kind, count_raw)) if !count_raw.is_empty() && count_raw.bytes().all(|b| b.is_ascii_digit()) => {
-        match (Verb::parse(kind), count_raw.parse::<usize>()) {
-          (Some(verb), Ok(count)) => Some((verb, count)),
+        match (Encoding::parse(kind), count_raw.parse::<usize>()) {
+          (Some(encoding), Ok(count)) => Some((encoding, count)),
           _ => None,
         }
       }
       _ => None,
     };
     match validated {
-      Some((verb, count)) => out.push_str(&fill_verb(seed, verb, count)),
+      Some((encoding, count)) => out.push_str(&fill_encoding(seed, encoding, count)),
       None => literal(&mut out),
     }
     rest = &after[close + 1..];
@@ -383,18 +465,18 @@ fn render_template(template: &str, seed: &str) -> String {
 
 /// Render `count` chars of `verb` from `seed`. Every encoding is a library
 /// call: `hex::encode`, `base62::encode`, or std `Display` for decimal.
-fn fill_verb(seed: &str, verb: Verb, count: usize) -> String {
+fn fill_encoding(seed: &str, encoding: Encoding, count: usize) -> String {
   let mut out = String::with_capacity(count);
   let mut index = 0;
   while out.len() < count {
-    let digest = Sha256::digest(format!("{}:{}:{index}", seed, verb.tag()).as_bytes());
-    match verb {
-      Verb::Hex => out.push_str(&hex::encode(digest)),
-      Verb::Decimal => {
+    let digest = Sha256::digest(format!("{}:{}:{index}", seed, encoding.tag()).as_bytes());
+    match encoding {
+      Encoding::Hex => out.push_str(&hex::encode(digest)),
+      Encoding::Decimal => {
         let word = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
         out.push_str(&word.to_string());
       }
-      Verb::Base62 => {
+      Encoding::Base62 => {
         let word: [u8; 16] = digest[0..16].try_into().expect("16 digest bytes");
         out.push_str(&base62::encode(u128::from_be_bytes(word)));
       }
@@ -540,6 +622,13 @@ allow = ["https://c.example"]
     // CLI beats env
     let (config, _) = load(&cli_for(&["hodor", "serve", "--listen", "127.0.0.1:4444"])).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:4444");
+    // the handshake budget defaults to 10 and layers like everything else
+    assert_eq!(config.proxy.handshake_timeout_secs, 10);
+    set_env("HODOR_HANDSHAKE_TIMEOUT_SECS", "3");
+    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    assert_eq!(config.proxy.handshake_timeout_secs, 3);
+    let (config, _) = load(&cli_for(&["hodor", "serve", "--handshake-timeout", "5"])).unwrap();
+    assert_eq!(config.proxy.handshake_timeout_secs, 5);
     scrub_env();
   }
 
@@ -713,7 +802,7 @@ allow = ["https://b.example"]
   }
 
   #[test]
-  fn unknown_verb_renders_literally() {
+  fn unknown_encoding_renders_literally() {
     assert_eq!(render_template("{bogus:10}", "seed"), "{bogus:10}");
     assert_eq!(render_template("a{bogus:10}b", "seed"), "a{bogus:10}b");
     assert_eq!(fake_for("SOME_TOKEN", Some("{bogus:10}")), "{bogus:10}");

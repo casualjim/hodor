@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hodor_config::config::ProxyCfg;
-use hodor_config::grants::{Grant, ResolvedConfig, Scheme, UriGrant};
+use hodor_config::grants::{Credential, EndpointScope, Grant, ResolvedConfig, Scheme};
 use hodor_proxy::ProxyState;
 
 use crate::{Options, SelfExclusion, run_ebpf_with};
@@ -74,6 +74,7 @@ fn state_with(grants: Vec<Grant>, ca: &hodor_pki::ca::CertAuthority) -> Arc<Prox
         proxy: ProxyCfg {
           listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
           ca_file: None,
+          handshake_timeout_secs: 10,
         },
         grants,
         plugins: Vec::new(),
@@ -131,6 +132,7 @@ async fn start_capture(
 /// remaps hodor's own dial to a loopback stub.
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
+#[expect(clippy::too_many_lines, reason = "linear live-test script, split would obscure the flow")]
 async fn ebpf_live_tcp_mitm_substitutes() {
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -152,14 +154,19 @@ async fn ebpf_live_tcp_mitm_substitutes() {
   let stub_port = stub.local_addr().unwrap().port();
 
   let state = state_with(
-    vec![Grant {
-      label: "t".into(),
-      fake: FAKE.into(),
-      value: secrecy::SecretString::from(VALUE),
-      allow: vec![UriGrant {
+    vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec![EndpointScope {
         scheme: Scheme::Https,
         host: SNI.parse().unwrap(),
         port: stub_port,
+        client_cert: None,
+        client_key: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
     }],
     &ca,

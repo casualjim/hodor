@@ -11,64 +11,53 @@
 //! Tests are sync: async machine entry points run on a current-thread
 //! tokio runtime via `block_on` (no timers, no IO — the machines are
 //! deterministic over the byte input alone).
-use hodor_config::grants::Grant;
 use proptest::prelude::*;
 
-use super::h1::SecretsMachine;
-use super::h2::H2Machine;
-use super::{Direction, H2_PREFACE, MachineMode, MachineParams, SubMachine};
+use hodor_config::grants::{Credential, Grant, Scheme};
+
+use super::h2::{H2, H2_PREFACE};
+use super::http::Http;
+use super::raw::Raw;
+use super::{Direction, Rewritten, Wire};
 
 /// Needle decoy (request-direction needle) and its real value.
 const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn grants() -> Vec<Grant> {
-  vec![Grant {
-    label: "github".into(),
-    fake: FAKE.into(),
-    value: secrecy::SecretString::from(VALUE),
+  vec![Grant::Token {
+    credential: Credential {
+      label: "github".into(),
+      fake: FAKE.into(),
+      value: secrecy::SecretString::from(VALUE),
+    },
     allow: vec!["https://*".parse().expect("grant")],
   }]
 }
 
-fn req_machine() -> SecretsMachine {
-  SecretsMachine::new(MachineParams::new(
-    &grants(),
-    MachineMode::Https,
-    "api.github.com",
-    443,
-    Direction::Request,
-  ))
+fn req_machine() -> Http {
+  Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None)
 }
 
-fn resp_machine() -> SecretsMachine {
-  SecretsMachine::new(MachineParams::new(
-    &grants(),
-    MachineMode::Https,
-    "api.github.com",
-    443,
-    Direction::Response,
-  ))
+fn resp_machine() -> Http {
+  Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None)
 }
 
-fn h2_req_machine() -> H2Machine {
-  H2Machine::new(MachineParams::new(
-    &grants(),
-    MachineMode::Https,
-    "api.github.com",
-    443,
-    Direction::Request,
-  ))
+fn h2_req_machine() -> H2 {
+  H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None)
 }
 
-fn h2_resp_machine() -> H2Machine {
-  H2Machine::new(MachineParams::new(
-    &grants(),
-    MachineMode::Https,
-    "api.github.com",
-    443,
-    Direction::Response,
-  ))
+fn h2_resp_machine() -> H2 {
+  H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None)
+}
+
+impl Rewritten<'_> {
+  fn emit_bytes(self) -> Vec<u8> {
+    match self {
+      Self::Emit(bytes) => bytes.into_owned(),
+      _ => Vec::new(),
+    }
+  }
 }
 
 fn block_on<F>(fut: F) -> F::Output
@@ -85,7 +74,7 @@ where
 /// Drain an H1 machine over `splits` (ascending cuts into `data`, implied
 /// final cut at `data.len()`), then one empty EOF flush. Concatenated
 /// output, total hit count.
-fn run_split(m: &mut SecretsMachine, data: &[u8], splits: &[usize]) -> (Vec<u8>, usize) {
+fn run_split<M: Wire>(m: &mut M, data: &[u8], splits: &[usize]) -> (Vec<u8>, usize) {
   let mut out = Vec::new();
   let mut hits = 0;
   let mut prev = 0;
@@ -93,42 +82,60 @@ fn run_split(m: &mut SecretsMachine, data: &[u8], splits: &[usize]) -> (Vec<u8>,
     // A relay only calls with non-empty chunks; an empty call is the
     // EOF flush. Skip cuts that would produce an interior empty call.
     if cut > prev {
-      let (bytes, chunk_hits) = block_on(m.substitute(&data[prev..cut]));
+      let (bytes, chunk_hits) = {
+        let (rewritten, hits) = block_on(m.feed(&data[prev..cut]));
+        (rewritten.emit_bytes(), hits)
+      };
       out.extend_from_slice(&bytes);
       hits += chunk_hits.len();
       prev = cut;
     }
   }
   if prev < data.len() {
-    let (bytes, chunk_hits) = block_on(m.substitute(&data[prev..]));
+    let (bytes, chunk_hits) = {
+      let (rewritten, hits) = block_on(m.feed(&data[prev..]));
+      (rewritten.emit_bytes(), hits)
+    };
     out.extend_from_slice(&bytes);
     hits += chunk_hits.len();
   }
-  let (bytes, chunk_hits) = block_on(m.substitute(&[]));
+  let (bytes, chunk_hits) = {
+    let (rewritten, hits) = block_on(m.feed(&[]));
+    (rewritten.emit_bytes(), hits)
+  };
   out.extend_from_slice(&bytes);
   hits += chunk_hits.len();
   (out, hits)
 }
 
 /// Drain an H2 machine the same way.
-fn run_split_h2(m: &mut H2Machine, data: &[u8], splits: &[usize]) -> (Vec<u8>, usize) {
+fn run_split_h2<M: Wire>(m: &mut M, data: &[u8], splits: &[usize]) -> (Vec<u8>, usize) {
   let mut out = Vec::new();
   let mut hits = 0;
   let mut prev = 0;
   for &cut in splits.iter().chain(std::iter::once(&data.len())) {
     if cut > prev {
-      let (bytes, chunk_hits) = block_on(m.substitute(&data[prev..cut]));
+      let (bytes, chunk_hits) = {
+        let (rewritten, hits) = block_on(m.feed(&data[prev..cut]));
+        (rewritten.emit_bytes(), hits)
+      };
       out.extend_from_slice(&bytes);
       hits += chunk_hits.len();
       prev = cut;
     }
   }
   if prev < data.len() {
-    let (bytes, chunk_hits) = block_on(m.substitute(&data[prev..]));
+    let (bytes, chunk_hits) = {
+      let (rewritten, hits) = block_on(m.feed(&data[prev..]));
+      (rewritten.emit_bytes(), hits)
+    };
     out.extend_from_slice(&bytes);
     hits += chunk_hits.len();
   }
-  let (bytes, chunk_hits) = block_on(m.substitute(&[]));
+  let (bytes, chunk_hits) = {
+    let (rewritten, hits) = block_on(m.feed(&[]));
+    (rewritten.emit_bytes(), hits)
+  };
   out.extend_from_slice(&bytes);
   hits += chunk_hits.len();
   (out, hits)
@@ -239,13 +246,15 @@ proptest! {
     pre in proptest::collection::vec(any::<u8>(), 0..64),
     suffix in proptest::collection::vec(any::<u8>(), 0..64),
   ) {
-    let grants = vec![Grant {
+    let grants = vec![Grant::Token {
+
+      credential: Credential {
       label: "t".into(),
       fake: FAKE.into(),
       value: secrecy::SecretString::from(VALUE),
-      allow: vec!["tcp://*:1".parse().expect("grant")],
-    }];
-    let mut m = SecretsMachine::new(MachineParams::new(&grants, MachineMode::RawTcp, "h", 1, Direction::Request));
+      },
+      allow: vec!["tcp://*:1".parse().expect("grant")],}];
+    let mut m = Raw::new(&grants, Scheme::Tcp, "h", 1, Direction::Downstream);
     let mid = FAKE.len() / 2;
     let mut data = pre.clone();
     data.extend_from_slice(&FAKE.as_bytes()[..mid]);
@@ -491,15 +500,15 @@ proptest! {
   /// walker.
   #[test]
   fn prop_sni_arbitrary_no_panic(data in proptest::collection::vec(any::<u8>(), 0..1024)) {
-    let _ = crate::policy::hello_sni(&data);
+    let _ = crate::identity::hello_sni(&data);
   }
 
   /// Crash resistance, grants: arbitrary strings parse or reject
   /// cleanly, and a valid entry round-trips through matching.
   #[test]
   fn prop_grant_parse_no_panic(s in ".*") {
-    if let Ok(grant) = s.parse::<hodor_config::grants::UriGrant>() {
-      let host = match &grant.host {
+    if let Ok(scope) = s.parse::<hodor_config::grants::EndpointScope>() {
+      let host = match &scope.host {
         hodor_config::grants::HostPat::Any => "anything.example".to_string(),
         hodor_config::grants::HostPat::Wildcard(pattern) => {
           let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
@@ -507,7 +516,15 @@ proptest! {
         }
         hodor_config::grants::HostPat::Exact(host) => host.clone(),
       };
-      let _ = hodor_config::grants::uri_match(std::slice::from_ref(&grant), grant.scheme, &host, grant.port);
+      assert!(
+        hodor_config::grants::uri_match(
+          std::slice::from_ref(&scope),
+          scope.scheme,
+          &host,
+          scope.port,
+        ),
+        "entry `{s}` must match the host its own pattern derives"
+      );
     }
   }
 }

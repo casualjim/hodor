@@ -92,7 +92,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   // fnox is needed exactly when a rule has no inline value: every
   // credential the proxy runs with resolves from fnox, age-encrypted secrets
   // included — never from the environment that started this process.
-  let needs_fnox = config.rules.values().any(|rule| rule.value.is_none());
+  let needs_fnox = config.rules.values().any(|rule| rule.value.is_none() || rule.is_database());
   let fnox = if needs_fnox { hodor_fnox::FnoxSource::open()? } else { None };
   if let Some(source) = &fnox {
     for name in hodor_fnox::export_provider_env(source).await? {

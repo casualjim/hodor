@@ -16,3 +16,18 @@ ca_file = "/certs/ca.pem"
 env = "GH_TOKEN"
 value = "ghp_deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 allow = ["https://api:8443", "http://api:8000", "tcp://10.202.0.20:9000", "https://api:9443"]
+
+
+# Real PostgreSQL on the server net, as a connection-string rule: the rule
+# states only the fake — a proper `postgres://` URL, so the env var the
+# guest reads holds a URL — and the real connection string lives in the
+# secret source (fnox.toml beside this file, mounted under the config dir).
+# No allow entries: the connection string is the grant, matched on the
+# fake's port, because a transparently captured connection carries no
+# hostname the capture knows (libpq sent no SNI before PostgreSQL 17 —
+# PostgreSQL 17+ does, and hodor re-keys on it). The strings name the host
+# the way real deployments do — a hostname, never an IP. Both passwords
+# are the same length — the wire machine swaps in place.
+[rules.db]
+env = "DATABASE_URL"
+value = "postgres://hodor:hodor_fake_password_01@db:5432/demo?sslmode=require"

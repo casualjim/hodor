@@ -22,6 +22,8 @@ Topology:
   `nft`/`ip`). Marked upstream dials bypass capture (fwmark rule).
 - `api` — bun server on `server` only, static IP `10.202.0.20`,
   validates only the real token.
+- `db` — real PostgreSQL 17 (Alpine) on `server` only, static IP
+  `10.202.0.30`, TLS with a demo-CA leaf, validates only the real password.
 - `server` subnet is RFC1918 on purpose: hodor captures LAN traffic too
   (the capture routes are default-route-only), and this demo proves it.
 
@@ -32,12 +34,23 @@ Topology:
 | 3 | Cleartext line protocol to `api:9000` | `tcp://10.202.0.20:9000` | `AUTH fake` became `AUTH real`, `OK real` came back as `OK fake` |
 | 4 | TLS line protocol to `api:9443` | `https://api:9443` | same as 3 through terminated TLS legs |
 | 5 | TLS line protocol to `api:9444` | none | tunnel splices untouched: fake arrives as-is, server rejects |
+| 6 | Postgres wire protocol driven by the client's own `DATABASE_URL` (the rule's stated fake string): SSLRequest, TLS, cleartext password auth, `SELECT` | `[rules.db]`: `env = "DATABASE_URL"`, `value` the fake URL; the real URL in `fnox.toml` | the fake password authenticates against real PostgreSQL — hodor swapped the real one in from the secret source — and the query row comes back |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
 (`crates/hodor-tproxy/src/tproxy.rs` `tproxy_conn_task`). Scenario 5 is the fail-closed control: without a grant
 hodor splices TLS byte-identical, so no secret can leak and the server
 refuses the fake.
+ Scenario 6's entry is a real
+libpq URL naming the host (`db`); a transparently captured connection
+carries no hostname hodor can key on (libpq sent no SNI before PostgreSQL
+17), so the transparent path shortlists by port alone — any captured
+connection to :5432 resolves to the entry, whatever address DNS resolved.
+Both connection strings name the host the way real deployments do —
+the `db` hostname, never an IP. The client keeps full TLS hostname
+verification on: it dials by that name, and hodor mints the guest leaf
+for it. The bwrap demo has
+no postgres and no `DATABASE_URL`, so scenario 6 is skipped there.
 
 ## Run
 

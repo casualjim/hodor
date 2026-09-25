@@ -9,7 +9,7 @@ use eyre::WrapErr as _;
 use serde::Deserialize;
 
 use crate::config::RuleCfg;
-use crate::grants::UriGrant;
+use crate::grants::EndpointScope;
 
 /// Bundled registry: environment names, API hosts, and token shapes.
 const BUNDLED: &str = include_str!("../../../rules/registry.toml");
@@ -243,10 +243,10 @@ impl Registry {
 /// Validate one host entry with the same grammar as `allow`.
 fn validate_hosts(hosts: &[String], source: &Path, kind: &str, name: &str) -> eyre::Result<()> {
   for host in hosts {
-    let grant: UriGrant = host
+    let scope: EndpointScope = host
       .parse()
       .map_err(|err| eyre::eyre!("{}: {kind} `{name}`: bad host `{host}`: {err}", source.display()))?;
-    if matches!(grant.host, crate::grants::HostPat::Any) {
+    if matches!(scope.host, crate::grants::HostPat::Any) {
       let what = format!("{kind} `{name}`");
       tracing::warn!(file = %source.display(), entry = %host, what, "grant matches any host; secret is exfil-risky");
     }

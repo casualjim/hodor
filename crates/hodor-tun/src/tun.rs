@@ -247,7 +247,7 @@ mod tests {
     SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::from(ip)), port)
   }
 
-  use hodor_config::grants::ResolvedConfig;
+  use hodor_config::grants::{Credential, ResolvedConfig};
   use tokio_rustls as _;
 
   static LIVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -275,6 +275,7 @@ mod tests {
         proxy: hodor_config::config::ProxyCfg {
           listen: "127.0.0.1:0".parse().unwrap(),
           ca_file: None,
+          handshake_timeout_secs: 10,
         },
         grants,
         plugins: Vec::new(),
@@ -362,14 +363,19 @@ mod tests {
     let stub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_port = stub.local_addr().unwrap().port();
 
-    let grants = vec![hodor_config::grants::Grant {
-      label: "t".into(),
-      fake: FAKE.into(),
-      value: secrecy::SecretString::from(VALUE),
-      allow: vec![hodor_config::grants::UriGrant {
+    let grants = vec![hodor_config::grants::Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec![hodor_config::grants::EndpointScope {
         scheme: hodor_config::grants::Scheme::Https,
         host: SNI.parse().unwrap(),
         port: stub_port,
+        client_cert: None,
+        client_key: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
     }];
     let state = Arc::new(
@@ -378,6 +384,7 @@ mod tests {
           proxy: hodor_config::config::ProxyCfg {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
+            handshake_timeout_secs: 10,
           },
           grants,
           plugins: Vec::new(),

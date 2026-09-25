@@ -1,4 +1,4 @@
-//! HTTP/2 machine: HPACK head substitution, DATA-frame scanning.
+//! HTTP/2 wire format: HPACK head rewriting, DATA-frame scanning.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -6,14 +6,11 @@ use std::collections::{HashMap, HashSet};
 use base64::Engine as _;
 use httlib_hpack::{Decoder, Encoder};
 
-#[cfg(test)]
-use hodor_config::grants::Grant;
+use hodor_config::grants::{Grant, Scheme};
 use hodor_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Verdict};
 
-#[cfg(test)]
-use super::MachineMode;
 use super::{
-  Direction, Hit, Location, MachineParams, Pair, SubMachine, eligible_pairs, max_tail_size, needle_safe_emit_len, replace_bytes,
+  CredentialPair, Direction, Hit, Location, Rewritten, Wire, eligible_pairs, max_tail_size, needle_safe_emit_len, replace_bytes,
   replace_in, response_has_no_body, scan_with_tail,
 };
 
@@ -98,8 +95,8 @@ enum H2Phase {
 /// substituted with the frame length rewritten (a per-stream overlap window
 /// is held back so cross-frame split secrets substitute whole). Any framing
 /// violation degrades to opaque scan-only forwarding.
-pub(crate) struct H2Machine {
-  pairs: Vec<Pair>,
+pub(crate) struct H2 {
+  pairs: Vec<CredentialPair>,
   dir: Direction,
   hook: Option<Box<dyn RewriteHook>>,
   decoder: Decoder<'static>,
@@ -120,21 +117,22 @@ pub(crate) struct H2Machine {
   must_close: bool,
 }
 
-impl H2Machine {
-  /// Build from explicit parameters. The request leg consumes the H2
-  /// connection preface; responses start with frames.
+impl H2 {
+  /// Build from the grants an `https://` rule matched. The downstream
+  /// direction consumes the H2 connection preface; upstream starts at
+  /// frames.
   #[must_use]
-  pub fn new(params: MachineParams<'_>) -> Self {
-    let pairs = eligible_pairs(params.grants, params.mode, params.host, params.port, params.dir);
+  pub fn new(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction, hook: Option<Box<dyn RewriteHook>>) -> Self {
+    let pairs = eligible_pairs(grants, scheme, host, port, dir);
     let tail_size = max_tail_size(&pairs);
     Self {
       pairs,
-      dir: params.dir,
-      hook: params.hook,
+      dir,
+      hook,
       decoder: Decoder::default(),
       encoder: Encoder::default(),
       buffer: Vec::new(),
-      phase: if params.dir == Direction::Request {
+      phase: if dir == Direction::Downstream {
         H2Phase::Preface
       } else {
         H2Phase::Framing
@@ -150,7 +148,7 @@ impl H2Machine {
     }
   }
 
-  /// Process one chunk. Inherent implementation of the [`SubMachine`] protocol;
+  /// Process one chunk. Inherent implementation of the [`Wire`] protocol;
   /// the trait impl below forwards here so concrete and dynamic callers share
   /// one code path.
   #[must_use]
@@ -182,7 +180,7 @@ impl H2Machine {
     }
     if self.phase == H2Phase::Opaque {
       let hits = scan_with_tail(&self.pairs, &mut self.scan_tail, self.tail_size, chunk, Location::Body);
-      if self.dir == Direction::Response && !hits.is_empty() {
+      if self.dir == Direction::Upstream && !hits.is_empty() {
         self.must_close = true;
       }
       return (Cow::Borrowed(chunk), hits);
@@ -349,7 +347,8 @@ impl H2Machine {
       combined.len() - needle_safe_emit_len(&combined, &self.pairs, self.tail_size)
     };
     let emit_len = combined.len() - hold;
-    let (mut new_emit, mut data_hits) = replace_in(&combined[..emit_len], &self.pairs, Location::Body);
+    let (new_emit, mut data_hits) = replace_in(&combined[..emit_len], &self.pairs, Location::Body);
+    let mut new_emit = new_emit.into_owned();
     hits.append(&mut data_hits);
     if let Some(hook) = self.hook.as_mut()
       && hook.rewrite_chunk(&mut new_emit, end_stream).await == Verdict::Close
@@ -421,12 +420,12 @@ impl H2Machine {
           .collect();
       }
     }
-    if self.dir == Direction::Request && is_head_method(&headers) {
+    if self.dir == Direction::Downstream && is_head_method(&headers) {
       self.head_requests += 1;
     }
     // HEADERS without opening the stream, so stray DATA frames fail the
     // `open_streams` check and degrade to opaque instead of substituting
-    let no_body = self.dir == Direction::Response && (self.suppress_body > 0 || response_status_no_body(&headers));
+    let no_body = self.dir == Direction::Upstream && (self.suppress_body > 0 || response_status_no_body(&headers));
     // Trailer HEADERS (no `:status`) must not consume a pending HEAD
     // suppression — only real response heads decrement. Interim 1xx heads
     // (e.g. 103 Early Hints) keep the suppression for the final response.
@@ -444,7 +443,7 @@ impl H2Machine {
     });
     let has_status = status.is_some();
     let interim = status.is_some_and(|code| (100..200).contains(&code));
-    if has_status && !interim && self.suppress_body > 0 && self.dir == Direction::Response {
+    if has_status && !interim && self.suppress_body > 0 && self.dir == Direction::Upstream {
       self.suppress_body -= 1;
     }
     let mut encoded = Vec::new();
@@ -480,7 +479,8 @@ impl H2Machine {
     if let Some(held) = self.data_tails.remove(&stream_id)
       && !held.is_empty()
     {
-      let (mut new_held, mut held_hits) = replace_in(&held, &self.pairs, Location::Body);
+      let (new_held, mut held_hits) = replace_in(&held, &self.pairs, Location::Body);
+      let mut new_held = new_held.into_owned();
       hits.append(&mut held_hits);
       let mut closed = false;
       if let Some(hook) = self.hook.as_mut()
@@ -518,18 +518,39 @@ impl H2Machine {
   }
 }
 
-impl SubMachine for H2Machine {
-  fn substitute<'a>(&mut self, chunk: &'a [u8]) -> impl Future<Output = (Cow<'a, [u8]>, Vec<Hit>)> + Send {
-    H2Machine::substitute(self, chunk)
+#[cfg(test)]
+impl H2 {
+  /// Fail-closed latch state.
+  pub(crate) fn must_close(&self) -> bool {
+    self.must_close
   }
+  /// Drain pending HEAD-request count.
   fn take_head_requests(&mut self) -> usize {
     std::mem::take(&mut self.head_requests)
   }
+  /// Suppress bodies for the next n responses.
   fn suppress_next_bodies(&mut self, n: usize) {
     self.suppress_body += n;
   }
-  fn must_close(&self) -> bool {
-    self.must_close
+}
+
+impl Wire for H2 {
+  async fn feed<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
+    let (out, hits) = H2::substitute(self, chunk).await;
+    let rewritten = if self.must_close {
+      Rewritten::Close
+    } else if out.is_empty() {
+      Rewritten::Hold
+    } else {
+      Rewritten::Emit(out)
+    };
+    (rewritten, hits)
+  }
+  fn take_peer_note(&mut self) -> usize {
+    std::mem::take(&mut self.head_requests)
+  }
+  fn apply_peer_note(&mut self, n: usize) {
+    self.suppress_body += n;
   }
 }
 fn finalize_borrow(chunk: &[u8], out: Vec<u8>, hits: Vec<Hit>) -> (Cow<'_, [u8]>, Vec<Hit>) {
@@ -542,7 +563,7 @@ fn finalize_borrow(chunk: &[u8], out: Vec<u8>, hits: Vec<Hit>) -> (Cow<'_, [u8]>
 
 /// Substitute all pairs in decoded header values. `:authority` is skipped
 /// (routing safety); `authorization: Basic` is decoded first like HTTP/1.
-fn substitute_h2_values(headers: &mut [(Vec<u8>, Vec<u8>, u8)], pairs: &[Pair], hits: &mut Vec<Hit>) {
+fn substitute_h2_values(headers: &mut [(Vec<u8>, Vec<u8>, u8)], pairs: &[CredentialPair], hits: &mut Vec<Hit>) {
   for pair in pairs {
     let mut header_hit = false;
     let mut basic_hit = false;
@@ -730,37 +751,28 @@ fn append_frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream_id: u32, payload:
 #[cfg(test)]
 mod h2_tests {
   use super::*;
+  use hodor_config::grants::Credential;
 
   const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
   fn grants() -> Vec<Grant> {
-    vec![Grant {
-      label: "github".into(),
-      fake: FAKE.into(),
-      value: secrecy::SecretString::from(VALUE),
-      allow: vec!["https://api.github.com".parse::<hodor_config::grants::UriGrant>().unwrap()],
+    vec![Grant::Token {
+      credential: Credential {
+        label: "github".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec!["https://api.github.com".parse().unwrap()],
     }]
   }
 
-  fn req_machine() -> H2Machine {
-    H2Machine::new(MachineParams::new(
-      &grants(),
-      MachineMode::Https,
-      "api.github.com",
-      443,
-      Direction::Request,
-    ))
+  fn req_machine() -> H2 {
+    H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None)
   }
 
-  fn resp_machine() -> H2Machine {
-    H2Machine::new(MachineParams::new(
-      &grants(),
-      MachineMode::Https,
-      "api.github.com",
-      443,
-      Direction::Response,
-    ))
+  fn resp_machine() -> H2 {
+    H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None)
   }
 
   fn encode_headers(fields: &[(&str, &str)]) -> Vec<u8> {
@@ -1025,8 +1037,15 @@ mod h2_tests {
     }
   }
 
-  fn req_hooked(hook: MockHook) -> H2Machine {
-    H2Machine::new(MachineParams::new(&grants(), MachineMode::Https, "api.github.com", 443, Direction::Request).hook(Some(Box::new(hook))))
+  fn req_hooked(hook: MockHook) -> H2 {
+    H2::new(
+      &grants(),
+      Scheme::Https,
+      "api.github.com",
+      443,
+      Direction::Downstream,
+      Some(Box::new(hook)),
+    )
   }
 
   #[tokio::test]

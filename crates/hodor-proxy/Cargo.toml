@@ -9,23 +9,36 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
+bytes = "1"
 eyre = "0.6"
 hodor-config = { path = "../hodor-config" }
 hodor-pki = { path = "../hodor-pki" }
 hodor-plugin = { path = "../hodor-plugin" }
 httlib-hpack = "0.1.3"
 httparse = "1"
-rama = { git = "https://github.com/plabayo/rama", default-features = false, features = ["boring", "tcp"] }
+pgwire = { version = "0.41", default-features = false }
+rama = { git = "https://github.com/lotsaai/rama", rev = "be3aa5b82f587f3688980db74e8c9e530cd7ac77", default-features = false, features = ["boring", "tcp"] } # fork of plabayo/rama: mTLS client identity on the MITM egress leg; switch back once upstreamed
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls-native-certs = "0.8"
+tokio-rustls = "0.26"
 secrecy = { version = "0.10", features = ["serde"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
+async-trait = "0.1"
+futures = "0.3"
+h2 = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# server-api-aws-lc-rs also turns on pgwire's TLS acceptor, which the
+# handshake tests drive with a real rustls server.
+pgwire = { version = "0.41", default-features = false, features = ["server-api-aws-lc-rs"] }
 pretty_assertions = "1"
 proptest = "1"
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tempfile = "3"
-tokio-rustls = "0.26"
+tokio-postgres = "0.7"
 [lints]
 workspace = true

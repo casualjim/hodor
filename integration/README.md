@@ -34,14 +34,15 @@ Topology:
 | 3 | Cleartext line protocol to `api:9000` | `tcp://10.202.0.20:9000` | `AUTH fake` became `AUTH real`, `OK real` came back as `OK fake` |
 | 4 | TLS line protocol to `api:9443` | `https://api:9443` | same as 3 through terminated TLS legs |
 | 5 | TLS line protocol to `api:9444` | none | tunnel splices untouched: fake arrives as-is, server rejects |
-| 6 | Postgres wire protocol driven by the client's own `DATABASE_URL` (the rule's stated fake string): SSLRequest, TLS, cleartext password auth, `SELECT` | `[rules.db]`: `env = "DATABASE_URL"`, `value` the fake URL; the real URL in `fnox.toml` | the fake password authenticates against real PostgreSQL — hodor swapped the real one in from the secret source — and the query row comes back |
+| 6 | Postgres wire protocol driven by the client's own `DATABASE_URL` (the rule's stated fake string): SSLRequest, TLS, cleartext password auth, `SELECT` | `[rules.db]`: `env = "DATABASE_URL"`, `value` the fake URL; the real URL in fnox | the fake password authenticates against real PostgreSQL — hodor swapped the real one in from the secret source — and the query row comes back |
+| 7 | OAuth2 `client_credentials` POST `api:8000/token` with the fake client secret, then GET with the minted token | `[rules.oidc]` + `oauth2` block | issuer saw the real client secret, the client received a minted decoy access token (never the real one), and the decoy swapped back to the real access token on the API call |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
 (`crates/hodor-tproxy/src/tproxy.rs` `tproxy_conn_task`). Scenario 5 is the fail-closed control: without a grant
 hodor splices TLS byte-identical, so no secret can leak and the server
 refuses the fake.
- Scenario 6's entry is a real
+Scenario 6's entry is a real
 libpq URL naming the host (`db`); a transparently captured connection
 carries no hostname hodor can key on (libpq sent no SNI before PostgreSQL
 17), so the transparent path shortlists by port alone — any captured
@@ -51,12 +52,27 @@ the `db` hostname, never an IP. The client keeps full TLS hostname
 verification on: it dials by that name, and hodor mints the guest leaf
 for it. The bwrap demo has
 no postgres and no `DATABASE_URL`, so scenario 6 is skipped there.
+Scenario 7 exercises runtime token minting
+(`crates/hodor-proxy/src/mint.rs`): the client secret is a static
+substitution (`hodor fake OIDC_CLIENT_SECRET`, pinned in
+`compose.yaml`), and the access token is minted per issue, so no real
+access token ever reaches the client container.
 
 ## Run
 
 ```sh
 mise run demo
 ```
+
+First run only: the demo's real values resolve from fnox at serve time, so
+no committed rule file carries a `value`. `gen-secrets.sh` renders the
+hodor container's fnox config from the environment:
+
+```sh
+cp integration/.env.example integration/.env   # gitignored; adjust freely
+```
+
+
 
 The task builds the release binary, packs it into
 the runtime image via the repo `Dockerfile`, and runs

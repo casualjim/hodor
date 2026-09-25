@@ -3,3 +3,4 @@
 .data
 mise.local.toml
 target/
+integration/.env

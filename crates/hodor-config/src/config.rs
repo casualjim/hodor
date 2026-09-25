@@ -130,6 +130,9 @@ pub struct RuleCfg {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   #[validate(custom(function = "validate_opt_pattern"))]
   pub pattern: Option<String>,
+  /// `OAuth2` token-issuer flow overriding the registry.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub oauth2: Option<crate::registry::OAuthFlow>,
   /// Consult the host registry for this rule (default true).
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub registry: Option<bool>,
@@ -346,6 +349,9 @@ impl AppConfig {
       if let Some(pattern) = rule.pattern.as_deref().filter(|p| !p.is_empty()) {
         validate_pattern(pattern).map_err(|err| eyre::eyre!("rule `{label}`: bad pattern `{pattern}`: {err}"))?;
       }
+      if let Some(flow) = &rule.oauth2 {
+        crate::registry::validate_flow(flow, "config", label)?;
+      }
     }
     Ok(())
   }
@@ -355,15 +361,19 @@ impl AppConfig {
 // format-valid deterministic fakes (port of substitute.py fake_for)
 // ---------------------------------------------------------------------------
 
-/// Deterministic format-valid fake for an env var name. Stable across
-/// restarts, distinct per name. `pattern` wins; the registry supplies one
-/// through `secrets::Registry::decoy`, and `DEFAULT_PATTERN` is the floor.
+/// Deterministic format-valid fake seeded on `seed`. Static decoys seed on
+/// the env name (stable across restarts, distinct per name); runtime token
+/// minting seeds on the real token value (one decoy per issued token). A
+/// raw TCP grant renders the seed at the real value's length by passing
+/// `{hex:<len>}` as the pattern. `pattern` wins; the registry supplies one
+/// through `Registry::decoy`, and `DEFAULT_PATTERN` is the floor.
 #[must_use]
-pub fn fake_for(env_name: &str, pattern: Option<&str>) -> String {
+pub fn fake_for(seed: &str, pattern: Option<&str>) -> String {
   let template = pattern.filter(|pattern| !pattern.is_empty()).unwrap_or(DEFAULT_PATTERN);
-  let seed = hex::encode(Sha256::digest(env_name.as_bytes()));
+  let seed = hex::encode(Sha256::digest(seed.as_bytes()));
   render_template(template, &seed)
 }
+
 /// Validate an explicit `pattern` template: every `{...}` must be a known
 /// encoding (`hex`, `d`, `base62`) with a nonzero count. Rejects typos that
 /// would otherwise render silently wrong (`{bogus:10}` → base62) or empty
@@ -371,7 +381,7 @@ pub fn fake_for(env_name: &str, pattern: Option<&str>) -> String {
 ///
 /// # Errors
 ///
-/// Returns the offending encoding or count as a message when a `{...}` segment
+/// Returns an error naming the offending encoding or count when a `{...}` segment
 /// names no known encoding or carries a zero count.
 pub fn validate_pattern(pattern: &str) -> Result<(), String> {
   let mut rest = pattern;

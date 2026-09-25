@@ -8,8 +8,8 @@ use hodor_config::grants::{Grant, Scheme};
 use hodor_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Verdict};
 
 use super::{
-  CredentialPair, Direction, Hit, Location, Rewritten, Wire, eligible_pairs, max_tail_size, needle_safe_emit_len, replace_bytes,
-  replace_in, response_has_no_body, scan_with_tail,
+  CredentialPair, Direction, Hit, Location, MAX_MINT_BODY, MintPlan, Rewritten, Wire, eligible_pairs, max_tail_size, mint_and_redact,
+  mint_plan_for, minted_pairs, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
 };
 
 /// Max buffered header block before degrading to opaque scan-only.
@@ -34,6 +34,10 @@ enum State {
   Opaque,
   /// Close-delimited response body: streams like Raw, flushes at EOF.
   CloseDelimited,
+  /// Flow-granted token response: buffering the body whole to mint decoys;
+  /// the head is held so `Content-Length` can be rewritten to the decoyed
+  /// body's true length.
+  MintBody,
 }
 
 /// Incremental chunked-framing parse phase (resumes across arrivals). No
@@ -107,18 +111,44 @@ pub(crate) struct Http {
   must_close: bool,
   /// Stage-1 plugin hook; `None` keeps today's value-swap-only behavior.
   hook: Option<Box<dyn RewriteHook>>,
+  /// Static grant pairs from construction; `pairs` rebuilds from these
+  /// whenever minted pairs refresh.
+  static_pairs: Vec<CredentialPair>,
+  /// Runtime mint handle; `None` keeps value-swap-only behavior.
+  mint: Option<crate::mint::MintHandle>,
+  /// Response side: the flow-granted grant's expectations, when this
+  /// endpoint is a token issuer and this machine mints.
+  mint_plan: Option<MintPlan>,
+  /// Held head awaiting a minted body (`State::MintBody`).
+  mint_head: Vec<u8>,
+  /// Accumulated token-response body (`State::MintBody`).
+  mint_body: Vec<u8>,
+  /// Bytes still expected into `mint_body` (fixed framing); `None` for
+  /// chunked accumulation.
+  mint_remaining: Option<usize>,
 }
 
 impl Http {
   /// Build from the grants an `http://` or `https://` rule matched. The
   /// scheme only picks pairs; framing always starts at a head.
   #[must_use]
-  pub fn new(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction, hook: Option<Box<dyn RewriteHook>>) -> Self {
-    let pairs = eligible_pairs(grants, scheme, host, port, dir);
-    let tail_size = max_tail_size(&pairs);
-
-    Self {
-      pairs,
+  pub fn new(
+    grants: &[Grant],
+    scheme: Scheme,
+    host: &str,
+    port: u16,
+    dir: Direction,
+    hook: Option<Box<dyn RewriteHook>>,
+    mint: Option<crate::mint::MintHandle>,
+  ) -> Self {
+    let static_pairs = eligible_pairs(grants, scheme, host, port, dir);
+    let tail_size = max_tail_size(&static_pairs);
+    // Response machines mint when a flow-granted grant matches this endpoint.
+    let mint_plan = (dir == Direction::Upstream)
+      .then(|| mint_plan_for(grants, scheme, host, port))
+      .flatten();
+    let mut wire = Self {
+      pairs: static_pairs.clone(),
       dir,
       state: State::Head,
       head_buf: Vec::new(),
@@ -136,14 +166,39 @@ impl Http {
       suppress_body: 0,
       must_close: false,
       hook,
+      static_pairs,
+      mint,
+      mint_plan,
+      mint_head: Vec::new(),
+      mint_body: Vec::new(),
+      mint_remaining: None,
+    };
+    // Both directions union the minted decoys at construction, so a decoy
+    // minted on any connection substitutes or redacts on this one too.
+    wire.refresh_minted_pairs();
+    wire
+  }
+
+  /// Rebuild the active pair set: static grants plus every minted decoy.
+  /// Called at construction and at each message head, so pairs minted
+  /// mid-connection go live immediately.
+  fn refresh_minted_pairs(&mut self) {
+    if self.mint.is_none() {
+      return;
     }
+    let mut pairs = self.static_pairs.clone();
+    if let Some(mint) = &self.mint {
+      pairs.extend(minted_pairs(mint, self.dir));
+    }
+    self.tail_size = max_tail_size(&pairs);
+    self.pairs = pairs;
   }
 
   /// Scan-only variant for tests: framing unknowable from the start.
   #[cfg(test)]
   #[must_use]
   pub fn opaque(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction) -> Self {
-    let mut wire = Self::new(grants, scheme, host, port, dir, None);
+    let mut wire = Self::new(grants, scheme, host, port, dir, None, None);
     wire.state = State::Opaque;
     wire
   }
@@ -186,6 +241,7 @@ impl Http {
           Step::Rest(&[])
         }
         State::CloseDelimited => self.step_close(rest, &mut out, &mut hits).await,
+        State::MintBody => self.step_mint(rest, &mut out, &mut hits),
       };
       match step {
         Step::Rest(remaining) => rest = remaining,
@@ -213,6 +269,11 @@ impl Http {
     self.head_buf.extend_from_slice(&rest[..take]);
     let rest = &rest[take..];
     if let Some(end) = find_header_boundary(&self.head_buf) {
+      // A new message starts: pairs minted since the last message (on this
+      // or any connection) go live now.
+      if self.mint.is_some() {
+        self.refresh_minted_pairs();
+      }
       let mut owned = std::mem::take(&mut self.head_buf);
       let mut combined = owned.split_off(end);
       let (head_out, head_hits) = self.process_head(owned).await;
@@ -565,6 +626,79 @@ impl Http {
     Step::Rest(&[])
   }
 
+  /// Mint-body state: accumulate the token response, then mint. The head is
+  /// held in `mint_head`; both emit together once the body is complete so
+  /// `Content-Length` can tell the truth about the decoyed body.
+  fn step_mint<'r>(&mut self, rest: &'r [u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Step<'r> {
+    let Some(remaining) = self.mint_remaining else {
+      // Chunked: accumulate raw framing bytes until the terminator.
+      self.mint_body.extend_from_slice(rest);
+      if self.mint_body.len() > MAX_MINT_BODY + 4096 {
+        self.must_close = true;
+        return Step::Rest(&[]);
+      }
+      if find_chunked_terminator(&self.mint_body) {
+        let head = std::mem::take(&mut self.mint_head);
+        let body = std::mem::take(&mut self.mint_body);
+        let (emitted, mint_hits) = self.finish_mint_chunked(&head, &body);
+        hits.extend(mint_hits);
+        out.extend_from_slice(&emitted);
+        self.state = State::Head;
+      }
+      return Step::Rest(&[]);
+    };
+    let take = remaining.min(rest.len());
+    self.mint_body.extend_from_slice(&rest[..take]);
+    self.mint_remaining = Some(remaining - take);
+    let rest = &rest[take..];
+    if self.mint_remaining == Some(0) {
+      self.mint_remaining = None;
+      let head = std::mem::take(&mut self.mint_head);
+      let body = std::mem::take(&mut self.mint_body);
+      let (emitted, mint_hits) = self.finish_mint_fixed(&head, &body);
+      hits.extend(mint_hits);
+      out.extend_from_slice(&emitted);
+      self.state = State::Head;
+    }
+    Step::Rest(rest)
+  }
+
+  /// Mint the buffered fixed-length body, rewrite the head's
+  /// `Content-Length`, and emit head + body.
+  fn finish_mint_fixed(&mut self, head: &[u8], body: &[u8]) -> (Vec<u8>, Vec<Hit>) {
+    let (body, hits) = self.mint_and_redact(body);
+    let mut out = rewrite_content_length(head, body.len());
+    out.extend_from_slice(&body);
+    (out, hits)
+  }
+
+  /// De-chunk the buffered body, mint, re-emit as a single chunk plus the
+  /// terminator. The terminator was validated by [`find_chunked_terminator`].
+  fn finish_mint_chunked(&mut self, head: &[u8], body: &[u8]) -> (Vec<u8>, Vec<Hit>) {
+    let Some(payload) = dechunk(body) else {
+      // Framing violated after all: fail closed rather than emit a lie.
+      self.must_close = true;
+      return (Vec::new(), Vec::new());
+    };
+    let (payload, hits) = self.mint_and_redact(&payload);
+    let mut out = head.to_vec();
+    out.extend_from_slice(format!("{:X}\r\n", payload.len()).as_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(b"\r\n0\r\n\r\n");
+    (out, hits)
+  }
+
+  /// Mint + redact through the shared body walk; when the plan or handle
+  /// went missing mid-stream the pair redaction still applies.
+  fn mint_and_redact(&mut self, body: &[u8]) -> (Vec<u8>, Vec<Hit>) {
+    if let (Some(plan), Some(mint)) = (&self.mint_plan, &self.mint) {
+      mint_and_redact(plan, mint, body, &self.pairs)
+    } else {
+      let (redacted, hits) = replace_in(body, &self.pairs, Location::Body);
+      (redacted.into_owned(), hits)
+    }
+  }
+
   /// Substitute a complete head block (ending exactly at the boundary) and
   /// set the body state. Returns the head bytes to emit plus hits.
   /// Stage order: value swap first (stage 0), then the plugin hook on the
@@ -644,6 +778,29 @@ impl Http {
     content_swapped: bool,
     status: Option<u16>,
   ) -> (Vec<u8>, Vec<Hit>) {
+    // Flow-granted token responses buffer whole for minting, on the
+    // framings that carry a decodable body. Compressed bodies are opaque
+    // to us: fall through to today's scan-only behavior. This is the one
+    // deliberate exception to "the head is always emitted immediately":
+    // minting rewrites `Content-Length`, so head and body emit together.
+    let mint_fixed = matches!(framing, Framing::Fixed { len } if len <= MAX_MINT_BODY);
+    let mint_chunked = matches!(framing, Framing::Chunked);
+    if self.dir == Direction::Upstream
+      && self.mint.is_some()
+      && self.mint_plan.is_some()
+      && !content_swapped
+      && (mint_fixed || mint_chunked)
+    {
+      if let Framing::Fixed { len } = framing {
+        self.mint_remaining = Some(len);
+      } else {
+        self.mint_remaining = None;
+      }
+      self.mint_head = new_head;
+      self.mint_body.clear();
+      self.state = State::MintBody;
+      return (Vec::new(), hits);
+    }
     match framing {
       Framing::Broken => {
         self.state = State::Opaque;
@@ -755,6 +912,31 @@ impl Http {
         out.extend_from_slice(std::mem::take(&mut self.trailer_buf).as_slice());
         if let Some((_, region)) = self.swap_region(&[], true, &mut hits).await {
           out.extend_from_slice(&region);
+        }
+      }
+      State::MintBody => {
+        // EOF mid-token-response: mint what arrived. A truncated body
+        // emits with its true rewritten length; the connection is
+        // closing, so the framing lie does not outlive it.
+        let head = std::mem::take(&mut self.mint_head);
+        let body = std::mem::take(&mut self.mint_body);
+        if self.mint_remaining.is_some() {
+          self.must_close = true;
+          let (emitted, mint_hits) = self.mint_and_redact(&body);
+          hits.extend(mint_hits);
+          let mut all = rewrite_content_length(&head, emitted.len());
+          all.extend_from_slice(&emitted);
+          out.extend_from_slice(&all);
+        } else if let Some(payload) = dechunk(&body) {
+          let (emitted, mint_hits) = self.mint_and_redact(&payload);
+          hits.extend(mint_hits);
+          let mut all = head;
+          all.extend_from_slice(format!("{:X}\r\n", emitted.len()).as_bytes());
+          all.extend_from_slice(&emitted);
+          out.extend_from_slice(&all);
+        } else {
+          self.must_close = true;
+          out.extend_from_slice(&body);
         }
       }
       _ => {}
@@ -1010,6 +1192,70 @@ fn find_header_boundary(data: &[u8]) -> Option<usize> {
   data.windows(4).position(|w| w == b"\r\n\r\n").map(|pos| pos + 4)
 }
 
+/// Rewrite (or append) `Content-Length` in a response head to the minted
+/// body's true length. The head ends exactly at the `\r\n\r\n` boundary.
+fn rewrite_content_length(head: &[u8], len: usize) -> Vec<u8> {
+  use std::fmt::Write as _;
+
+  let boundary = find_header_boundary(head).unwrap_or(head.len());
+  let (head_end, _) = head.split_at(boundary);
+  let text = String::from_utf8_lossy(head_end);
+  let mut replaced = false;
+  let mut out = String::with_capacity(head_end.len());
+  for (i, line) in text.split("\r\n").enumerate() {
+    if i > 0 {
+      out.push_str("\r\n");
+    }
+    if line
+      .split_once(':')
+      .is_some_and(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+      let _ = write!(out, "Content-Length: {len}");
+      replaced = true;
+    } else {
+      out.push_str(line);
+    }
+  }
+  if !replaced {
+    // No Content-Length to rewrite: the mint path is only entered from a
+    // Fixed framing, which requires one. Defensive: re-add it.
+    let insert = out.len() - 2;
+    let line = format!("Content-Length: {len}\r\n");
+    out.insert_str(insert, &line);
+  }
+  out.into_bytes()
+}
+
+/// True when a buffered chunked body reaches its terminator (`0\r\n\r\n`).
+/// A payload byte sequence that mimics the terminator makes `dechunk`
+/// fail validation and fail closed, so an early match is safe.
+fn find_chunked_terminator(data: &[u8]) -> bool {
+  const NEEDLE_A: &[u8] = b"\r\n0\r\n\r\n";
+  const NEEDLE_B: &[u8] = b"0\r\n\r\n";
+  data.windows(NEEDLE_A.len()).any(|w| w == NEEDLE_A) || data.starts_with(NEEDLE_B)
+}
+
+/// Decode a complete buffered chunked body to its payload.
+/// Returns `None` on any framing violation.
+fn dechunk(data: &[u8]) -> Option<Vec<u8>> {
+  let mut out = Vec::new();
+  let mut rest = data;
+  loop {
+    let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+    let size_line = &rest[..line_end];
+    let size = parse_chunk_size(size_line)?;
+    rest = &rest[line_end + 2..];
+    if size == 0 {
+      return Some(out);
+    }
+    if rest.len() < size + 2 {
+      return None;
+    }
+    out.extend_from_slice(&rest[..size]);
+    rest = &rest[size + 2..];
+  }
+}
+
 /// Build the owned plugin head from a swapped parse: request carries method
 /// plus the request-target token, responses carry the status code.
 fn plugin_head_from_parsed(parsed: &ParsedHead<'_>, dir: Direction) -> PluginHead {
@@ -1221,15 +1467,51 @@ mod tests {
         value: secrecy::SecretString::from(VALUE),
       },
       allow: vec!["https://api.github.com".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
     }]
   }
 
   fn req_machine() -> Http {
-    Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None)
+    Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None, None)
   }
 
   fn resp_machine() -> Http {
-    Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None)
+    Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None, None)
+  }
+
+  /// A flow-granted endpoint: the grant matches `auth.example.com` and
+  /// declares a client-credentials flow.
+  fn flow_grants() -> Vec<Grant> {
+    vec![Grant::Token {
+      credential: Credential {
+        label: "issuer".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec!["https://auth.example.com".parse().unwrap()],
+      pattern: None,
+      oauth2: Some(hodor_config::registry::OAuthFlow {
+        flow: hodor_config::registry::FlowKind::ClientCredentials,
+        token_url: "https://auth.example.com/oauth/token".into(),
+        authorize_url: None,
+        refresh_url: None,
+        rotates_refresh: false,
+        token_fields: Vec::new(),
+      }),
+    }]
+  }
+
+  fn mint_machine(store: std::sync::Arc<crate::mint::MintStore>) -> Http {
+    Http::new(
+      &flow_grants(),
+      Scheme::Https,
+      "auth.example.com",
+      443,
+      Direction::Upstream,
+      None,
+      Some(crate::mint::MintHandle::new(store)),
+    )
   }
 
   #[tokio::test]
@@ -1338,6 +1620,8 @@ mod tests {
         value: secrecy::SecretString::from("short"),
       },
       allow: vec!["https://api.github.com".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
     }];
     let mut machine = Http::new(
       &short_value_grants,
@@ -1345,6 +1629,7 @@ mod tests {
       "api.github.com",
       443,
       Direction::Downstream,
+      None,
       None,
     );
     let body = "x=LONGFAKEVALUE";
@@ -1626,7 +1911,7 @@ mod tests {
 
   #[tokio::test]
   async fn close_delimited_without_pairs_streams_zero_copy() {
-    let mut resp = Http::new(&[], Scheme::Https, "api.github.com", 443, Direction::Upstream, None);
+    let mut resp = Http::new(&[], Scheme::Https, "api.github.com", 443, Direction::Upstream, None, None);
     let _ = resp.substitute(b"HTTP/1.1 200 OK\r\n\r\n").await;
     assert!(matches!(resp.state, State::Opaque), "{:?}", resp.state);
     let (out, hits) = resp.substitute(b"body-bytes").await;
@@ -1747,6 +2032,7 @@ mod tests {
       443,
       Direction::Downstream,
       Some(Box::new(hook)),
+      None,
     )
   }
 
@@ -1857,5 +2143,145 @@ mod tests {
     let (out, _) = opaque.substitute(b"unframable-bytes").await;
     assert_eq!(out.as_ref(), b"unframable-bytes");
     assert!(opaque.must_close());
+  }
+
+  #[tokio::test]
+  async fn token_response_mints_decoy_and_rewrites_length() {
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let body = r#"{"access_token":"real-token-value","token_type":"Bearer","expires_in":3600}"#;
+    let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    let (out, hits) = resp.substitute(input.as_bytes()).await;
+    let out = String::from_utf8(out.into_owned()).unwrap();
+    assert!(!out.contains("real-token-value"), "{out}");
+    assert!(out.contains("access_token"), "{out}");
+    let decoy = store.snapshot_pairs()[0].0.clone();
+    assert!(out.contains(&decoy), "{out}");
+    // Content-Length rewritten to the decoyed body's true length.
+    let minted_body = out.split("\r\n\r\n").nth(1).unwrap();
+    assert!(out.contains(&format!("Content-Length: {}", minted_body.len())), "{out}");
+    assert_eq!(
+      hits,
+      vec![Hit {
+        label: "issuer".into(),
+        location: Location::Body
+      }]
+    );
+  }
+
+  #[tokio::test]
+  async fn minted_decoy_substitutes_on_a_later_connection() {
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let body = r#"{"access_token":"real-token-value","token_type":"Bearer"}"#;
+    let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    resp.substitute(input.as_bytes()).await;
+    let decoy = store.snapshot_pairs()[0].0.clone();
+    // A fresh request machine on a new connection unions the minted pair.
+    let mut req = Http::new(
+      &flow_grants(),
+      Scheme::Https,
+      "auth.example.com",
+      443,
+      Direction::Downstream,
+      None,
+      Some(crate::mint::MintHandle::new(std::sync::Arc::clone(&store))),
+    );
+    let input = format!("GET /x HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer {decoy}\r\n\r\n");
+    let (out, hits) = req.substitute(input.as_bytes()).await;
+    let out = String::from_utf8(out.into_owned()).unwrap();
+    assert!(out.contains("real-token-value"), "{out}");
+    assert!(!out.contains(&decoy), "{out}");
+    assert_eq!(
+      hits,
+      vec![Hit {
+        label: "issuer".into(),
+        location: Location::Header
+      }]
+    );
+  }
+
+  #[tokio::test]
+  async fn keepalive_request_sees_fresh_mint_at_next_head() {
+    // The request machine is constructed before anything mints; the decoy
+    // minted on the response leg must go live at the next request head.
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let body = r#"{"access_token":"real-token-value"}"#;
+    let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    resp.substitute(input.as_bytes()).await;
+    let decoy = store.snapshot_pairs()[0].0.clone();
+    let mut req = Http::new(
+      &flow_grants(),
+      Scheme::Https,
+      "auth.example.com",
+      443,
+      Direction::Downstream,
+      None,
+      Some(crate::mint::MintHandle::new(std::sync::Arc::clone(&store))),
+    );
+    let first = "GET /a HTTP/1.1\r\nHost: a\r\n\r\n";
+    let _ = req.substitute(first.as_bytes()).await;
+    let second = format!("GET /b HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer {decoy}\r\n\r\n");
+    let (out, hits) = req.substitute(second.as_bytes()).await;
+    let out = String::from_utf8(out.into_owned()).unwrap();
+    assert!(out.contains("real-token-value"), "{out}");
+    assert!(!out.contains(&decoy), "{out}");
+    assert!(hits.iter().any(|hit| hit.location == Location::Header));
+  }
+
+  #[tokio::test]
+  async fn chunked_token_response_mints_and_rechunks() {
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let input = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n23\r\n{\"access_token\":\"real-token-value\"}\r\n0\r\n\r\n";
+    let (out, _hits) = resp.substitute(input.as_bytes()).await;
+    let out = String::from_utf8(out.into_owned()).unwrap();
+    assert!(!out.contains("real-token-value"), "{out}");
+    let decoy = store.snapshot_pairs()[0].0.clone();
+    assert!(out.contains(&decoy), "{out}");
+    assert!(out.contains("0\r\n\r\n"), "{out}");
+  }
+
+  #[tokio::test]
+  async fn non_json_token_response_passes_through() {
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let body = "not json at all";
+    let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    let (out, hits) = resp.substitute(input.as_bytes()).await;
+    let out = String::from_utf8(out.into_owned()).unwrap();
+    assert_eq!(out, input, "unparseable body is untouched");
+    assert!(hits.is_empty());
+    assert!(store.snapshot_pairs().is_empty());
+  }
+
+  #[tokio::test]
+  async fn rotation_mints_a_pair_per_value() {
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut grants = flow_grants();
+    let Grant::Token { oauth2: Some(flow), .. } = &mut grants[0] else {
+      panic!("a flow grant");
+    };
+    flow.rotates_refresh = true;
+    let mut resp = Http::new(
+      &grants,
+      Scheme::Https,
+      "auth.example.com",
+      443,
+      Direction::Upstream,
+      None,
+      Some(crate::mint::MintHandle::new(std::sync::Arc::clone(&store))),
+    );
+    let first = r#"{"access_token":"token-one","refresh_token":"refresh-one"}"#;
+    let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{first}", first.len());
+    resp.substitute(input.as_bytes()).await;
+    let second = r#"{"access_token":"token-two","refresh_token":"refresh-two"}"#;
+    let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{second}", second.len());
+    let (out, _hits) = resp.substitute(input.as_bytes()).await;
+    let out = String::from_utf8(out.into_owned()).unwrap();
+    assert!(!out.contains("token-two"), "{out}");
+    assert!(!out.contains("refresh-two"), "{out}");
+    assert_eq!(store.snapshot_pairs().len(), 4, "one pair per minted value");
   }
 }

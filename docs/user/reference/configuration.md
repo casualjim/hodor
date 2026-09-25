@@ -29,12 +29,32 @@ A rule wires an environment name to the hosts it may reach, the decoy shape the 
 | `env` | yes | Environment variable name. Seeds the decoy, keys the registry lookup, and defaults the fnox key. |
 | `value` | no | Inline real secret value. Wins over fnox. Never serialized. |
 | `fnox_key` | no | fnox secret name. Defaults to `env`. |
-| `allow` | no | List of `scheme://host[:port]` allow entries. Unions with the hosts the registry supplies. |
+| `allow` | no | List of `scheme://host[:port]` allow entries. Unions with the hosts the registry supplies. See [allow entries](allow-entries.md) for the grammar and host forms. |
 | `pattern` | no | Decoy pattern, overriding the registry. |
+| `oauth2` | no | An OAuth2 flow block overriding the registry's: declares a token issuer whose freshly issued tokens get minted as decoys. See [the registry reference](registry.md). |
 | `registry` | no | Whether this rule uses registry hosts. Default `true`; `false` keeps only `allow`. |
 | `if_missing` | no | `error` (default), `warn`, or `ignore`. Governs a value or hosts the rule cannot resolve. |
 
 `env = "GITHUB_TOKEN"` alone is a complete rule when the registry knows the name: registry supplies hosts and shape, fnox supplies the value.
+
+The registry knows public API hosts, so services it cannot bundle need explicit `allow` entries. A self-hosted or internal TLS host:
+
+```toml
+[rules.internal-api]
+env = "INTERNAL_API_TOKEN"
+pattern = "internal_{hex:32}"
+allow = ["https://api.internal.corp"]
+```
+
+A raw TCP service such as Postgres. There is no SNI on a raw TCP connection, so the entry names the literal dialled address and port; substitution is equal-length byte swap only:
+
+```toml
+[rules.db]
+env = "PGPASSWORD"
+allow = ["tcp://10.0.0.8:5432"]
+```
+
+A `tcp://` entry has no framing to rewrite, so the substitution is equal-length only, and hodor satisfies that by construction: the decoy for a rule with a `tcp://` entry is generated at the real value's length, falling back from the registry shape only when the shape renders another length. See [capture traffic transparently](../how-to/capture-traffic-transparently.md) for the capture side.
 
 ## `[workspace]`
 

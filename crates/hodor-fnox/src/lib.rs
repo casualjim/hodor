@@ -311,6 +311,20 @@ pub async fn resolve(config: &mut hodor_config::config::AppConfig, registry: &Re
     }
     // Unioned once here so `grants::resolve` sees the final list.
     rule.allow = hosts;
+    if rule.oauth2.is_none() {
+      rule.oauth2 = registry.flow_for(rule);
+    }
+    if let Some(flow) = &rule.oauth2 {
+      for url in [&Some(flow.token_url.clone()), &flow.authorize_url, &flow.refresh_url]
+        .into_iter()
+        .flatten()
+      {
+        let authority = hodor_config::registry::authority_of(url)?;
+        if !rule.allow.contains(&authority) {
+          rule.allow.push(authority);
+        }
+      }
+    }
     rule.pattern = rule.pattern.take().filter(|pattern| !pattern.is_empty());
     if rule.pattern.is_none() {
       rule.pattern = Some(registry.template(&rule.env, None).into_owned());
@@ -357,6 +371,31 @@ mod tests {
     assert!(allow.contains(&"https://api.github.com".to_string()));
     assert!(allow.contains(&"https://ghe.corp.example".to_string()));
     assert_eq!(allow.len(), 4);
+  }
+
+  #[tokio::test]
+  async fn resolve_unions_flow_authorities_into_allow() {
+    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let mut rule = rule("GITHUB_TOKEN");
+    rule.oauth2 = Some(hodor_config::registry::OAuthFlow {
+      flow: hodor_config::registry::FlowKind::ClientCredentials,
+      token_url: "https://auth.example.com/oauth/token".into(),
+      authorize_url: None,
+      refresh_url: None,
+      rotates_refresh: false,
+      token_fields: Vec::new(),
+    });
+    let mut config = config_with("gh", rule);
+    resolve(&mut config, &registry, None).await.unwrap();
+    let allow = &config.rules["gh"].allow;
+    assert!(
+      allow.contains(&"https://auth.example.com".to_string()),
+      "token_url authority must be unioned, got {allow:?}"
+    );
+    assert!(
+      !allow.iter().any(|entry| entry.contains("/oauth/token")),
+      "full URLs must be reduced to authority-only, got {allow:?}"
+    );
   }
   #[tokio::test]
   async fn resolve_registry_false_keeps_only_explicit_hosts() {
@@ -427,6 +466,7 @@ mod tests {
       fnox_key: None,
       allow: Vec::new(),
       pattern: None,
+      oauth2: None,
       registry: None,
       if_missing: hodor_config::config::IfMissing::Error,
       tls: std::collections::BTreeMap::new(),

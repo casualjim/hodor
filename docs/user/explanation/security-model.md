@@ -8,7 +8,25 @@ A credential that leaves the workload is the decoy. The workload holds only a fo
 
 - **Exfiltration to a third party.** A prompt-injected tool, a curious dependency, or a log sink receives the decoy. Any host outside the allow entries gets the decoy and rejects it. The real value never travels there.
 - **Leaked environment or config.** A container dump, a screenshot, a paste of `env`: all carry decoys, which are deterministic and safe to commit.
+- **The token-issuance path.** When a rule's registry entry declares an OAuth2 flow, freshly issued tokens never reach the workload: the proxy rewrites the token response, the workload holds a minted decoy, and later requests swap it back. Rotating refresh tokens get one decoy per issued value.
 - **The response path.** hodor redacts real values back to decoys in responses, so even output from a granted host shows the client the fake.
+
+## Runtime token minting
+
+Static decoys are seeded on the env name; minted decoys are seeded on the real token value and render from the same registry pattern, so a minted decoy has the same shape as every other decoy. Minted pairs live in the proxy's memory for the process lifetime and are shared across connections, because agents reuse tokens across connections.
+
+The trigger is a grant plus a declared flow, never shape alone: a JSON body on an ungranted host that happens to contain `access_token` is untouched. On a flow-granted endpoint, a token response that cannot be parsed as a flat JSON object passes through unchanged; the proxy mints only what it can positively identify. A token body larger than the internal cap, or a chunked body whose framing does not validate, fails closed: the connection drops rather than forward a real token. Compressed token responses are opaque to the proxy and pass through; a vendor that compresses token responses reduces coverage, not safety.
+
+The proxy translates and never participates in the protocol: it does not initiate refreshes, hold expiry timers, or schedule token acquisition. What the agent does, the proxy observes and translates.
+
+### Edges you accept
+
+| Edge | Consequence |
+| --- | --- |
+| Proxy restart | Minted decoys are memory-only. A restarted proxy does not know the decoys the agent still holds; the next request sends an unknown decoy, the upstream rejects it, and the agent re-authenticates. |
+| Authorization-code browser leg | Covered when the agent drives a headless browser through the proxy (the redirect `code` is minted like a token). A human logging in interactively on their own machine is outside the model. |
+| Compressed token responses | Not rewritten (opaque to the proxy). Coverage gap, not a leak direction. |
+| Mint-failure passthrough | A body that is JSON but unparseable, or a mint error, passes through with the field it could not mint. Rare and logged. |
 
 The grant list is the blast radius. `https://api.anthropic.com` means the real key reaches exactly that authority (any path on it, see below) and nowhere else.
 

@@ -67,6 +67,8 @@ hodor fake GITHUB_TOKEN    # the value the workload holds
 
 `env = "GITHUB_TOKEN"` alone is a complete rule when the bundled known-host registry knows the name: the registry supplies the hosts and the decoy shape, and [fnox](https://fnox.jdx.dev) supplies the real value at serve time (age, 1Password, Vault, Bitwarden, AWS Secrets Manager, the OS keychain, and the rest of its provider catalog; no fnox binary needed).
 
+When the registry entry declares the service's OAuth2 flow, freshly issued tokens are covered too: the proxy rewrites the token endpoint's response so the agent holds a minted decoy, and swaps it back on every later request. `hodor registry from-oidc` / `from-openapi` turn a vendor's discovery or OpenAPI document into that entry.
+
 ## Documentation
 
 Everything lives under [docs/user](docs/user/README.md), arranged by what you need:

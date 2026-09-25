@@ -10,8 +10,8 @@ use hodor_config::grants::{Grant, Scheme};
 use hodor_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Verdict};
 
 use super::{
-  CredentialPair, Direction, Hit, Location, Rewritten, Wire, eligible_pairs, max_tail_size, needle_safe_emit_len, replace_bytes,
-  replace_in, response_has_no_body, scan_with_tail,
+  CredentialPair, Direction, Hit, Location, MAX_MINT_BODY, MintPlan, Rewritten, Wire, eligible_pairs, max_tail_size, mint_and_redact,
+  mint_plan_for, minted_pairs, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
 };
 
 /// HTTP/2 connection preface.
@@ -115,6 +115,16 @@ pub(crate) struct H2 {
   suppress_body: usize,
   /// Fail-closed latch: a scan-only path hit a needle it could not rewrite.
   must_close: bool,
+  /// Static grant pairs from construction; `pairs` rebuilds from these
+  /// whenever minted pairs refresh.
+  static_pairs: Vec<CredentialPair>,
+  /// Runtime mint handle; `None` keeps value-swap-only behavior.
+  mint: Option<crate::mint::MintHandle>,
+  /// Response side: the flow-granted grant's expectations, when this
+  /// endpoint is a token issuer and this machine mints.
+  mint_plan: Option<MintPlan>,
+  /// Response side: streams buffering a whole token-response body.
+  mint_streams: HashMap<u32, Vec<u8>>,
 }
 
 impl H2 {
@@ -122,11 +132,22 @@ impl H2 {
   /// direction consumes the H2 connection preface; upstream starts at
   /// frames.
   #[must_use]
-  pub fn new(grants: &[Grant], scheme: Scheme, host: &str, port: u16, dir: Direction, hook: Option<Box<dyn RewriteHook>>) -> Self {
-    let pairs = eligible_pairs(grants, scheme, host, port, dir);
-    let tail_size = max_tail_size(&pairs);
-    Self {
-      pairs,
+  pub fn new(
+    grants: &[Grant],
+    scheme: Scheme,
+    host: &str,
+    port: u16,
+    dir: Direction,
+    hook: Option<Box<dyn RewriteHook>>,
+    mint: Option<crate::mint::MintHandle>,
+  ) -> Self {
+    let static_pairs = eligible_pairs(grants, scheme, host, port, dir);
+    let tail_size = max_tail_size(&static_pairs);
+    let mint_plan = (dir == Direction::Upstream)
+      .then(|| mint_plan_for(grants, scheme, host, port))
+      .flatten();
+    let mut wire = Self {
+      pairs: static_pairs.clone(),
       dir,
       hook,
       decoder: Decoder::default(),
@@ -145,7 +166,35 @@ impl H2 {
       head_requests: 0,
       suppress_body: 0,
       must_close: false,
+      static_pairs,
+      mint,
+      mint_plan,
+      mint_streams: HashMap::new(),
+    };
+    // Both directions union the minted decoys at construction, so a decoy
+    // minted on any connection substitutes or redacts on this one too.
+    wire.refresh_minted_pairs();
+    wire
+  }
+
+  /// Rebuild the active pair set: static grants plus every minted decoy.
+  /// Called at construction and at each finished HEADERS block, so pairs
+  /// minted mid-connection go live immediately.
+  fn refresh_minted_pairs(&mut self) {
+    if self.mint.is_none() {
+      return;
     }
+    let mut pairs = self.static_pairs.clone();
+    if let Some(mint) = &self.mint {
+      pairs.extend(minted_pairs(mint, self.dir));
+    }
+    self.tail_size = max_tail_size(&pairs);
+    self.pairs = pairs;
+  }
+
+  /// True when response DATA on this connection buffers whole for minting.
+  fn mint_active(&self) -> bool {
+    self.dir == Direction::Upstream && self.mint.is_some() && self.mint_plan.is_some()
   }
 
   /// Process one chunk. Inherent implementation of the [`Wire`] protocol;
@@ -173,6 +222,19 @@ impl H2 {
         while offset < new_held.len() {
           let take = (new_held.len() - offset).min(0xff_ffff);
           append_frame(&mut out, F_DATA, 0, stream_id, &new_held[offset..offset + take]);
+          offset += take;
+        }
+      }
+      // Flush mint-buffered streams the same way: mint what arrived, emit
+      // as DATA frames. The connection is closing; unframed remainder is
+      // already the EOF convention above.
+      for (stream_id, body) in std::mem::take(&mut self.mint_streams) {
+        let (new_body, mut mh) = self.mint_body(&body);
+        held_hits.append(&mut mh);
+        let mut offset = 0;
+        while offset < new_body.len() {
+          let take = (new_body.len() - offset).min(0xff_ffff);
+          append_frame(&mut out, F_DATA, 0, stream_id, &new_body[offset..offset + take]);
           offset += take;
         }
       }
@@ -261,6 +323,7 @@ impl H2 {
         }
         self.open_streams.remove(&stream_id);
         self.data_tails.remove(&stream_id);
+        self.mint_streams.remove(&stream_id);
         Ok(Cow::Borrowed(raw))
       }
       // PUSH_PROMISE carries an HPACK block that mutates the dynamic table;
@@ -332,6 +395,9 @@ impl H2 {
       return Err(raw.to_vec());
     }
     let data = data_payload(flags, payload).ok_or_else(|| raw.to_vec())?;
+    if self.mint_active() {
+      return Ok(self.mint_data_frame(stream_id, flags, data, hits));
+    }
     let end_stream = flags & FLAG_END_STREAM != 0;
     // Prepend the hold-back so cross-frame split secrets substitute whole;
     // hold the overlap window for the next frame (bounded by tail_size).
@@ -384,6 +450,48 @@ impl H2 {
     Ok(frame)
   }
 
+  /// Mint-active response DATA: buffer the stream's payload whole, then
+  /// mint and re-emit as one frame at `END_STREAM`. The JSON rewrite needs
+  /// the complete body, and H2 re-frames freely, so nothing streams.
+  fn mint_data_frame(&mut self, stream_id: u32, flags: u8, data: &[u8], hits: &mut Vec<Hit>) -> Vec<u8> {
+    let end_stream = flags & FLAG_END_STREAM != 0;
+    let buf = self.mint_streams.entry(stream_id).or_default();
+    buf.extend_from_slice(data);
+    if buf.len() > MAX_MINT_BODY {
+      self.must_close = true;
+      self.mint_streams.remove(&stream_id);
+      self.open_streams.remove(&stream_id);
+      return Vec::new();
+    }
+    if !end_stream {
+      return Vec::new();
+    }
+    let body = self.mint_streams.remove(&stream_id).unwrap_or_default();
+    self.open_streams.remove(&stream_id);
+    let (new_body, mut body_hits) = self.mint_body(&body);
+    hits.append(&mut body_hits);
+    if new_body.len() > 0xff_ffff {
+      // The minted body cannot fit one 24-bit length field: fail closed
+      // rather than split what the JSON rewrite produced.
+      self.must_close = true;
+      return Vec::new();
+    }
+    let mut frame = Vec::with_capacity(9 + new_body.len());
+    append_frame(&mut frame, F_DATA, FLAG_END_STREAM, stream_id, &new_body);
+    frame
+  }
+
+  /// Mint + redact through the shared body walk; when the plan or handle
+  /// went missing mid-stream the pair redaction still applies.
+  fn mint_body(&mut self, body: &[u8]) -> (Vec<u8>, Vec<Hit>) {
+    if let (Some(plan), Some(mint)) = (&self.mint_plan, &self.mint) {
+      mint_and_redact(plan, mint, body, &self.pairs)
+    } else {
+      let (redacted, hits) = replace_in(body, &self.pairs, Location::Body);
+      (redacted.into_owned(), hits)
+    }
+  }
+
   async fn finish_block(&mut self, block: H2Block, hits: &mut Vec<Hit>) -> Result<Vec<u8>, Vec<u8>> {
     let mut frag = block.fragments;
     let mut headers: Vec<(Vec<u8>, Vec<u8>, u8)> = Vec::new();
@@ -392,6 +500,11 @@ impl H2 {
     }
     if headers.len() > H2_MAX_FIELDS {
       return Err(block.raw);
+    }
+    // A finished HEADERS block starts a message: pairs minted since the
+    // last block (on this or any connection) go live now.
+    if self.mint.is_some() {
+      self.refresh_minted_pairs();
     }
     substitute_h2_values(&mut headers, &self.pairs, hits);
     if let Some(hook) = self.hook.as_mut() {
@@ -464,6 +577,19 @@ impl H2 {
     }
     let mut out = Vec::new();
     if block.end_stream {
+      // A mint-buffered stream ended by trailers: mint and emit the whole
+      // body as a final DATA frame before the trailer block.
+      if let Some(body) = self.mint_streams.remove(&block.stream_id) {
+        let (new_body, mut body_hits) = self.mint_body(&body);
+        hits.append(&mut body_hits);
+        if new_body.len() > 0xff_ffff {
+          self.must_close = true;
+          return Ok(Vec::new());
+        }
+        if !new_body.is_empty() {
+          append_frame(&mut out, F_DATA, 0, block.stream_id, &new_body);
+        }
+      }
       self.flush_trailer_held(block.stream_id, &mut out, hits).await;
       self.open_streams.remove(&block.stream_id);
     }
@@ -504,6 +630,12 @@ impl H2 {
     self.phase = H2Phase::Opaque;
     self.block = None;
     if self.hook.is_some() {
+      self.must_close = true;
+    }
+    // Mint-buffered bodies hold unminted real tokens: emitting them raw on
+    // the opaque path would leak. Drop and fail closed instead.
+    if !self.mint_streams.is_empty() {
+      self.mint_streams.clear();
       self.must_close = true;
     }
     let rest = std::mem::take(&mut self.buffer);
@@ -764,15 +896,51 @@ mod h2_tests {
         value: secrecy::SecretString::from(VALUE),
       },
       allow: vec!["https://api.github.com".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
+    }]
+  }
+
+  /// A flow-granted endpoint: the grant matches `auth.example.com` and
+  /// declares a client-credentials flow.
+  fn flow_grants() -> Vec<Grant> {
+    vec![Grant::Token {
+      credential: Credential {
+        label: "issuer".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      allow: vec!["https://auth.example.com".parse().unwrap()],
+      pattern: None,
+      oauth2: Some(hodor_config::registry::OAuthFlow {
+        flow: hodor_config::registry::FlowKind::ClientCredentials,
+        token_url: "https://auth.example.com/oauth/token".into(),
+        authorize_url: None,
+        refresh_url: None,
+        rotates_refresh: false,
+        token_fields: Vec::new(),
+      }),
     }]
   }
 
   fn req_machine() -> H2 {
-    H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None)
+    H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None, None)
   }
 
   fn resp_machine() -> H2 {
-    H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None)
+    H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None, None)
+  }
+
+  fn mint_resp_machine(store: std::sync::Arc<crate::mint::MintStore>) -> H2 {
+    H2::new(
+      &flow_grants(),
+      Scheme::Https,
+      "auth.example.com",
+      443,
+      Direction::Upstream,
+      None,
+      Some(crate::mint::MintHandle::new(store)),
+    )
   }
 
   fn encode_headers(fields: &[(&str, &str)]) -> Vec<u8> {
@@ -1045,6 +1213,7 @@ mod h2_tests {
       443,
       Direction::Downstream,
       Some(Box::new(hook)),
+      None,
     )
   }
 
@@ -1193,5 +1362,75 @@ mod h2_tests {
     assert!(hits.iter().any(|hit| hit.location == Location::Body));
     assert!(machine.data_tails.is_empty());
     assert!(!machine.must_close());
+  }
+
+  #[tokio::test]
+  async fn h2_token_response_mints_and_reframes() {
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut resp = mint_resp_machine(std::sync::Arc::clone(&store));
+    let block = encode_headers(&[(":status", "200")]);
+    let mut input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &block);
+    let body = r#"{"access_token":"real-token-value","token_type":"Bearer"}"#;
+    input.extend_from_slice(&frame(F_DATA, FLAG_END_STREAM, 1, body.as_bytes()));
+    let (out, hits) = resp.substitute(&input).await;
+    let out = out.into_owned();
+    let decoy = store.snapshot_pairs()[0].0.clone();
+    assert!(!out.windows(16).any(|w| w == b"real-token-value"), "real token never emitted");
+    assert!(out.windows(decoy.len()).any(|w| w == decoy.as_bytes()), "decoy emitted");
+    assert!(hits.iter().any(|hit| hit.location == Location::Body));
+    assert!(!resp.must_close());
+  }
+
+  #[tokio::test]
+  async fn h2_split_data_frames_mint_at_end_stream() {
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut resp = mint_resp_machine(std::sync::Arc::clone(&store));
+    let block = encode_headers(&[(":status", "200")]);
+    let mut input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &block);
+    let (a, b) = r#"{"access_token":"real-token-value"}"#.split_at(20);
+    input.extend_from_slice(&frame(F_DATA, 0, 1, a.as_bytes()));
+    input.extend_from_slice(&frame(F_DATA, FLAG_END_STREAM, 1, b.as_bytes()));
+    let (out, _) = resp.substitute(&input).await;
+    let out = out.into_owned();
+    assert!(!out.windows(16).any(|w| w == b"real-token-value"), "real token never emitted");
+    let decoy = store.snapshot_pairs()[0].0.clone();
+    assert!(out.windows(decoy.len()).any(|w| w == decoy.as_bytes()), "whole-body decoy emitted");
+    assert!(resp.mint_streams.is_empty());
+    assert!(!resp.must_close());
+  }
+
+  #[tokio::test]
+  async fn h2_minted_decoy_substitutes_on_a_later_request_connection() {
+    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let mut resp = mint_resp_machine(std::sync::Arc::clone(&store));
+    let block = encode_headers(&[(":status", "200")]);
+    let mut input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &block);
+    let body = r#"{"access_token":"real-token-value"}"#;
+    input.extend_from_slice(&frame(F_DATA, FLAG_END_STREAM, 1, body.as_bytes()));
+    let _ = resp.substitute(&input).await;
+    let decoy = store.snapshot_pairs()[0].0.clone();
+    // A fresh request machine on a new connection unions the minted pair.
+    let mut req = H2::new(
+      &flow_grants(),
+      Scheme::Https,
+      "auth.example.com",
+      443,
+      Direction::Downstream,
+      None,
+      Some(crate::mint::MintHandle::new(std::sync::Arc::clone(&store))),
+    );
+    let block = encode_headers(&[
+      (":method", "GET"),
+      (":path", "/x"),
+      (":authority", "auth.example.com"),
+      ("authorization", &format!("Bearer {decoy}")),
+    ]);
+    let mut input = H2_PREFACE.to_vec();
+    input.extend_from_slice(&frame(F_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &block));
+    let (out, hits) = req.substitute(&input).await;
+    let out = out.into_owned();
+    assert!(out.windows(16).any(|w| w == b"real-token-value"), "real value upstream: {out:?}");
+    assert!(!out.windows(decoy.len()).any(|w| w == decoy.as_bytes()), "decoy swapped out");
+    assert!(hits.iter().any(|hit| hit.location == Location::Header));
   }
 }

@@ -14,13 +14,68 @@ use crate::grants::EndpointScope;
 /// Bundled registry: environment names, API hosts, and token shapes.
 const BUNDLED: &str = include_str!("../../../rules/registry.toml");
 
+/// Which `OAuth2` flow a token issuer runs, per RFC 6749 and `OpenAPI`'s
+/// `securitySchemes` vocabulary. The flow decides which response bodies
+/// mint decoys and which fields are expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowKind {
+  /// Machine-to-machine: `client_credentials` grant, `access_token` only.
+  ClientCredentials,
+  /// Browser-driven: `authorization_code` grant with an authorize endpoint.
+  AuthorizationCode,
+  /// Refresh-grant exchanges against a previously issued refresh token.
+  Refresh,
+}
+
+/// One token issuer's `OAuth2` flow endpoints and expectations.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthFlow {
+  /// Which flow this entry describes.
+  pub flow: FlowKind,
+  /// Token endpoint authority, granted like `hosts`.
+  pub token_url: String,
+  /// Authorize endpoint authority (`authorization_code` only), granted like `hosts`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub authorize_url: Option<String>,
+  /// Refresh endpoint authority when it differs from `token_url`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub refresh_url: Option<String>,
+  /// The issuer rotates `refresh_token` on every refresh (RFC 6749 §6).
+  #[serde(default)]
+  pub rotates_refresh: bool,
+  /// Response body fields to mint, overriding the RFC 6749 defaults.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub token_fields: Vec<String>,
+}
+
+impl OAuthFlow {
+  /// Field names minted from token responses for this flow shape.
+  ///
+  /// `access_token` and `refresh_token` are the credentials an agent can
+  /// hold; `token_type` (`"Bearer"`) and `expires_in` (a number) are not
+  /// secrets, so they pass through untouched.
+  #[must_use]
+  pub fn fields(&self) -> Vec<&str> {
+    let mut fields = vec!["access_token"];
+    if matches!(self.flow, FlowKind::AuthorizationCode) || self.rotates_refresh {
+      fields.push("refresh_token");
+    }
+    fields
+  }
+}
+
 /// What the registry knows about one environment name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KnownHosts {
   /// Raw `scheme://host[:port]` entries, in declaration order.
   pub hosts: Vec<String>,
   /// Decoy template, if any entry supplies one.
+  /// Decoy template, if any entry supplies one.
   pub pattern: Option<String>,
+  /// `OAuth2` token-issuer flow, if any entry declares one.
+  pub oauth2: Option<OAuthFlow>,
 }
 
 /// Known hosts and decoy shapes: bundled table plus `rules.d` overrides.
@@ -75,6 +130,9 @@ struct ProviderEntry {
   /// Discard earlier layers for the keys this entry covers.
   #[serde(default)]
   replace: bool,
+  /// `OAuth2` flow this provider's token issuer runs, if any.
+  #[serde(default)]
+  oauth2: Option<OAuthFlow>,
 }
 
 /// One exact environment-name entry.
@@ -90,6 +148,9 @@ struct NameEntry {
   /// Discard earlier layers for this name.
   #[serde(default)]
   replace: bool,
+  /// `OAuth2` flow this name's token issuer runs, if any.
+  #[serde(default)]
+  oauth2: Option<OAuthFlow>,
 }
 
 impl Registry {
@@ -145,11 +206,15 @@ impl Registry {
     validate_hosts(&entry.hosts, source, "provider", provider)?;
     let pattern = entry.pattern.as_deref().filter(|pattern| !pattern.is_empty());
     validate_optional_pattern(pattern, source, "provider", provider)?;
+    if let Some(flow) = &entry.oauth2 {
+      validate_flow(flow, &source.display().to_string(), provider)?;
+    }
     for env in &entry.env {
       let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
       if entry.replace {
         slot.hosts.clear();
         slot.pattern = None;
+        slot.oauth2 = None;
       }
       for host in &entry.hosts {
         if !slot.hosts.contains(host) {
@@ -158,6 +223,9 @@ impl Registry {
       }
       if let Some(pattern) = pattern {
         slot.pattern = Some(pattern.to_string());
+      }
+      if entry.oauth2.is_some() {
+        slot.oauth2.clone_from(&entry.oauth2);
       }
     }
     if entry.replace {
@@ -186,10 +254,14 @@ impl Registry {
     validate_hosts(&entry.hosts, source, "name", env)?;
     let pattern = entry.pattern.as_deref().filter(|pattern| !pattern.is_empty());
     validate_optional_pattern(pattern, source, "name", env)?;
+    if let Some(flow) = &entry.oauth2 {
+      validate_flow(flow, &source.display().to_string(), env)?;
+    }
     let slot = self.names.entry(env.to_ascii_uppercase()).or_default();
     if entry.replace {
       slot.hosts.clear();
       slot.pattern = None;
+      slot.oauth2 = None;
     }
     for host in &entry.hosts {
       if !slot.hosts.contains(host) {
@@ -198,6 +270,9 @@ impl Registry {
     }
     if let Some(pattern) = pattern {
       slot.pattern = Some(pattern.to_string());
+    }
+    if entry.oauth2.is_some() {
+      slot.oauth2.clone_from(&entry.oauth2);
     }
     Ok(())
   }
@@ -238,6 +313,94 @@ impl Registry {
     }
     self.lookup(&rule.env).map_or(&[], |known| known.hosts.as_slice())
   }
+
+  /// `OAuth2` flow for one rule, honoring `registry = false` and a rule-level
+  /// override.
+  #[must_use]
+  pub fn flow_for(&self, rule: &RuleCfg) -> Option<OAuthFlow> {
+    if let Some(flow) = &rule.oauth2 {
+      return Some(flow.clone());
+    }
+    if rule.registry == Some(false) {
+      return None;
+    }
+    self.lookup(&rule.env).and_then(|known| known.oauth2.clone())
+  }
+}
+
+/// Validate one `OAuth2` flow block: endpoint authorities parse, and the
+/// required fields for the flow kind are present.
+///
+/// # Errors
+///
+/// Returns an error naming the rule when an endpoint URL does not parse
+/// or the flow kind lacks its required endpoint.
+pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> eyre::Result<()> {
+  for url in [&Some(flow.token_url.clone()), &flow.authorize_url, &flow.refresh_url]
+    .into_iter()
+    .flatten()
+  {
+    let authority = flow_authority(url).map_err(|err| eyre::eyre!("{source}: `{name}`: bad oauth2 url `{url}`: {err}"))?;
+    if matches!(authority, crate::grants::HostPat::Any) {
+      tracing::warn!(
+        entry = url,
+        what = format!("`{name}` oauth2"),
+        "grant matches any host; secret is exfil-risky"
+      );
+    }
+  }
+  if matches!(flow.flow, FlowKind::AuthorizationCode) && flow.authorize_url.is_none() {
+    eyre::bail!("{source}: `{name}`: `authorization_code` flow needs an `authorize_url`");
+  }
+  for field in &flow.token_fields {
+    eyre::ensure!(!field.is_empty(), "{source}: `{name}`: `token_fields` entries must not be empty");
+  }
+  let mut seen = std::collections::BTreeSet::new();
+  for field in &flow.token_fields {
+    if !seen.insert(field) {
+      eyre::bail!("{source}: `{name}`: duplicate `token_fields` entry `{field}`");
+    }
+  }
+  Ok(())
+}
+
+/// Endpoint URLs are full URLs; grants are authority-only. Parse the URL,
+/// then reduce it to its host pattern for the exfil-risk warning.
+fn flow_authority(url: &str) -> Result<crate::grants::HostPat, String> {
+  let parsed = url::Url::parse(url).map_err(|err| err.to_string())?;
+  let host = match parsed.host() {
+    Some(url::Host::Domain("*")) => crate::grants::HostPat::Any,
+    Some(url::Host::Domain(domain)) if domain.starts_with("*.") => crate::grants::HostPat::Wildcard(domain[1..].to_string()),
+    Some(url::Host::Domain(domain)) => crate::grants::HostPat::Exact(domain.to_string()),
+    Some(url::Host::Ipv4(addr)) => crate::grants::HostPat::Exact(addr.to_string()),
+    Some(url::Host::Ipv6(addr)) => crate::grants::HostPat::Exact(addr.to_string()),
+    None => return Err("empty host".to_string()),
+  };
+  Ok(host)
+}
+
+/// Reduce a full endpoint URL to the authority-only grant grammar
+/// (`scheme://host[:port]`), dropping path, query, and fragment.
+///
+/// # Errors
+///
+/// Returns an error when the URL does not parse or carries no host.
+pub fn authority_of(url: &str) -> eyre::Result<String> {
+  let parsed = url::Url::parse(url).wrap_err_with(|| format!("bad oauth2 url `{url}`"))?;
+  let host = parsed
+    .host_str()
+    .ok_or_else(|| eyre::eyre!("bad oauth2 url `{url}`: empty host"))?
+    .trim_start_matches('[')
+    .trim_end_matches(']');
+  let port = parsed.port();
+  Ok(match port {
+    Some(port) if !is_default_port(parsed.scheme(), port) => format!("{}://{host}:{port}", parsed.scheme()),
+    _ => format!("{}://{host}", parsed.scheme()),
+  })
+}
+
+fn is_default_port(scheme: &str, port: u16) -> bool {
+  matches!((scheme.to_ascii_lowercase().as_str(), port), ("http", 80) | ("https", 443))
 }
 
 /// Validate one host entry with the same grammar as `allow`.
@@ -577,5 +740,176 @@ hosts = ["https://api.example/path"]
         .hosts
         .is_empty()
     );
+  }
+  #[test]
+  fn oauth2_flow_block_parses_and_defaults_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-flow.toml",
+      r#"
+  [providers.issuer]
+  env = ["ISSUER_TOKEN"]
+  hosts = ["https://api.example.com"]
+
+  [providers.issuer.oauth2]
+  flow = "client_credentials"
+  token_url = "https://auth.example.com/oauth/token"
+  "#,
+    );
+    let registry = Registry::load(Some(dir.path())).unwrap();
+    let known = registry.lookup("ISSUER_TOKEN").expect("ISSUER_TOKEN in the loaded registry");
+    let flow = known.oauth2.as_ref().expect("flow present");
+    assert_eq!(flow.flow, FlowKind::ClientCredentials);
+    assert_eq!(flow.token_url, "https://auth.example.com/oauth/token");
+    assert_eq!(flow.fields(), vec!["access_token"]);
+  }
+
+  #[test]
+  fn oauth2_fields_follow_flow_shape_and_rotation() {
+    let mut flow = OAuthFlow {
+      flow: FlowKind::AuthorizationCode,
+      token_url: "https://auth.example.com/oauth/token".into(),
+      authorize_url: Some("https://auth.example.com/authorize".into()),
+      refresh_url: None,
+      rotates_refresh: false,
+      token_fields: Vec::new(),
+    };
+    assert_eq!(flow.fields(), vec!["access_token", "refresh_token"]);
+    flow.flow = FlowKind::ClientCredentials;
+    flow.rotates_refresh = true;
+    assert_eq!(flow.fields(), vec!["access_token", "refresh_token"]);
+    flow.rotates_refresh = false;
+    assert_eq!(flow.fields(), vec!["access_token"]);
+  }
+
+  #[test]
+  fn token_fields_override_the_defaults() {
+    let flow = OAuthFlow {
+      flow: FlowKind::Refresh,
+      token_url: "https://auth.example.com/oauth/token".into(),
+      authorize_url: None,
+      refresh_url: None,
+      rotates_refresh: false,
+      token_fields: vec!["wrapped_token".into()],
+    };
+    assert_eq!(flow.fields(), vec!["access_token"]);
+    assert_eq!(flow.token_fields, vec!["wrapped_token"]);
+  }
+
+  #[test]
+  fn rules_d_unions_the_oauth2_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-flow.toml",
+      r#"
+  [providers.issuer]
+  env = ["ISSUER_TOKEN"]
+  hosts = ["https://api.example.com"]
+
+  [providers.issuer.oauth2]
+  flow = "authorization_code"
+  token_url = "https://auth.example.com/oauth/token"
+  authorize_url = "https://auth.example.com/authorize"
+  "#,
+    );
+    let registry = Registry::load(Some(dir.path())).unwrap();
+    let known = registry.lookup("ISSUER_TOKEN").expect("ISSUER_TOKEN in the loaded registry");
+    let flow = known.oauth2.as_ref().expect("flow present");
+    assert_eq!(flow.flow, FlowKind::AuthorizationCode);
+    assert_eq!(flow.authorize_url.as_deref(), Some("https://auth.example.com/authorize"));
+  }
+
+  #[test]
+  fn replace_discards_the_oauth2_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-flow.toml",
+      r#"
+  [providers.issuer]
+  env = ["ISSUER_TOKEN"]
+  hosts = ["https://api.example.com"]
+
+  [providers.issuer.oauth2]
+  flow = "client_credentials"
+  token_url = "https://auth.example.com/oauth/token"
+  "#,
+    );
+    write_rules(
+      dir.path(),
+      "20-narrow.toml",
+      r#"
+  [providers.issuer]
+  env = ["ISSUER_TOKEN"]
+  hosts = ["https://api.example.com"]
+  replace = true
+  "#,
+    );
+    let registry = Registry::load(Some(dir.path())).unwrap();
+    let known = registry.lookup("ISSUER_TOKEN").expect("ISSUER_TOKEN in the loaded registry");
+    assert!(known.oauth2.is_none(), "replace must discard the flow");
+  }
+
+  #[test]
+  fn authorization_code_without_authorize_url_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+  [providers.bad]
+  env = ["BAD_TOKEN"]
+  hosts = ["https://api.example.com"]
+
+  [providers.bad.oauth2]
+  flow = "authorization_code"
+  token_url = "https://auth.example.com/oauth/token"
+  "#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("needs an `authorize_url`"), "{err:?}");
+  }
+
+  #[test]
+  fn bad_flow_token_url_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+  [providers.bad]
+  env = ["BAD_TOKEN"]
+  hosts = ["https://api.example.com"]
+
+  [providers.bad.oauth2]
+  flow = "client_credentials"
+  token_url = "not a url"
+"#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("bad oauth2 url"), "{err:?}");
+  }
+
+  #[test]
+  fn duplicate_and_empty_token_fields_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rules(
+      dir.path(),
+      "10-bad.toml",
+      r#"
+  [providers.bad]
+  env = ["BAD_TOKEN"]
+  hosts = ["https://api.example.com"]
+
+  [providers.bad.oauth2]
+  flow = "client_credentials"
+  token_url = "https://auth.example.com/oauth/token"
+  token_fields = ["access_token", "access_token"]
+  "#,
+    );
+    let err = Registry::load(Some(dir.path())).unwrap_err();
+    assert!(err.to_string().contains("duplicate `token_fields` entry"), "{err:?}");
   }
 }

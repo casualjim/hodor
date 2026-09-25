@@ -19,6 +19,8 @@ pub(crate) struct PairCtx<'a> {
   pub(crate) port: u16,
   /// Per-connection plugin registry.
   pub(crate) plugins: &'a hodor_plugin::Registry,
+  /// Runtime token-mint handle; `None` keeps value-swap-only behavior.
+  pub(crate) mint: Option<crate::mint::MintHandle>,
 }
 
 /// Both directions for a cleartext HTTP connection.
@@ -31,6 +33,7 @@ pub(crate) fn http_pair(ctx: &PairCtx<'_>) -> (AnyWire, AnyWire) {
       ctx.port,
       Direction::Downstream,
       ctx.plugins.select(Scheme::Http, ctx.host, ctx.port, HookDirection::Request),
+      ctx.mint.clone(),
     )),
     AnyWire::Http(Http::new(
       ctx.grants,
@@ -39,6 +42,7 @@ pub(crate) fn http_pair(ctx: &PairCtx<'_>) -> (AnyWire, AnyWire) {
       ctx.port,
       Direction::Upstream,
       ctx.plugins.select(Scheme::Http, ctx.host, ctx.port, HookDirection::Response),
+      ctx.mint.clone(),
     )),
   )
 }
@@ -53,6 +57,7 @@ pub(crate) fn https_pair(ctx: &PairCtx<'_>) -> (AnyWire, AnyWire) {
       ctx.port,
       Direction::Downstream,
       ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Request),
+      ctx.mint.clone(),
     )),
     AnyWire::Http(Http::new(
       ctx.grants,
@@ -61,6 +66,7 @@ pub(crate) fn https_pair(ctx: &PairCtx<'_>) -> (AnyWire, AnyWire) {
       ctx.port,
       Direction::Upstream,
       ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Response),
+      ctx.mint.clone(),
     )),
   )
 }
@@ -75,6 +81,7 @@ pub(crate) fn https_h2_pair(ctx: &PairCtx<'_>) -> (AnyWire, AnyWire) {
       ctx.port,
       Direction::Downstream,
       ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Request),
+      ctx.mint.clone(),
     )),
     AnyWire::H2(H2::new(
       ctx.grants,
@@ -83,6 +90,7 @@ pub(crate) fn https_h2_pair(ctx: &PairCtx<'_>) -> (AnyWire, AnyWire) {
       ctx.port,
       Direction::Upstream,
       ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Response),
+      ctx.mint.clone(),
     )),
   )
 }

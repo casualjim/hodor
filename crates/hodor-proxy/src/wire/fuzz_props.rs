@@ -32,23 +32,25 @@ fn grants() -> Vec<Grant> {
       value: secrecy::SecretString::from(VALUE),
     },
     allow: vec!["https://*".parse().expect("grant")],
+    pattern: None,
+    oauth2: None,
   }]
 }
 
 fn req_machine() -> Http {
-  Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None)
+  Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None, None)
 }
 
 fn resp_machine() -> Http {
-  Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None)
+  Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None, None)
 }
 
 fn h2_req_machine() -> H2 {
-  H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None)
+  H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None, None)
 }
 
 fn h2_resp_machine() -> H2 {
-  H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None)
+  H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None, None)
 }
 
 impl Rewritten<'_> {
@@ -253,7 +255,10 @@ proptest! {
       fake: FAKE.into(),
       value: secrecy::SecretString::from(VALUE),
       },
-      allow: vec!["tcp://*:1".parse().expect("grant")],}];
+      allow: vec!["tcp://*:1".parse().expect("grant")],
+      pattern: None,
+      oauth2: None,
+    }];
     let mut m = Raw::new(&grants, Scheme::Tcp, "h", 1, Direction::Downstream);
     let mid = FAKE.len() / 2;
     let mut data = pre.clone();

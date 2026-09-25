@@ -48,6 +48,10 @@ Generate or load the CA, print its certificate PEM to stdout, and write `ca.crt`
 
 Print `[rules.*]` blocks for the secrets this workspace can get: the intersection of fnox declarations and the known-host registry. Values resolve from fnox at serve time; the output carries env names only. Names the registry knows but states no hosts for are printed commented out; fnox declarations no registry entry covers are listed at the end.
 
+## `hodor registry from-oidc <FILE> <SLUG> <ENV>` / `hodor registry from-openapi <FILE> <SLUG> <ENV>`
+
+Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document. `from-oidc` maps `token_endpoint` and `grant_types_supported`; `from-openapi` maps every `type: oauth2` security scheme and reports `openIdConnect` schemes as skipped. Both print a complete `[providers.<slug>]` TOML fragment to stdout for review and placement in `rules.d`; they never fetch, never write files, and never touch the bundled table. See [the registry reference](registry.md).
+
 ## `hodor init [--backend <BACKEND>] [WORKSPACE]`
 
 Generate the workspace stack as editable files: `[rules.*]` blocks in `<workspace>/.config/hodor.toml` when the workspace has none, the CA and the agent entrypoint when they are missing, and `<state-dir>/hodor/ws/<slug>/compose.yml`. Nothing existing is overwritten; the stack is regenerated when the workspace config changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.

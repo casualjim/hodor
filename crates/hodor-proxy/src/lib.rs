@@ -33,6 +33,7 @@ pub(crate) use relay::relay_guarded;
 
 mod connection;
 mod identity;
+mod mint;
 mod protocol;
 mod wire;
 
@@ -50,6 +51,8 @@ pub struct ProxyState {
   relay_mtls: TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>,
   pg: Arc<PgTransport>,
   mint: MintBucket,
+  /// Runtime token-mint store, shared across connections.
+  mint_store: Arc<crate::mint::MintStore>,
   fwmark: Option<u32>,
   plugins: Arc<hodor_plugin::Registry>,
 }
@@ -110,6 +113,7 @@ impl ProxyState {
       relay_mtls,
       pg,
       mint: MintBucket::new(),
+      mint_store: Arc::new(crate::mint::MintStore::default()),
       fwmark: None,
       plugins,
     })
@@ -128,6 +132,12 @@ impl ProxyState {
   #[must_use]
   pub fn snapshot(&self) -> Arc<ResolvedConfig> {
     Arc::clone(&self.config)
+  }
+
+  /// Handle to the runtime token-mint store for new connections.
+  #[must_use]
+  pub(crate) fn mint_handle(&self) -> crate::mint::MintHandle {
+    crate::mint::MintHandle::new(Arc::clone(&self.mint_store))
   }
 
   /// `SO_MARK` for upstream sockets (`None` = unmarked).
@@ -355,6 +365,7 @@ where
         host: raw_host,
         port,
         plugins: &state.plugins,
+        mint: Some(state.mint_handle()),
       };
       let (mut downstream_machine, mut upstream_machine) = raw_tcp_pair(&ctx);
       relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, initial).await
@@ -376,6 +387,7 @@ where
         host: if named { &head_host } else { raw_host },
         port: if named { head_port } else { port },
         plugins: &state.plugins,
+        mint: Some(state.mint_handle()),
       };
       let (mut downstream_machine, mut upstream_machine) = if named { http_pair(&ctx) } else { raw_tcp_pair(&ctx) };
       relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, &head).await
@@ -428,6 +440,7 @@ where
         identity,
         port,
         plugins: Arc::clone(&state.plugins),
+        mint: Some(state.mint_handle()),
       };
       let relay = match scope.guest_tls {
         hodor_config::grants::GuestTlsMode::Tls => state.relay.clone(),
@@ -517,6 +530,7 @@ where
         host: server_name.as_deref().unwrap_or(raw_host),
         port,
         plugins: &state.plugins,
+        mint: Some(state.mint_handle()),
       };
       // The upstream leg verifies against the real string's host, which its
       // certificate must carry.
@@ -594,6 +608,7 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
     host: &host,
     port,
     plugins: &state.plugins,
+    mint: Some(state.mint_handle()),
   };
   let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
   relay_guarded(client, upstream, &mut downstream_machine, &mut upstream_machine, head).await
@@ -876,6 +891,8 @@ mod tests {
         client_key: None,
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
+      pattern: None,
+      oauth2: None,
     }]
   }
 
@@ -1087,6 +1104,8 @@ mod tests {
         client_key: None,
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
+      pattern: None,
+      oauth2: None,
     }]
   }
 
@@ -1321,6 +1340,8 @@ mod tests {
         client_key: Some(key_path.clone()),
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
+      pattern: None,
+      oauth2: None,
     }];
     let state = test_state_with_plugins(grants, Vec::new(), &ca);
     let (proxy_addr, _proxy) = run_proxy_with(state).await;
@@ -1458,6 +1479,8 @@ mod tests {
         client_key: None,
         guest_tls: hodor_config::grants::GuestTlsMode::Mtls,
       }],
+      pattern: None,
+      oauth2: None,
     }];
     let state = test_state_with_plugins(grants, Vec::new(), &ca);
     let (proxy_addr, _proxy) = run_proxy_with(state).await;
@@ -1663,6 +1686,8 @@ mod tests {
         client_key: None,
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
+      pattern: None,
+      oauth2: None,
     }];
     let state = test_state_with(grants, &ca);
     let snapshot = state.snapshot();
@@ -1724,6 +1749,8 @@ mod tests {
         client_key: None,
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
+      pattern: None,
+      oauth2: None,
     }];
     let state = test_state_with(grants, &ca);
     let snapshot = state.snapshot();
@@ -1810,8 +1837,8 @@ mod tests {
     let (guest_end, mut client_end) = tokio::io::duplex(64 * 1024);
     let (server_end, mut stub_end) = tokio::io::duplex(64 * 1024);
     let (mut request, mut response) = (
-      Http::new(&[], Scheme::Http, "x", 80, Direction::Downstream, Some(Box::new(CloseHook))),
-      Http::new(&[], Scheme::Http, "x", 80, Direction::Upstream, None),
+      Http::new(&[], Scheme::Http, "x", 80, Direction::Downstream, Some(Box::new(CloseHook)), None),
+      Http::new(&[], Scheme::Http, "x", 80, Direction::Upstream, None, None),
     );
     let (relay_out, ()) = tokio::join!(relay_guarded(guest_end, server_end, &mut request, &mut response, b""), async {
       client_end.write_all(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();

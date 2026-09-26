@@ -173,7 +173,7 @@ fn own_netns_cookie() -> u64 {
     return 0;
   };
   let mut cookie = 0u64;
-  let mut size = std::mem::size_of::<u64>() as libc::socklen_t;
+  let mut size = libc::socklen_t::try_from(std::mem::size_of::<u64>()).expect("size_of::<u64>() is 8 and always fits socklen_t");
   // SAFETY: the fd is owned by `socket`, and the option reads exactly
   // `size` bytes into `cookie`, a valid u64 slot.
   let ok = unsafe {

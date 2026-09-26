@@ -490,7 +490,6 @@ async fn ebpf_live_unconnected_udp_passes_through() {
 /// Needs the `ip` (iproute2) and `bash` binaries in addition to root.
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes, ip netns)"]
-#[expect(clippy::too_many_lines, reason = "linear live-test script, split would obscure the flow")]
 async fn ebpf_live_nested_netns_connect_is_not_captured() {
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 

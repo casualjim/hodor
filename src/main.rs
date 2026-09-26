@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser as _;
 
+mod fwd;
+
 /// The workspace a command names, or the current directory.
 fn workspace_arg(workspace: Option<&Path>) -> PathBuf {
   workspace.unwrap_or(Path::new(".")).to_path_buf()
@@ -125,6 +127,12 @@ async fn main() -> eyre::Result<()> {
     Command::Up(args) => hodor_compose::up_command(&workspace_arg(args.workspace.as_deref())),
     Command::Down(args) => hodor_compose::down_command(&workspace_arg(args.workspace.as_deref())),
     Command::Logs(args) => hodor_compose::logs_command(&workspace_arg(args.workspace.as_deref()), &args),
+    Command::Fwd => {
+      #[cfg(not(target_os = "linux"))]
+      eyre::bail!("hodor fwd reads /proc/net/tcp and exists on Linux only");
+      #[cfg(target_os = "linux")]
+      crate::fwd::run().await
+    }
     Command::Serve(args) => serve(&cli, args).await,
   }
 }

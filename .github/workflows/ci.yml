@@ -47,9 +47,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Lint
-        run: |-
-          hk validate
-          hk check --all
+        run: mise check
 
       - name: Buld & Test
         run: mise build

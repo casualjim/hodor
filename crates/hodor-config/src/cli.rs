@@ -49,6 +49,15 @@ pub enum Command {
   /// start the stack, then run the configured shell (or the command after
   /// `--`). The stack keeps running when that exits, unless `--rm` stops it.
   Agent(AgentArgs),
+  /// Forward agent-owned loopback listeners to the wildcard interface.
+  ///
+  /// A sidecar of the generated compose stack, not a user command: it shares
+  /// the agent's PID namespace and hodor's network namespace, so it sees every
+  /// listener of the shared namespace and can attribute the ones the agent's
+  /// own processes hold. Anything else — hodor's capture and explicit-proxy
+  /// listeners, docker's embedded DNS — is never attributable from here and
+  /// is never forwarded. Raw bytes only: payloads are never inspected.
+  Fwd,
   /// Start the layered compose project `hodor init` generated.
   Up(WorkspaceArgs),
   /// Stop the layered compose project.

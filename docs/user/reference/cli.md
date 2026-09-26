@@ -32,7 +32,7 @@ What each backend does:
 
 All three are peers: same interception contract (a captured connection's destination is its identity), different mechanism. `tun` is the one to reach for when you need the UDP path handled; `tproxy` when you want the kernel to terminate TCP with nftables you can inspect; `ebpf` when you want no netfilter rules on the host and are scoping capture by cgroup rather than by network namespace. The eBPF backend's attach handles are owned by the process, so exit detaches the programs and leaves no host state behind.
 
-Kernel floor for `ebpf` is 5.15, and it is IPv4-only.
+Kernel floor for `ebpf` is 5.15, and it is IPv4-only. Capture is scoped to hodor's own network namespace: containers the agent spawns — inner compose stacks, podman — carry their own namespaces and are left alone, while egress through the agent's namespace stays captured.
 
 The listener binds before any capture side effect, so a bad listen address fails before routes, nft rules, or kernel programs touch the host. A failed capture leg ends the process rather than silently serving explicit-proxy only.
 
@@ -54,7 +54,7 @@ Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document.
 
 ## `hodor init [--backend <BACKEND>] [WORKSPACE]`
 
-Generate the workspace stack as editable files: `[rules.*]` blocks in `<workspace>/.config/hodor.toml` when the workspace has none, the CA and the agent entrypoint when they are missing, and `<state-dir>/hodor/ws/<slug>/compose.yml`. Nothing existing is overwritten; the stack is regenerated when the workspace config changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.
+Generate the workspace stack as editable files: `[rules.*]` blocks in `<workspace>/.config/hodor.toml` when the workspace has none, the CA and the agent entrypoint when they are missing, and `<state-dir>/hodor/ws/<slug>/compose.yml`. Nothing existing is overwritten; the stack is regenerated when the workspace config or the generator's stack shape changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.
 
 ## `hodor agent [WORKSPACE] [--rm] [-- <COMMAND>...]`
 
@@ -73,6 +73,10 @@ Stop the layered compose project.
 Read the stack's logs. `--tail` defaults to `all`; no service means every service. `--workspace` defaults to the current directory and is a flag rather than a positional because the service names already take that slot.
 
 See [how to confine a workspace](../how-to/confine-a-workspace.md).
+
+## `hodor fwd`
+
+Sidecar of the generated compose stack, not a user command: it runs on the `fwd` service with hodor's network namespace and the agent's PID namespace, forwards every agent-owned loopback listener to the namespace's own bridge address (the one the host reaches and docker publishes to), and relays raw bytes without inspecting payloads. Anything not attributable to an agent process — hodor's own listeners, docker's embedded DNS — is never forwarded. Loopback listeners only; a listener already bound to a wildcard address is directly reachable and needs no forwarder. Two listeners sharing one port on different loopback addresses cannot both be exposed and are logged and skipped.
 
 ## Exit behaviour
 

@@ -13,6 +13,7 @@ dashmap = "6"
 eyre = "0.6"
 hodor-config = { path = "../hodor-config" }
 hodor-proxy = { path = "../hodor-proxy" }
+libc = "0.2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 

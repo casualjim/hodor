@@ -68,6 +68,7 @@ mod tests {
       fnox: FnoxBinds::default(),
       guest: Vec::new(),
       init: None,
+      ports: Vec::new(),
     }
   }
 
@@ -659,6 +660,37 @@ mod tests {
     unset_env("XDG_CONFIG_HOME");
   }
 
+  /// A digest that matches can only be made stale by the shape: an older
+  /// shape — or none at all, which is every stack generated before the
+  /// marker existed — regenerates, so the bundled `hodor agent` cannot leave
+  /// an old wiring behind.
+  #[test]
+  fn a_stack_of_an_older_shape_is_stale() {
+    assert_eq!(stack_shape_in("# stack shape: 2\nservices:\n"), Some(2));
+    assert_eq!(stack_shape_in("services:\n"), None, "a pre-marker stack carries no shape");
+    assert_eq!(stack_shape_in("# stack shape: nope\n"), None);
+
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+
+    std::fs::write(
+      state.path().join("compose.yml"),
+      format!("# stack shape: {STACK_SHAPE}\nname: hodor\n"),
+    )
+    .unwrap();
+    assert!(
+      !stack_is_stale(state.path(), root.path()),
+      "current shape and matching digest keep the stack"
+    );
+
+    std::fs::write(state.path().join("compose.yml"), "# stack shape: 1\nname: hodor\n").unwrap();
+    assert!(stack_is_stale(state.path(), root.path()), "an older shape regenerates");
+
+    std::fs::write(state.path().join("compose.yml"), "name: hodor\n").unwrap();
+    assert!(stack_is_stale(state.path(), root.path()), "a pre-marker stack regenerates");
+  }
+
   /// A regeneration must not switch how traffic is captured: the backend is
   /// read back off the compose file, and the caller's default is only a
   /// fallback.
@@ -693,6 +725,75 @@ mod tests {
       toml_edit::de::from_str::<hodor_config::config::RuleCfg>("env = \"GH_TOKEN\"\n").unwrap(),
     )]);
     assert!(rules_warning(&rules, config_file).is_none(), "one rule is enough not to warn");
+  }
+
+  #[test]
+  fn workspace_ports_render_as_stable_host_bindings() {
+    let yaml = Stack {
+      ports: vec![3000, 5432],
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    let hodor_block = &yaml[..yaml.find("\n  agent:\n").unwrap()];
+    assert!(
+      hodor_block.contains("    ports:\n"),
+      "ports belong to the hodor service: {hodor_block}"
+    );
+    for port in [3000, 5432] {
+      assert!(
+        hodor_block.contains(&format!("      - \"127.0.0.1:{port}:{port}\"\n")),
+        "{hodor_block}"
+      );
+    }
+    assert!(
+      !hodor_block.contains("15000"),
+      "the capture listener port is not published: {hodor_block}"
+    );
+    assert_eq!(
+      hodor_block.matches("      - \"127.0.0.1:").count(),
+      2,
+      "exactly the declared ports, nothing else: {hodor_block}"
+    );
+    let empty = test_stack(ProxyBackend::Tproxy).render();
+    assert!(!empty.contains("ports:"), "no ports key without declared ports: {empty}");
+  }
+
+  #[test]
+  fn the_generated_stack_renders_the_sidecar_and_moves_the_explicit_proxy_off_8080() {
+    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    assert!(
+      yaml.starts_with(&format!("# stack shape: {STACK_SHAPE}\n")),
+      "the shape marker leads the generated file, so staleness can see it: {yaml}"
+    );
+    for expected in [
+      "  fwd:\n",
+      "    image: ghcr.io/casualjim/hodor:latest\n",
+      "    command: [\"fwd\"]\n",
+      "    network_mode: \"service:hodor\"\n",
+      "    pid: \"service:agent\"\n",
+    ] {
+      assert!(yaml.contains(expected), "missing {expected:?}:\n{yaml}");
+    }
+    // One service key each: a duplicated key is a compose parse error, not a
+    // cosmetic slip.
+    for service in ["hodor", "agent", "fwd"] {
+      assert_eq!(
+        yaml.matches(&format!("\n  {service}:\n")).count(),
+        1,
+        "service `{service}` must be defined exactly once:\n{yaml}"
+      );
+    }
+    assert!(
+      yaml.contains(&format!("HODOR_LISTEN: {}", crate::stack::EXPLICIT_LISTEN)),
+      "the explicit proxy must not hold the common dev-server port:\n{yaml}"
+    );
+    assert!(!yaml.contains("HODOR_LISTEN: 127.0.0.1:8080"), "{yaml}");
+    // The sidecar shares the agent's PID namespace, never hodor's.
+    assert!(!yaml.contains("pid: \"service:hodor\""), "{yaml}");
+    // Only the agent and hodor get cgroup placement; the sidecar must stay
+    // outside the captured subtree so its own relays are never rewritten.
+    let fwd_block = &yaml[yaml.find("\n  fwd:\n").unwrap()..];
+    assert!(!fwd_block.contains("cgroup"), "the sidecar is not captured: {fwd_block}");
   }
 
   /// The flags map one-to-one onto compose's and services ride at the end: a

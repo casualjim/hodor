@@ -10,7 +10,9 @@ use eyre::WrapErr as _;
 use hodor_config::cli::{LogsArgs, ProxyBackend};
 
 use crate::paths::translate;
-use crate::stack::{current_uid, generate_stack, rules_command, workspace_config, workspace_file, workspace_state_dir};
+use crate::stack::{
+  STACK_SHAPE, current_uid, generate_stack, rules_command, stack_shape_in, workspace_config, workspace_file, workspace_state_dir,
+};
 
 /// The entrypoint the generated agent service runs: it makes hodor's CA trusted
 /// inside the container before handing off, by installing it into the system
@@ -209,9 +211,15 @@ pub(crate) fn config_digest(root: &Path) -> u64 {
 
 /// Whether the stack on disk was generated from a different workspace config
 /// — which matters because the decoys are derived from the rules: a stack made
-/// before a rule existed hands the agent a decoy that can never be swapped.
-/// A stack with no digest beside it predates the check and counts as stale.
+/// before a rule existed hands the agent a decoy that can never be swapped —
+/// or by an older stack shape, which matters because `hodor agent` bundles
+/// generation and must not leave an old wiring behind. A stack with no digest
+/// beside it predates the check and counts as stale.
 pub(crate) fn stack_is_stale(state_ws: &Path, root: &Path) -> bool {
+  let shape_stale = std::fs::read_to_string(state_ws.join("compose.yml")).is_ok_and(|body| stack_shape_in(&body) != Some(STACK_SHAPE));
+  if shape_stale {
+    return true;
+  }
   match std::fs::read_to_string(state_ws.join("config.digest")) {
     Ok(stored) => stored.trim() != config_digest(root).to_string(),
     Err(_) => true,
@@ -253,7 +261,7 @@ fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) ->
       return Ok(());
     }
     println!(
-      "regenerating {}: the workspace config changed since it was generated, so hand edits to it are replaced",
+      "regenerating {}: the workspace config or the stack shape changed since it was generated, so hand edits to it are replaced",
       ws_compose.display()
     );
   }

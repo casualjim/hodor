@@ -28,7 +28,7 @@
 
 use aya_ebpf::{
   EbpfContext as _,
-  helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_socket_cookie},
+  helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_netns_cookie, bpf_get_socket_cookie},
   macros::{cgroup_skb, cgroup_sock_addr, map},
   maps::{Array, LruHashMap},
   programs::{SkBuffContext, SockAddrContext},
@@ -54,6 +54,12 @@ pub struct Config {
   pub tcp_port: u32,
   /// Loopback port `connect4` rewrites UDP destinations to.
   pub udp_port: u32,
+  /// Netns cookie of the loader's own network namespace, as
+  /// `SO_NETNS_COOKIE` reports it. Connects from a different network
+  /// namespace — the containers the agent spawns — are never rewritten.
+  /// Zero means unknown, disabling the guard: the pid and cgroup checks
+  /// then carry exclusion alone, as before this field existed.
+  pub netns_cookie: u64,
 }
 
 /// Original destination recorded before the rewrite. Both fields keep the
@@ -224,6 +230,21 @@ fn redirect(ctx: &SockAddrContext, listener_port: u32) -> i32 {
 pub fn connect4(ctx: SockAddrContext) -> i32 {
   if is_proxy() {
     return 1;
+  }
+  // Containers the captured processes spawn — inner compose stacks, podman
+  // inside the agent — run in their own network namespaces. Only sockets in
+  // the loader's own namespace are captured: the cgroup subtree spans those
+  // namespaces, while tproxy and tun capture one netns each. `0` disables
+  // the guard on a kernel too old to read the cookie.
+  if let Some(config) = CONFIG.get(0) {
+    if config.netns_cookie != 0 {
+      // SAFETY: the kernel supplied a live context for this hook; the helper
+      // reads the connecting socket's netns cookie from it.
+      let cookie = unsafe { bpf_get_netns_cookie(ctx.as_ptr()) };
+      if cookie != config.netns_cookie {
+        return 1;
+      }
+    }
   }
   // SAFETY: the kernel supplies a live `bpf_sock_addr` for this hook.
   let protocol = unsafe { (*ctx.sock_addr).protocol };

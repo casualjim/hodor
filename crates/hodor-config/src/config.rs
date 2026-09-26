@@ -79,6 +79,15 @@ pub struct WorkspaceCfg {
   /// translate into this prefix, others mount at their own path.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub home: Option<String>,
+  /// Ports the generated stack publishes on the host as stable `127.0.0.1`
+  /// bindings, forwarded to the same port inside the agent's shared network
+  /// namespace: the `fwd` sidecar exposes every agent-owned loopback
+  /// listener there, and a published port names one from the host reliably
+  /// instead of by a changing container IP. Applying a change needs a stack
+  /// restart — publishings are fixed at container create.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub ports: Vec<u16>,
 }
 /// Proxy listener settings (CLI/env/file overlay).
 #[derive(confique::Config, Clone, Debug, Serialize)]
@@ -352,6 +361,18 @@ impl AppConfig {
       if let Some(flow) = &rule.oauth2 {
         crate::registry::validate_flow(flow, "config", label)?;
       }
+    }
+    for port in &self.workspace.ports {
+      eyre::ensure!(*port != 0, "[workspace] ports: port 0 cannot be published");
+      // The capture listeners hold these ports inside the shared netns, and
+      // the `fwd` sidecar only forwards agent-owned listeners, so a published
+      // capture port would shadow a host port with a dead binding. The
+      // literals must stay in step with hodor-ebpf's `TCP_LISTEN_PORT` and
+      // `UDP_LISTEN_PORT`.
+      eyre::ensure!(
+        *port != 15_000 && *port != 15_001,
+        "[workspace] port {port} is a capture listener port and cannot be published"
+      );
     }
     Ok(())
   }
@@ -816,5 +837,34 @@ allow = ["https://b.example"]
     assert_eq!(render_template("{bogus:10}", "seed"), "{bogus:10}");
     assert_eq!(render_template("a{bogus:10}b", "seed"), "a{bogus:10}b");
     assert_eq!(fake_for("SOME_TOKEN", Some("{bogus:10}")), "{bogus:10}");
+  }
+
+  /// Workspace ports are load-refused when they cannot name an exposed
+  /// agent listener: port 0 is no port, and the capture listeners are never
+  /// agent-owned, so publishing one shadows a host port with a dead binding.
+  #[test]
+  fn workspace_ports_refuse_zero_and_the_capture_listener_ports() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    set_env("HODOR_CONFIG", &global);
+    for (ports, expected) in [
+      ("[0]", "port 0"),
+      ("[15000]", "capture listener port"),
+      ("[15001]", "capture listener port"),
+      ("[3000, 0]", "port 0"),
+    ] {
+      write_file(&global, format!("[workspace]\nports = {ports}\n").as_str());
+      let err = load(&cli_for(&["hodor", "serve"])).unwrap_err();
+      assert!(err.to_string().contains(expected), "ports {ports}: {err:?}");
+    }
+    write_file(&global, "[workspace]\nports = [3000, 8080, 5432]\n");
+    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    assert_eq!(config.workspace.ports, vec![3000, 8080, 5432]);
+    write_file(&global, "[proxy]\n");
+    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    assert!(config.workspace.ports.is_empty(), "absent ports stay empty");
+    scrub_env();
   }
 }

@@ -160,6 +160,38 @@ fn own_cgroup_id() -> u64 {
   std::fs::metadata(Path::new(CGROUP2_MOUNT).join(relative)).map_or(0, |meta| meta.ino())
 }
 
+/// The netns cookie of this process's own network namespace, as
+/// `SO_NETNS_COOKIE` reports it — the same value `bpf_get_netns_cookie`
+/// reports for a socket in that namespace, so the two sides compare
+/// apples to apples. `0` means it could not be read (kernel older than
+/// 5.5, `CONFIG_NET_NS` unset), which disables the guard and restores the
+/// pre-cookie behavior: only the pid and cgroup checks exclude, and every
+/// namespace under the attached cgroup is captured.
+fn own_netns_cookie() -> u64 {
+  use std::os::fd::AsRawFd as _;
+  let Ok(socket) = std::net::UdpSocket::bind(("127.0.0.1", 0)) else {
+    return 0;
+  };
+  let mut cookie = 0u64;
+  let mut size = std::mem::size_of::<u64>() as libc::socklen_t;
+  // SAFETY: the fd is owned by `socket`, and the option reads exactly
+  // `size` bytes into `cookie`, a valid u64 slot.
+  let ok = unsafe {
+    libc::getsockopt(
+      socket.as_raw_fd(),
+      libc::SOL_SOCKET,
+      libc::SO_NETNS_COOKIE,
+      (&raw mut cookie).cast(),
+      (&raw mut size).cast(),
+    )
+  } == 0;
+  if !ok || size as usize != std::mem::size_of::<u64>() {
+    tracing::debug!(ok, size, "netns cookie unreadable: the netns guard stays off");
+    return 0;
+  }
+  cookie
+}
+
 /// Attach the capture programs and serve captured traffic forever.
 ///
 /// `cgroup` is the directory whose member processes get captured. hodor itself
@@ -217,12 +249,19 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> e
 
 /// Write the loader-side configuration the programs read at runtime.
 fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfExclusion) -> eyre::Result<()> {
+  let netns_cookie = own_netns_cookie();
+  if netns_cookie == 0 {
+    tracing::warn!(
+      "could not read this process's netns cookie (SO_NETNS_COOKIE): connect4 captures every namespace under the attached cgroup"
+    );
+  }
   let config = Config {
     proxy_pid: self_exclusion.pid(),
     _pad: [0; 4],
     proxy_cgroup: own_cgroup_id(),
     tcp_port: u32::from(tcp_port),
     udp_port: u32::from(udp_port),
+    netns_cookie,
   };
   config
     .validate()
@@ -252,6 +291,10 @@ pub(crate) struct Config {
   pub tcp_port: u32,
   /// Port `connect4` rewrites UDP destinations to.
   pub udp_port: u32,
+  /// Netns cookie of this process's network namespace, or 0 when unknown:
+  /// connects from other namespaces — the containers the agent spawns — are
+  /// then still rewritten, as before this guard existed.
+  pub netns_cookie: u64,
 }
 
 impl Config {
@@ -520,13 +563,14 @@ mod tests {
     assert_eq!(offset_of!(OrigDst, proto), 8);
     assert_eq!(offset_of!(OrigDst, _pad), 9);
 
-    assert_eq!(size_of::<Config>(), 24);
+    assert_eq!(size_of::<Config>(), 32);
     assert_eq!(align_of::<Config>(), 8);
     assert_eq!(offset_of!(Config, proxy_pid), 0);
     assert_eq!(offset_of!(Config, _pad), 4);
     assert_eq!(offset_of!(Config, proxy_cgroup), 8);
     assert_eq!(offset_of!(Config, tcp_port), 16);
     assert_eq!(offset_of!(Config, udp_port), 20);
+    assert_eq!(offset_of!(Config, netns_cookie), 24);
   }
 
   /// A configuration the programs cannot act on must be refused before it is
@@ -540,6 +584,7 @@ mod tests {
       proxy_cgroup: own_cgroup_id(),
       tcp_port: u32::from(TCP_LISTEN_PORT),
       udp_port: u32::from(UDP_LISTEN_PORT),
+      netns_cookie: own_netns_cookie(),
     };
     base.validate().expect("a fully populated config is valid");
     assert!(Config { tcp_port: 0, ..base }.validate().is_err());

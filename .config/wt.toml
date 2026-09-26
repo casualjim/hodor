@@ -1,0 +1,10 @@
+# Graft a paired jj working copy into each new worktree (backed by the
+# colocated repo's git store) so both git tooling and `jj` work inside it.
+# No-op when jj is missing, the primary checkout isn't jj-colocated, or the
+# worktree already has .jj. Never fails worktree creation.
+pre-start = "command -v jj >/dev/null && test -d {{ primary_worktree_path }}/.jj && test ! -d .jj && jj git init --git-repo={{ primary_worktree_path }}/.git . || true"
+
+# Copy gitignored files (.env, .config/nats, node_modules, target) from the
+# primary worktree into each new worktree, in the background after creation.
+[post-start]
+copy = "wt step copy-ignored"

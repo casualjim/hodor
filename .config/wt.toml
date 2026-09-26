@@ -8,3 +8,10 @@ pre-start = "command -v jj >/dev/null && test -d {{ primary_worktree_path }}/.jj
 # primary worktree into each new worktree, in the background after creation.
 [post-start]
 copy = "wt step copy-ignored"
+
+# wt remove deletes the git branch, but a jj command racing the background
+# removal can re-export refs/heads/<branch> after the deletion (import saw it
+# alive, export resurrects it). Delete the bookmark from jj afterwards — this
+# also removes any recreated git ref via export. Runs in the primary worktree.
+[post-remove]
+jj-cleanup = "{% if branch %}test -d {{ primary_worktree_path }}/.jj && command -v jj >/dev/null && jj bookmark delete {{ branch }} || true{% endif %}"

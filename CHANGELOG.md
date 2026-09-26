@@ -1,3 +1,8 @@
+## [0.2.1] - 2026-09-26
+
+### 🚀 Features
+
+- *(compose)* Netns-scoped capture, agent port exposure (#38)
 ## [0.2.0] - 2026-09-26
 
 ### 🚀 Features
@@ -7,6 +12,8 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(vcs)* Add worktrunk confg
+- Update changelog for v0.2.0 [ci skip]
+- Release
 ## [0.1.23] - 2026-09-25
 
 ### 🚀 Features

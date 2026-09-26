@@ -255,14 +255,24 @@ fn bridge_addresses() -> eyre::Result<Option<(IpAddr, Option<IpAddr>)>> {
   let mut v4 = None;
   let mut v6 = None;
   let mut cursor = list.0;
-  while let Some(entry) = unsafe { cursor.as_ref() } {
+  loop {
+    // SAFETY: `cursor` is null or points at a node of the list `list` owns.
+    let entry = unsafe { cursor.as_ref() };
+    let Some(entry) = entry else {
+      break;
+    };
     cursor = entry.ifa_next;
-    let Some(raw) = (unsafe { entry.ifa_addr.as_ref() }) else {
+    // SAFETY: `ifa_addr` is null or points at an address that lives as long
+    // as the entry does.
+    let raw = unsafe { entry.ifa_addr.as_ref() };
+    let Some(raw) = raw else {
       continue;
     };
     match i32::from(raw.sa_family) {
       libc::AF_INET if v4.is_none() => {
-        let Some(sa) = (unsafe { entry.ifa_addr.cast::<libc::sockaddr_in>().as_ref() }) else {
+        // SAFETY: an AF_INET entry stores a `sockaddr_in` at `ifa_addr`.
+        let sa = unsafe { entry.ifa_addr.cast::<libc::sockaddr_in>().as_ref() };
+        let Some(sa) = sa else {
           continue;
         };
         let addr = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
@@ -271,7 +281,9 @@ fn bridge_addresses() -> eyre::Result<Option<(IpAddr, Option<IpAddr>)>> {
         }
       }
       libc::AF_INET6 if v6.is_none() => {
-        let Some(sa) = (unsafe { entry.ifa_addr.cast::<libc::sockaddr_in6>().as_ref() }) else {
+        // SAFETY: an AF_INET6 entry stores a `sockaddr_in6` at `ifa_addr`.
+        let sa = unsafe { entry.ifa_addr.cast::<libc::sockaddr_in6>().as_ref() };
+        let Some(sa) = sa else {
           continue;
         };
         // The in6_addr is an opaque byte array, so the octets are the octets.
@@ -347,13 +359,12 @@ fn parse_table(path: &str) -> eyre::Result<Vec<Row>> {
       32 => {
         let mut octets = [0u8; 16];
         let mut decoded = true;
-        for (slot, at) in octets.chunks_exact_mut(4).zip((0..32).step_by(8)) {
-          match u32::from_str_radix(&addr_hex[at..at + 8], 16) {
-            Ok(raw) => slot.copy_from_slice(&u32::from_be(raw).to_be_bytes()),
-            Err(_) => {
-              decoded = false;
-              break;
-            }
+        for (slot, at) in octets.as_chunks_mut::<4>().0.iter_mut().zip((0..32).step_by(8)) {
+          if let Ok(raw) = u32::from_str_radix(&addr_hex[at..at + 8], 16) {
+            slot.copy_from_slice(&u32::from_be(raw).to_be_bytes());
+          } else {
+            decoded = false;
+            break;
           }
         }
         if !decoded {
@@ -366,7 +377,7 @@ fn parse_table(path: &str) -> eyre::Result<Vec<Row>> {
     if !addr.is_loopback() {
       continue;
     }
-    let Ok(inode) = u64::from_str_radix(inode_hex, 10) else {
+    let Ok(inode) = inode_hex.parse::<u64>() else {
       continue;
     };
     rows.push(Row { addr, port, inode });

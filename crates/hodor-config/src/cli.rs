@@ -36,6 +36,10 @@ pub enum Command {
   Ca,
   /// Print `[rules.*]` for the secrets this workspace can get (fnox ∩ registry).
   Rules,
+  /// Curate an `oauth2` registry fragment from a discovery or `OpenAPI`
+  /// document. Reads a local file; prints TOML to stdout. Never touches
+  /// the bundled registry or runtime config.
+  Registry(RegistryArgs),
   /// Generate this workspace's stack as an editable file: the workspace
   /// `[rules.*]` config when it has none, the CA, the agent entrypoint, and
   /// the compose file. Existing files are left untouched; the stack is
@@ -175,6 +179,38 @@ pub struct FakeArgs {
   /// Explicit fake pattern overriding the prefix default.
   #[arg(long)]
   pub pattern: Option<String>,
+}
+
+/// `hodor registry` subcommands.
+#[derive(Subcommand, Debug, Clone)]
+pub enum RegistryCommand {
+  /// Map an OIDC discovery document (`<issuer>/.well-known/openid-configuration`)
+  /// onto one `[providers.<slug>.oauth2]` fragment. The flow comes from
+  /// `grant_types_supported`.
+  FromOidc(ImportArgs),
+  /// Map an `OpenAPI` document's `components.securitySchemes` (`type: oauth2`)
+  /// onto fragments, one per scheme. `openIdConnect` schemes are reported
+  /// and skipped.
+  FromOpenapi(ImportArgs),
+}
+
+/// Arguments for [`Command::Registry`].
+#[derive(clap::Args, Debug, Clone)]
+pub struct RegistryArgs {
+  /// Which document kind to import.
+  #[command(subcommand)]
+  pub command: RegistryCommand,
+}
+
+/// Arguments for the registry import commands.
+#[derive(clap::Args, Debug, Clone)]
+pub struct ImportArgs {
+  /// Path to the saved discovery or `OpenAPI` JSON document.
+  pub file: PathBuf,
+  /// Provider slug for the generated `[providers.<slug>]` entry.
+  pub slug: String,
+  /// Environment name the generated entry claims.
+  pub env: String,
 }
 
 #[cfg(test)]

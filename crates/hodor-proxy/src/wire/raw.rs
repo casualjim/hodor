@@ -102,6 +102,8 @@ mod tests {
         value: secrecy::SecretString::from("REAL5678"),
       },
       allow: vec!["tcp://10.0.0.8:5432".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
     }];
     let mut raw = Raw::new(&grants, Scheme::Tcp, "10.0.0.8", 5432, Direction::Downstream);
     let (out1, _) = {
@@ -143,6 +145,8 @@ mod tests {
         value: secrecy::SecretString::from(VALUE),
       },
       allow: vec!["tcp://10.0.0.8:5432".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
     }];
     let mut raw = Raw::new(&grants, Scheme::Tcp, "10.0.0.8", 5432, Direction::Downstream);
     let chunk = format!("x{FAKE}");
@@ -174,6 +178,8 @@ mod tests {
         value: secrecy::SecretString::from("A-MUCH-LONGER-VALUE"),
       },
       allow: vec!["tcp://10.0.0.8:5432".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
     }];
     let mut raw = Raw::new(&grants, Scheme::Tcp, "10.0.0.8", 5432, Direction::Downstream);
     let (out, hits) = {
@@ -207,6 +213,8 @@ mod tests {
         value: secrecy::SecretString::from("REAL5678"),
       },
       allow: vec!["tcp://10.0.0.8:5432".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
     }];
     let mut raw = Raw::new(&grants, Scheme::Tcp, "10.0.0.8", 5432, Direction::Downstream);
     let (out, hits) = {
@@ -230,6 +238,8 @@ mod tests {
         value: secrecy::SecretString::from("REAL5678"),
       },
       allow: vec!["https://api:9443".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
     }];
     let mut req = Raw::new(&grants, Scheme::Https, "api", 9443, Direction::Downstream);
     let (out, hits) = {

@@ -115,6 +115,7 @@ pub(crate) struct PumpService {
   pub(crate) identity: String,
   pub(crate) port: u16,
   pub(crate) plugins: Arc<hodor_plugin::Registry>,
+  pub(crate) mint: Option<crate::mint::MintHandle>,
 }
 impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for PumpService
 where
@@ -133,6 +134,7 @@ where
       host: &self.identity,
       port: self.port,
       plugins: &self.plugins,
+      mint: self.mint.clone(),
     };
     // The relay handshook the upstream leg before the guest's, and answered
     // the guest with what that leg agreed, so this one fact frames both

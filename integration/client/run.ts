@@ -9,6 +9,7 @@ import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile } from "node:fs/promises";
 
 const FAKE = process.env.HODOR_FAKE ?? "";
+const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
 const CERT_DIR = process.env.CERT_DIR ?? "/certs";
 const PG_URL = process.env.DATABASE_URL ?? ""; // the fake connection string
 const ATTEMPT_TIMEOUT_MS = 5000;
@@ -16,8 +17,8 @@ const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
 const DEADLINE = Date.now() + TOTAL_BUDGET_MS;
 
-if (!FAKE) {
-  console.error("HODOR_FAKE not set");
+if (!FAKE || !OIDC_FAKE_SECRET) {
+  console.error("HODOR_FAKE or OIDC_FAKE_SECRET not set");
   process.exit(1);
 }
 
@@ -203,10 +204,10 @@ if (PG_URL) {
     }));
   }
   await retry("postgres mitm swaps the password for a real server", async () => {
-    stage(`pg ${db.hostname}:${db.port || 5432} connecting`);
     const db = new URL(PG_URL);
-      const sock = await race("pg connect", new Promise<Socket>((resolve, reject) => {
-        const s = connect(Number(db.port || 5432), db.hostname);
+    stage(`pg ${db.hostname}:${db.port || 5432} connecting`);
+    const sock = await race("pg connect", new Promise<Socket>((resolve, reject) => {
+      const s = connect(Number(db.port || 5432), db.hostname);
       s.once("connect", () => resolve(s));
       s.once("error", reject);
     }));
@@ -249,6 +250,38 @@ if (PG_URL) {
 } else {
   stage("pg scenario skipped: no DATABASE_URL (bwrap)");
 }
+
+// 7. OAuth2 client_credentials through the token issuer: the fake client
+//    secret is swapped to the real one at /token, the returned access token
+//    is minted as a decoy (never the real value), and that decoy swaps back
+//    to the real access token on the API call. Garbage tokens stay
+//    unauthorized.
+await retry("oauth2 token endpoint mints and the minted decoy substitutes", async () => {
+  const basic = Buffer.from(`demo-client:${OIDC_FAKE_SECRET}`).toString("base64");
+  const tokenResp = await fetch("http://api:8000/token", {
+    method: "POST",
+    headers: { authorization: `Basic ${basic}`, "content-type": "application/x-www-form-urlencoded" },
+    body: "grant_type=client_credentials",
+  });
+  if (tokenResp.status !== 200) {
+    stage(`token endpoint status ${tokenResp.status}`);
+    return false;
+  }
+  const { access_token: minted, token_type: tokenType } = (await tokenResp.json()) as { access_token: string; token_type: string };
+  stage(`minted token head: ${minted.slice(0, 8)}…`);
+  // The minted decoy renders the default {hex:32} pattern; the real access
+  // token does not. A regex shape check proves minting fired without the
+  // client ever learning the real value.
+  if (!/^[0-9a-f]{32}$/.test(minted) || tokenType !== "Bearer" || minted === OIDC_FAKE_SECRET) {
+    return false;
+  }
+  const apiResp = await fetch("http://api:8000/api", { headers: { authorization: `Bearer ${minted}` } });
+  if (apiResp.status !== 200 || (await apiResp.text()) !== "ok\n") {
+    return false;
+  }
+  const badResp = await fetch("http://api:8000/api", { headers: { authorization: "Bearer not-a-token" } });
+  return badResp.status === 401;
+});
 
 console.log("all scenarios passed");
 process.exit(0);

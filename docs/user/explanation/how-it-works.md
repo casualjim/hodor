@@ -23,7 +23,8 @@ Then, per connection:
 3. **Terminate.** hodor terminates TLS with that leaf, signed by its own CA. This is why granted HTTPS hosts require client trust in the CA.
 4. **Sniff.** hodor peeks at the plaintext stream to tell HTTP/1 from HTTP/2 (h2 preface) from raw bytes.
 5. **Substitute.** Guest-to-server chunks pass through a request machine that swaps decoy for real; server-to-guest chunks pass through a response machine that swaps real back to decoy. The substitution engine walks HTTP/1 headers and bodies, and HTTP/2 headers via an hpack frame walker. Raw TCP (a `tcp://` grant) gets a byte-level scan-and-forward: framing uncertainty degrades to opaque scanning, never blocks.
-6. **Log.** A substitution logs its rule label and the location (`Header`, `BasicAuth`, `Body`), never a value.
+6. **Mint (token issuers).** When the rule's registry entry declares an OAuth2 flow for this endpoint, the response machine buffers a token response whole, mints a decoy for each flow field (`access_token`, `refresh_token`), rewrites the body and its `Content-Length`, and records the pair in a process-lifetime store. Later request machines union the minted pairs, so a decoy minted on one connection substitutes on the next.
+7. **Log.** A substitution logs its rule label and the location (`Header`, `BasicAuth`, `Body`), never a value.
 
 ## Why the pieces are shaped this way
 

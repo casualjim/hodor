@@ -47,7 +47,37 @@ When only the hosts need overriding, a names entry is the smaller change:
 hosts = ["https://ghe.corp.example"]
 ```
 
-## 4. Preview the decoy
+## 4. Declare an OAuth2 token issuer
+
+When the service issues its own tokens (an OAuth2 token endpoint instead of one static key), declare the flow so freshly issued tokens never reach the agent as real values.
+
+The two curation commands turn a vendor's own documents into the entry:
+
+```sh
+# OIDC discovery: fetch and save the document, then map it
+hodor registry from-oidc issuer.json example EXAMPLE_TOKEN
+
+# OpenAPI: map every `type: oauth2` security scheme
+hodor registry from-openapi openapi.json example EXAMPLE_TOKEN
+```
+
+Both print a `rules.d` TOML fragment to stdout. Review it, then drop it into `rules.d`. They never fetch at runtime and never touch the bundled table.
+
+For hand-written entries, the block is:
+
+```toml
+[providers.acme]
+env = ["ACME_TOKEN"]
+hosts = ["https://api.acme.example.com"]
+
+[providers.acme.oauth2]
+flow = "client_credentials"
+token_url = "https://auth.acme.example.com/oauth/token"
+```
+
+With the flow declared, the proxy terminates TLS on the token endpoint and rewrites the response body: every `access_token` the issuer returns is replaced with a freshly minted decoy matching the rule's pattern. The agent holds the decoy; the proxy swaps it back on every later request. `expires_in` is logged at mint time; values are never logged.
+
+## 5. Preview the decoy
 
 `hodor fake` uses the same table, so the override is visible without running a proxy:
 

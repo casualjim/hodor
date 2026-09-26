@@ -744,6 +744,7 @@ mod tests {
       allow: vec!["https://api.github.com".to_string()],
       pattern: None,
       registry: None,
+      oauth2: None,
       tls,
       if_missing: hodor_config::config::IfMissing::default(),
     };

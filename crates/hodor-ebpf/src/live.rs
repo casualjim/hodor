@@ -168,6 +168,8 @@ async fn ebpf_live_tcp_mitm_substitutes() {
         client_key: None,
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
+      pattern: None,
+      oauth2: None,
     }],
     &ca,
   );

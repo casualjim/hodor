@@ -20,6 +20,7 @@ pgwire = { version = "0.41", default-features = false }
 rama = { git = "https://github.com/lotsaai/rama", rev = "be3aa5b82f587f3688980db74e8c9e530cd7ac77", default-features = false, features = ["boring", "tcp"] } # fork of plabayo/rama: mTLS client identity on the MITM egress leg; switch back once upstreamed
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 rustls-native-certs = "0.8"
+serde_json = "1"
 tokio-rustls = "0.26"
 secrecy = { version = "0.10", features = ["serde"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

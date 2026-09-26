@@ -2,13 +2,16 @@
 // holds just the deterministic fake. Listeners:
 //   8443  HTTPS (HTTP semantics)          - MITM path, https:// grant
 //   8000  cleartext HTTP                  - MITM path, http:// grant
+//         + token issuer: discovery and client_credentials exchange
 //   9000  cleartext TCP line protocol     - raw substitution, tcp:// grant
 //   9443  TLS line protocol               - MITM + raw substitution, https:// grant
 //   9444  TLS line protocol, no grant     - spliced untouched by hodor
 const REAL = process.env.HODOR_REAL ?? "";
+const CLIENT_SECRET = process.env.OIDC_CLIENT_SECRET ?? "";
+const ACCESS_TOKEN = process.env.OIDC_ACCESS_TOKEN ?? "";
 const CERT_DIR = process.env.CERT_DIR ?? "/certs";
-if (!REAL) {
-  console.error("HODOR_REAL not set");
+if (!REAL || !CLIENT_SECRET || !ACCESS_TOKEN) {
+  console.error("HODOR_REAL, OIDC_CLIENT_SECRET, or OIDC_ACCESS_TOKEN not set");
   process.exit(1);
 }
 
@@ -20,6 +23,13 @@ const fetch = (req: Request) => {
   if (auth === `Bearer ${REAL}`) {
     return new Response(`token:${REAL}\n`);
   }
+  // A minted access token: hodor swapped the client-held decoy for the
+  // real one. The body never echoes the access token, because minted
+  // decoys are swapped on requests, not redacted from arbitrary response
+  // positions.
+  if (auth === `Bearer ${ACCESS_TOKEN}`) {
+    return new Response(`ok\n`);
+  }
   return new Response(`unauthorized:${auth}\n`, { status: 401 });
 };
 
@@ -30,11 +40,47 @@ Bun.serve({
   fetch,
 });
 
+// Token issuer on the cleartext HTTP leg: discovery plus a
+// client_credentials exchange gated on the real client secret (Basic auth).
+// hodor swaps the client's fake secret to the real one here, mints a decoy
+// for the returned access token, and swaps that decoy back on later
+// requests.
+const issuerFetch = (req: Request) => {
+  const url = new URL(req.url);
+  if (req.method === "GET" && url.pathname === "/.well-known/openid-configuration") {
+    return Response.json({
+      issuer: "http://api:8000",
+      token_endpoint: "http://api:8000/token",
+      grant_types_supported: ["client_credentials", "authorization_code"],
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/token") {
+    const auth = req.headers.get("authorization") ?? "";
+    const expected = `Basic ${Buffer.from(`demo-client:${CLIENT_SECRET}`).toString("base64")}`;
+    if (auth !== expected) {
+      return Response.json({ error: "invalid_client" }, { status: 401 });
+    }
+    return Response.json({
+      access_token: ACCESS_TOKEN,
+      token_type: "Bearer",
+      expires_in: 3600,
+    });
+  }
+  return new Response("not found\n", { status: 404 });
+};
+
 // Plain HTTP twin for the http:// grant scenario (transparent capture).
+// Issuer paths first, then the bearer-checked API.
 Bun.serve({
   hostname: "0.0.0.0",
   port: 8000,
-  fetch,
+  fetch: (req: Request) => {
+    const pathname = new URL(req.url).pathname;
+    if (pathname === "/.well-known/openid-configuration" || pathname === "/token") {
+      return issuerFetch(req);
+    }
+    return fetch(req);
+  },
 });
 
 type LineState = { buf: string };
@@ -53,8 +99,7 @@ const lineHandlers = {
     }
   },
 };
-
 Bun.listen<LineState>({ hostname: "0.0.0.0", port: 9000, socket: lineHandlers, data: { buf: "" } });
 Bun.listen<LineState>({ hostname: "0.0.0.0", port: 9443, tls, socket: lineHandlers, data: { buf: "" } });
 Bun.listen<LineState>({ hostname: "0.0.0.0", port: 9444, tls, socket: lineHandlers, data: { buf: "" } });
-console.log("api listening: 8443 https, 8000 http, 9000 tcp, 9443 tls-mitm, 9444 tls-splice");
+console.log("api listening: 8443 https, 8000 http+issuer, 9000 tcp, 9443 tls-mitm, 9444 tls-splice");

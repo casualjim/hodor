@@ -5,7 +5,9 @@
 //! match, and redacts real values back to fakes on responses. Everything
 //! else splices through byte-identical.
 
-pub use hodor_config::cli::{AgentArgs, Cli, Command, FakeArgs, InitArgs, LogsArgs, ProxyBackend, ServeArgs, WorkspaceArgs};
+pub use hodor_config::cli::{
+  AgentArgs, Cli, Command, FakeArgs, ImportArgs, InitArgs, LogsArgs, ProxyBackend, RegistryCommand, ServeArgs, WorkspaceArgs,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -47,7 +49,39 @@ async fn main() -> eyre::Result<()> {
         hodor_config::config::validate_pattern(pattern).map_err(|err| eyre::eyre!("bad --pattern: {err}"))?;
       }
       let registry = hodor_config::registry::Registry::load(hodor_config::config::rules_dir().as_deref())?;
-      println!("{}", registry.decoy(&args.env, args.pattern.as_deref()));
+      let (mut config, _) = hodor_config::config::load(&cli)?;
+      // Resolve the rule's value the way `serve` does, so a `tcp://` rule
+      // previews the length-matched decoy the proxy will actually use.
+      let needs_fnox = config.rules.values().any(|rule| rule.env == args.env && rule.value.is_none());
+      if needs_fnox {
+        let fnox = hodor_fnox::FnoxSource::open()?;
+        hodor_fnox::resolve(&mut config, &registry, fnox).await?;
+      }
+      let rule = config.rules.values().find(|rule| rule.env == args.env);
+      let Some(rule) = rule else {
+        println!("{}", registry.decoy(&args.env, args.pattern.as_deref()));
+        return Ok(());
+      };
+      let Some(value) = rule.value.as_ref() else {
+        println!("{}", registry.decoy(&args.env, args.pattern.as_deref()));
+        return Ok(());
+      };
+      let allow: Vec<hodor_config::grants::EndpointScope> = rule
+        .allow
+        .iter()
+        .map(|entry| entry.parse())
+        .collect::<Result<_, _>>()
+        .map_err(|err| eyre::eyre!("bad allow entry: {err}"))?;
+      let (decoy, length_matched) = hodor_config::grants::decoy_for_rule(
+        &rule.env,
+        rule.pattern.as_deref().or(args.pattern.as_deref()),
+        &allow,
+        hodor_config::ExposeSecret::expose_secret(value).len(),
+      );
+      if length_matched {
+        eprintln!("# length-matched for a tcp:// allow entry; the registry shape rendered another length");
+      }
+      println!("{decoy}");
       Ok(())
     }
     Command::Ca => {
@@ -58,6 +92,26 @@ async fn main() -> eyre::Result<()> {
     }
     Command::Rules => {
       print!("{}", hodor_compose::rules_command()?);
+      Ok(())
+    }
+    Command::Registry(args) => {
+      let import = match &args.command {
+        RegistryCommand::FromOidc(import) | RegistryCommand::FromOpenapi(import) => import,
+      };
+      let doc = std::fs::read_to_string(&import.file).map_err(|err| eyre::eyre!("read {}: {err}", import.file.display()))?;
+      let flows = match &args.command {
+        RegistryCommand::FromOidc(_) => vec![(
+          import.slug.clone(),
+          hodor_config::import::flow_from_oidc(&doc).map_err(|err| err.to_string()),
+        )],
+        RegistryCommand::FromOpenapi(_) => hodor_config::import::flows_from_openapi(&doc)?,
+      };
+      for (slug, flow) in flows {
+        match flow {
+          Ok(flow) => print!("{}", hodor_config::import::to_toml_fragment(&slug, &import.env, &flow)?),
+          Err(reason) => tracing::warn!(scheme = %slug, reason, "skipped security scheme"),
+        }
+      }
       Ok(())
     }
     Command::Init(args) => {

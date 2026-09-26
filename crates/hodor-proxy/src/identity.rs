@@ -252,6 +252,8 @@ mod tests {
         value: SecretString::from("value"),
       },
       allow: entries.iter().map(|entry| entry.parse().unwrap()).collect(),
+      pattern: None,
+      oauth2: None,
     }]
   }
 

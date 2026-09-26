@@ -524,6 +524,10 @@ pub enum Grant {
     credential: Credential,
     /// Parsed endpoint entries.
     allow: Vec<EndpointScope>,
+    /// Decoy template this grant's decoys render from.
+    pattern: Option<String>,
+    /// `OAuth2` token-issuer flow, when this grant's rule declares one.
+    oauth2: Option<crate::registry::OAuthFlow>,
   },
   /// One connection-string mapping: fake connection string to real, 1:1.
   Database {
@@ -694,13 +698,23 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
       tracing::warn!(label, env = %rule.env, "rule has no allow entries; no grant");
       continue;
     }
-    let allow = parsed.into_iter().map(|(_, scope)| scope).collect();
+    let allow: Vec<EndpointScope> = parsed.into_iter().map(|(_, scope)| scope).collect();
+    // A decoy is a key the proxy maps back to the real value; its shape is a
+    // prop for the observer. Raw TCP grants need the decoy at the real
+    // value's length (the raw swap is equal-length only), so the decoy
+    // falls back to a length-matched render there.
+    let (fake, _) = decoy_for_rule(&rule.env, rule.pattern.as_deref(), &allow, value.expose_secret().len());
     let credential = Credential {
       label: label.clone(),
-      fake: crate::config::fake_for(&rule.env, rule.pattern.as_deref()),
+      fake,
       value,
     };
-    grants.push(Grant::Token { credential, allow });
+    grants.push(Grant::Token {
+      credential,
+      allow,
+      pattern: rule.pattern.clone(),
+      oauth2: rule.oauth2.clone(),
+    });
   }
   let plugins = crate::plugins::resolve_plugins(cfg)?;
   Ok(ResolvedConfig {
@@ -708,6 +722,21 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
     grants,
     plugins,
   })
+}
+
+/// The decoy a rule's grant will use: the shaped decoy, falling back to a
+/// length-matched render when the rule has a `tcp://` allow entry and the
+/// shape renders another length than the real value. Returns the decoy and
+/// whether the length-matched fallback fired.
+#[must_use]
+pub fn decoy_for_rule(env: &str, pattern: Option<&str>, allow: &[EndpointScope], value_len: usize) -> (String, bool) {
+  let shaped = crate::config::fake_for(env, pattern);
+  if allow.iter().any(|scope| scope.scheme == Scheme::Tcp) && shaped.len() != value_len {
+    let length_pattern = format!("{{hex:{value_len}}}");
+    (crate::config::fake_for(env, Some(&length_pattern)), true)
+  } else {
+    (shaped, false)
+  }
 }
 
 /// Scheme + port + host all match, over raw parsed endpoint entries.
@@ -731,6 +760,8 @@ mod tests {
         value: SecretString::from("value"),
       },
       allow: entries.iter().map(|entry| endpoint_scope(entry)).collect(),
+      pattern: None,
+      oauth2: None,
     }
   }
 
@@ -752,6 +783,7 @@ mod tests {
         allow: vec![],
         pattern: None,
         registry: None,
+        oauth2: None,
         tls: BTreeMap::new(),
         if_missing: crate::config::IfMissing::default(),
       },
@@ -801,6 +833,7 @@ mod tests {
         allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
         pattern: None,
         registry: None,
+        oauth2: None,
         tls,
         if_missing: crate::config::IfMissing::default(),
       },
@@ -816,6 +849,53 @@ mod tests {
       plugins: BTreeMap::new(),
       agents: BTreeMap::new(),
     }
+  }
+
+  fn config_with_rule(label: &str, env: &str, value: &str, allow: Vec<&str>) -> AppConfig {
+    let mut rules = std::collections::BTreeMap::new();
+    rules.insert(
+      label.to_string(),
+      crate::config::RuleCfg {
+        env: env.to_string(),
+        value: Some(SecretString::from(value)),
+        real: None,
+        fnox_key: None,
+        allow: allow.into_iter().map(str::to_string).collect(),
+        pattern: None,
+        oauth2: None,
+        registry: Some(false),
+        tls: BTreeMap::new(),
+        if_missing: crate::config::IfMissing::Error,
+      },
+    );
+    AppConfig {
+      proxy: crate::config::ProxyCfg {
+        listen: "127.0.0.1:8080".parse().unwrap(),
+        ca_file: None,
+        handshake_timeout_secs: 10,
+      },
+      workspace: crate::config::WorkspaceCfg::default(),
+      rules,
+      plugins: BTreeMap::new(),
+      agents: BTreeMap::new(),
+    }
+  }
+
+  #[test]
+  fn tcp_grant_decoy_matches_the_real_value_length() {
+    let config = config_with_rule("db", "PGPASSWORD", "twenty-char-password", vec!["tcp://10.0.0.8:5432"]);
+    let resolved = resolve(&config).unwrap();
+    let grant = &resolved.grants[0];
+    assert_eq!(grant.credential().fake.len(), 20, "decoy length equals the real value length");
+  }
+
+  #[test]
+  fn https_only_grant_keeps_the_shaped_decoy() {
+    let config = config_with_rule("gh", "GITHUB_TOKEN", "ghp_real", vec!["https://api.github.com"]);
+    let resolved = resolve(&config).unwrap();
+    let grant = &resolved.grants[0];
+    assert_eq!(grant.credential().fake, crate::config::fake_for("GITHUB_TOKEN", None));
+    assert_eq!(grant.credential().fake.len(), 32, "default pattern renders 32 hex characters");
   }
 
   #[test]

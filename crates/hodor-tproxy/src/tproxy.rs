@@ -414,6 +414,8 @@ mod tests {
         client_key: None,
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
+      pattern: None,
+      oauth2: None,
     }];
     let state = Arc::new(
       ProxyState::new(

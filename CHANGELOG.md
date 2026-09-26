@@ -1,8 +1,22 @@
+## [0.2.0] - 2026-09-26
+
+### 🚀 Features
+
+- Response-side OAuth2 token minting
+
+### ⚙️ Miscellaneous Tasks
+
+- *(vcs)* Add worktrunk confg
 ## [0.1.23] - 2026-09-25
 
 ### 🚀 Features
 
 - *(proxy)* Tcp, mTLS, and postgres wire substitution (#36)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.1.23 [ci skip]
+- Release
 ## [0.1.22] - 2026-09-20
 
 ### 🚀 Features

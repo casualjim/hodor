@@ -1,8 +1,18 @@
+## [0.2.2] - 2026-09-27
+
+### ⚙️ Miscellaneous Tasks
+
+- Refresh mise tool lock, add jj bookmark cleanup to worktrunk
 ## [0.2.1] - 2026-09-26
 
 ### 🚀 Features
 
 - *(compose)* Netns-scoped capture, agent port exposure (#38)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.2.1 [ci skip]
+- Release
 ## [0.2.0] - 2026-09-26
 
 ### 🚀 Features

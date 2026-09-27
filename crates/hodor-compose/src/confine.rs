@@ -144,9 +144,10 @@ fn resolve_root(workspace: &Path) -> eyre::Result<PathBuf> {
 
 /// The workspace layer of the config overlay: the file `hodor init` writes when
 /// the workspace has none, and whose content decides whether the generated
-/// stack is still current.
+/// stack is still current. Always the unified path; reads fall back to the
+/// legacy flat file.
 fn workspace_config_file(root: &Path) -> PathBuf {
-  root.join(".config").join("hodor.toml")
+  hodor_config::config::project_config_write_path(root)
 }
 
 /// Write `content` unless the file is already there; `true` means it was
@@ -169,11 +170,11 @@ pub(crate) fn write_if_absent(path: &Path, content: &str) -> eyre::Result<bool> 
 /// decoy — so `init` writes the file rather than serving a workspace that
 /// cannot swap anything. The file is the user's to trim from then on.
 fn ensure_workspace_config(root: &Path) -> eyre::Result<(PathBuf, bool)> {
-  let path = workspace_config_file(root);
-  if path.exists() {
-    return Ok((path, false));
+  if let Some(existing) = hodor_config::config::project_config_file(root) {
+    return Ok((existing, false));
   }
-  let content = rules_command().wrap_err("generate the workspace rules")?;
+  let path = workspace_config_file(root);
+  let content = rules_command(Some(root)).wrap_err("generate the workspace rules")?;
   let written = write_if_absent(&path, &content)?;
   Ok((path, written))
 }
@@ -191,21 +192,51 @@ pub(crate) fn rules_warning(rules: &BTreeMap<String, hodor_config::config::RuleC
   ))
 }
 
-/// Digest of both config layers' bytes — global and workspace — so a stack
-/// generated from different settings can be told apart from a current one:
-/// generation reads both, so editing either must regenerate. `DefaultHasher`
+/// Digest of both config layers' bytes — global and workspace — plus the
+/// `rules.d` override trees both sides, so a stack generated from different
+/// settings can be told apart from a current one: generation reads all of
+/// them, so editing any must regenerate. `DefaultHasher`
 /// is enough: this only ever compares digests written by the same binary.
 pub(crate) fn config_digest(root: &Path) -> u64 {
   use std::hash::{Hash as _, Hasher as _};
+  fn hash_file(path: &Path, hasher: &mut std::collections::hash_map::DefaultHasher) {
+    match std::fs::read(path) {
+      Ok(bytes) => bytes.hash(hasher),
+      Err(_) => "absent".hash(hasher),
+    }
+    path.hash(hasher);
+  }
+  fn hash_rules_dir(dir: &Path, hasher: &mut std::collections::hash_map::DefaultHasher) {
+    let mut files = std::fs::read_dir(dir)
+      .ok()
+      .map(|entries| {
+        entries
+          .flatten()
+          .map(|entry| entry.path())
+          .filter(|path| path.is_file())
+          .collect::<Vec<_>>()
+      })
+      .unwrap_or_default();
+    files.sort();
+    if files.is_empty() {
+      "absent".hash(hasher);
+      dir.hash(hasher);
+      return;
+    }
+    for path in files {
+      hash_file(&path, hasher);
+    }
+  }
   let mut hasher = std::collections::hash_map::DefaultHasher::new();
   let global = hodor_config::config::config_dir().map(|dir| dir.join("config.toml"));
-  for path in global.into_iter().chain([workspace_config_file(root)]) {
-    match std::fs::read(&path) {
-      Ok(bytes) => bytes.hash(&mut hasher),
-      Err(_) => "absent".hash(&mut hasher),
-    }
-    path.hash(&mut hasher);
+  let legacy = root.join(".config").join("hodor.toml");
+  for path in global.into_iter().chain([workspace_config_file(root), legacy]) {
+    hash_file(&path, &mut hasher);
   }
+  if let Some(global_rules) = hodor_config::config::rules_dir() {
+    hash_rules_dir(&global_rules, &mut hasher);
+  }
+  hash_rules_dir(&hodor_config::config::project_rules_dir(root), &mut hasher);
   hasher.finish()
 }
 

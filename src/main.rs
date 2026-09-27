@@ -50,7 +50,10 @@ async fn main() -> eyre::Result<()> {
       if let Some(pattern) = args.pattern.as_deref() {
         hodor_config::config::validate_pattern(pattern).map_err(|err| eyre::eyre!("bad --pattern: {err}"))?;
       }
-      let registry = hodor_config::registry::Registry::load(hodor_config::config::rules_dir().as_deref())?;
+      let registry = hodor_config::registry::Registry::load_union(
+        hodor_config::config::rules_dir().as_deref(),
+        hodor_config::config::cwd_project_rules_dir().as_deref(),
+      )?;
       let (mut config, _) = hodor_config::config::load(&cli)?;
       // Resolve the rule's value the way `serve` does, so a `tcp://` rule
       // previews the length-matched decoy the proxy will actually use.
@@ -93,7 +96,10 @@ async fn main() -> eyre::Result<()> {
       Ok(())
     }
     Command::Rules => {
-      print!("{}", hodor_compose::rules_command()?);
+      print!(
+        "{}",
+        hodor_compose::rules_command(hodor_config::config::cwd_project_rules_dir().as_deref())?
+      );
       Ok(())
     }
     Command::Registry(args) => {
@@ -150,7 +156,10 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     eyre::bail!("--ebpf-cgroup is required for --proxy-backend ebpf");
   }
   let (mut config, workspace) = hodor_config::config::load(cli)?;
-  let registry = hodor_config::registry::Registry::load(hodor_config::config::rules_dir().as_deref())?;
+  let registry = hodor_config::registry::Registry::load_union(
+    hodor_config::config::rules_dir().as_deref(),
+    hodor_config::config::cwd_project_rules_dir().as_deref(),
+  )?;
   // fnox is needed exactly when a rule has no inline value: every
   // credential the proxy runs with resolves from fnox, age-encrypted secrets
   // included — never from the environment that started this process.

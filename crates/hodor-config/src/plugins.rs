@@ -110,7 +110,7 @@ mod tests {
       workspace: crate::config::WorkspaceCfg::default(),
       rules: BTreeMap::new(),
       plugins,
-      agents: BTreeMap::new(),
+      tools: BTreeMap::new(),
     }
   }
 

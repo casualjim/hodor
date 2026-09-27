@@ -6,7 +6,7 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 
 1. CLI flags: `--listen`, `--ca-file`, `--config`.
 2. Environment variables: `HODOR_LISTEN`, `HODOR_CA_FILE`, `HODOR_CONFIG`, `HODOR_PROXY_BACKEND`, `HODOR_TPROXY_ALLOW_ROOT_NETNS`.
-3. The project file at `<workspace root>/.config/hodor.toml`. The workspace root is found by walking up from the working directory.
+3. The project file at `<workspace root>/.config/hodor/config.toml` (legacy `.config/hodor.toml` still reads). The workspace root is found by walking up from the working directory.
 4. The global file at `$HODOR_CONFIG` or `<config-dir>/hodor/config.toml`.
 
 `--config <FILE>` replaces the project layer, it does not add a fifth one.
@@ -67,21 +67,39 @@ Controls the compose stack `hodor init` generates.
 | `shell` | `sh` | Shell `hodor agent` runs in the container when no command is given. |
 | `include` | empty | Extra host paths the agent service mounts, translated into the container home. `~` expands; relative paths resolve against the workspace root; a trailing `:ro`/`:rw` sets the mode. Overlapping paths reuse the covering mount. A path that does not exist fails generation, because docker would mount an empty directory in its place. |
 | `ports` | empty | Ports published on the host as stable `127.0.0.1:<port>` bindings, forwarded to the same port inside the agent's shared network namespace. The generated stack's `fwd` sidecar exposes every agent-owned loopback listener there; a published port names one reliably from the host instead of through a changing container IP. Applying a change needs a stack restart. Port `0` and the capture listener ports (`15000`, `15001`) are refused at load. |
+| `profile` | `__shared__` | Isolated tool-config namespace the generated stack mounts. Profiles inherit off `__shared__` through `profile.toml` cookies naming a parent. |
 
-## `[agents.<name>]`
+## Profiles
 
-Agent config mounts for the confine stack. Every directory under `<config-dir>/hodor/agents/` whose name the table covers mounts into the agent container at the location that agent reads its own configuration from by default, so nothing has to set a config-directory variable.
+Isolated tool-config namespaces for the confine stack. Global profiles live under `<config-dir>/hodor/profiles/<name>/`; project ones under `<workspace root>/.config/hodor/profiles/<name>/`. Each `<tool>/` directory inside a profile mounts into the agent container at the location that tool reads its own configuration from by default, so nothing has to set a config-directory variable. The workspace selects its profile with `[workspace] profile`; unset selects `__shared__`, the base every other profile inherits off and hodor always creates.
+
+```toml
+[workspace]
+profile = "work"
+```
+
+```toml
+# profiles/work/profile.toml
+[profile]
+parent = "__shared__"
+```
+
+A profile mounts its own tool dirs plus every tool its cookie parent names that it does not override. The mounts are writable: what the tool writes lands beside the profile on the host. No cookie means `__shared__` directly, and when both layers hold a `profile.toml` the project one wins outright. Cycles, unknown parents, and non-segment names fail generation.
+
+## `[tools.<name>]`
+
+Tool config mounts for the confine stack, by tool name.
 
 | Key | Required | Purpose |
 | --- | --- | --- |
 | `config_dir` | yes | Container path the directory mounts at. `{home}` expands to `[workspace] home`. Must expand to an absolute path. |
 
 ```toml
-[agents.trae]
+[tools.trae]
 config_dir = "{home}/.trae"
 ```
 
-An entry overrides a built-in path for that name or adds a name the table does not carry. The mount is writable: what the agent writes lands under `<config-dir>/hodor/agents/<name>` on the host.
+An entry overrides a built-in path for that name or adds a name the table does not carry; a named tool found nowhere is created under the selected profile. The built-in table covers the agent CLIs plus `gh` at `{home}/.config/gh`.
 
 ## Environment variables
 

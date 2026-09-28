@@ -3,16 +3,20 @@
 //! Registry and host knowledge live in `hodor-config`; everything that talks
 //! to fnox lives here.
 
+mod error;
 mod layers;
+
+pub use error::Error;
 
 #[cfg(test)]
 use std::path::Path;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 
-use eyre::WrapErr as _;
-use hodor_config::config::RuleCfg;
-use hodor_config::registry::Registry;
+use fnox_core::env as fnox_env;
+use hodor_config::config::{AppConfig, IfMissing, RuleCfg};
+use hodor_config::registry::{Registry, authority_of};
 use secrecy::SecretString;
 
 /// Merged fnox config plus the profiles and names it declares.
@@ -24,31 +28,31 @@ pub struct FnoxSource {
 }
 
 /// Map a discovery failure with no config found to `None`; other errors stay.
-fn discovered_or_none(found: fnox_core::Result<fnox_core::config::Config>) -> eyre::Result<Option<fnox_core::config::Config>> {
+fn discovered_or_none(found: fnox_core::Result<fnox_core::config::Config>) -> Result<Option<fnox_core::config::Config>, Error> {
   match found {
     Ok(config) => Ok(Some(config)),
     Err(fnox_core::FnoxError::ConfigNotFound { .. }) => Ok(None),
-    Err(err) => Err(err).wrap_err("fnox discovery failed"),
+    Err(err) => Err(Error::Discovery { source: err }),
   }
 }
 
 /// The profile stack the chain loaded with, expanded through inheritance the
 /// way `load_with_recursion` does, so lookup sees the same stack.
-fn active_profiles(config: &fnox_core::config::Config) -> eyre::Result<Vec<String>> {
+fn active_profiles(config: &fnox_core::config::Config) -> Result<Vec<String>, Error> {
   config
     .resolve_profiles(&fnox_core::config::Config::get_profiles(&[]))
-    .wrap_err("fnox profiles")
+    .map_err(|source| Error::Profiles { source })
 }
 
 /// Names a config declares under the active profiles.
-fn declared_names(config: &fnox_core::config::Config, profiles: &[String]) -> eyre::Result<BTreeSet<String>> {
+fn declared_names(config: &fnox_core::config::Config, profiles: &[String]) -> Result<BTreeSet<String>, Error> {
   // Same setting value() reads through get_secret, so the declared set and the
   // resolved value cannot disagree about whether top-level secrets count.
   let no_defaults = fnox_core::settings::Settings::get().no_defaults;
   Ok(
     config
       .get_secrets_with_no_defaults(profiles, no_defaults)
-      .wrap_err("fnox: cannot list secrets")?
+      .map_err(|source| Error::ListSecrets { source })?
       .into_keys()
       .collect(),
   )
@@ -61,7 +65,7 @@ impl FnoxSource {
   ///
   /// Returns an error when a discovered config file is malformed, when its
   /// profiles are unresolvable, or when fnox cannot list its declared secrets.
-  pub fn open() -> eyre::Result<Option<Self>> {
+  pub fn open() -> Result<Option<Self>, Error> {
     let Some(config) = discovered_or_none(crate::layers::discover())? else {
       return Ok(None);
     };
@@ -76,8 +80,11 @@ impl FnoxSource {
 
   /// Open one explicit config file; test injection point.
   #[cfg(test)]
-  fn open_at(path: &Path) -> eyre::Result<Self> {
-    let config = crate::layers::load(path).wrap_err_with(|| format!("fnox config {}", path.display()))?;
+  fn open_at(path: &Path) -> Result<Self, Error> {
+    let config = crate::layers::load(path).map_err(|source| Error::ConfigFile {
+      path: path.to_path_buf(),
+      source,
+    })?;
     let profiles = active_profiles(&config)?;
     let declared = declared_names(&config, &profiles)?;
     Ok(Self {
@@ -95,24 +102,29 @@ impl FnoxSource {
 
   /// Value for one key: `None` when fnox does not declare it, error when a
   /// declared key resolves to nothing usable (no value or an empty one).
-  async fn value(&self, key: &str) -> eyre::Result<Option<String>> {
+  async fn value(&self, key: &str) -> Result<Option<String>, Error> {
     if !self.declared.contains(key) {
       return Ok(None);
     }
-    let Some(secret) = self
-      .config
-      .get_secret(&self.profiles, key)
-      .wrap_err_with(|| format!("fnox secret `{key}`"))?
+    let Some(secret) = self.config.get_secret(&self.profiles, key).map_err(|source| Error::Secret {
+      key: key.to_string(),
+      source,
+    })?
     else {
-      eyre::bail!("fnox key `{key}` is declared but resolves to no value");
+      return Err(Error::DeclaredNoValue { key: key.to_string() });
     };
     let resolved = fnox_core::secret_resolver::resolve_secret(&self.config, &self.profiles, key, secret)
       .await
-      .wrap_err_with(|| format!("fnox secret `{key}`"))?;
+      .map_err(|source| Error::Secret {
+        key: key.to_string(),
+        source,
+      })?;
     let Some(value) = resolved else {
-      eyre::bail!("fnox key `{key}` is declared but resolves to no value");
+      return Err(Error::DeclaredNoValue { key: key.to_string() });
     };
-    eyre::ensure!(!value.is_empty(), "fnox key `{key}` is declared but resolves to an empty value");
+    if value.is_empty() {
+      return Err(Error::DeclaredEmpty { key: key.to_string() });
+    }
     Ok(Some(value))
   }
 }
@@ -195,14 +207,12 @@ pub const FNOX_ENV: &[&str] = &[
 /// that resolves to nothing warns instead of failing startup, because the rule
 /// needing that provider reports the real error a moment later.
 ///
-/// # Errors
-///
-/// Returns an error only when reading fnox's declared set fails; a declared
-/// name that does not resolve is warned about and skipped.
-pub async fn export_provider_env(fnox: &FnoxSource) -> eyre::Result<Vec<String>> {
+/// A declared name that does not resolve is warned about and skipped, so this
+/// never fails.
+pub async fn export_provider_env(fnox: &FnoxSource) -> Vec<String> {
   let mut exported = Vec::new();
   for name in FNOX_ENV {
-    if std::env::var_os(name).is_some() || !fnox.declared().contains(*name) {
+    if env::var_os(name).is_some() || !fnox.declared().contains(*name) {
       continue;
     }
     match fnox.value(name).await {
@@ -210,14 +220,14 @@ pub async fn export_provider_env(fnox: &FnoxSource) -> eyre::Result<Vec<String>>
         // fnox-core's own write path, which serializes with the rest of fnox's
         // environment access; this runs once at startup, before any task reads
         // the environment.
-        fnox_core::env::set_var(name, value);
+        fnox_env::set_var(name, value);
         exported.push((*name).to_string());
       }
       Ok(None) => {}
       Err(err) => tracing::warn!(name, "provider credential declared in fnox did not resolve: {err}"),
     }
   }
-  Ok(exported)
+  exported
 }
 
 /// Env names fnox declares that the registry knows, sorted; `None` yields none.
@@ -245,7 +255,7 @@ fn fnox_key(rule: &RuleCfg) -> String {
 ///
 /// Returns an error when a rule's `fnox_key` is declared yet resolves to no
 /// usable value, or when a rule's `allow` entry fails to parse.
-pub async fn resolve(config: &mut hodor_config::config::AppConfig, registry: &Registry, fnox: Option<FnoxSource>) -> eyre::Result<()> {
+pub async fn resolve(config: &mut AppConfig, registry: &Registry, fnox: Option<FnoxSource>) -> Result<(), Error> {
   // Values are fetched before the map is mutated, so rules stay borrowed
   // immutably while fnox is awaited.
   let keys = config
@@ -319,7 +329,7 @@ pub async fn resolve(config: &mut hodor_config::config::AppConfig, registry: &Re
         .into_iter()
         .flatten()
       {
-        let authority = hodor_config::registry::authority_of(url)?;
+        let authority = authority_of(url)?;
         if !rule.allow.contains(&authority) {
           rule.allow.push(authority);
         }
@@ -342,27 +352,36 @@ pub async fn resolve(config: &mut hodor_config::config::AppConfig, registry: &Re
 
 /// Apply one rule's `if_missing` policy. Returns `Ok(())` when the caller
 /// must drop the rule; `Error` bails instead.
-fn skip(label: &str, rule: &RuleCfg, what: &str) -> eyre::Result<()> {
+fn skip(label: &str, rule: &RuleCfg, detail: &str) -> Result<(), Error> {
   match rule.if_missing {
-    hodor_config::config::IfMissing::Error => eyre::bail!("rule `{label}` (env {}): {what}", rule.env),
-    hodor_config::config::IfMissing::Warn => {
-      tracing::warn!(label, env = %rule.env, reason = what, "dropping rule");
+    IfMissing::Error => Err(Error::UnresolvedRule {
+      label: label.to_string(),
+      env: rule.env.clone(),
+      detail: detail.to_string(),
+    }),
+    IfMissing::Warn => {
+      tracing::warn!(label, env = %rule.env, reason = detail, "dropping rule");
       Ok(())
     }
-    hodor_config::config::IfMissing::Ignore => Ok(()),
+    IfMissing::Ignore => Ok(()),
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::path::PathBuf;
-
+  use hodor_config::config::{ProxyCfg, WorkspaceCfg};
+  use hodor_config::registry::{FlowKind, OAuthFlow};
   use pretty_assertions::assert_eq;
+  use secrecy::ExposeSecret as _;
+  use std::error::Error as _;
+  use std::fs;
+  use std::path::PathBuf;
+  use tempfile::tempdir;
 
   #[tokio::test]
   async fn resolve_unions_registry_hosts_with_explicit_allow() {
-    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let registry = Registry::load(None).unwrap();
     let mut rule = rule("GITHUB_TOKEN");
     rule.allow = vec!["https://ghe.corp.example".to_string()];
     let mut config = config_with("gh", rule);
@@ -375,10 +394,10 @@ mod tests {
 
   #[tokio::test]
   async fn resolve_unions_flow_authorities_into_allow() {
-    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let registry = Registry::load(None).unwrap();
     let mut rule = rule("GITHUB_TOKEN");
-    rule.oauth2 = Some(hodor_config::registry::OAuthFlow {
-      flow: hodor_config::registry::FlowKind::ClientCredentials,
+    rule.oauth2 = Some(OAuthFlow {
+      flow: FlowKind::ClientCredentials,
       token_url: "https://auth.example.com/oauth/token".into(),
       authorize_url: None,
       refresh_url: None,
@@ -409,14 +428,14 @@ mod tests {
   }
   #[tokio::test]
   async fn resolve_fills_the_pattern_from_the_registry() {
-    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let registry = Registry::load(None).unwrap();
     let mut config = config_with("gh", rule("GITHUB_TOKEN"));
     resolve(&mut config, &registry, None).await.unwrap();
     assert_eq!(config.rules["gh"].pattern.as_deref(), Some("ghp_{hex:40}"));
   }
   #[tokio::test]
   async fn resolve_keeps_an_explicit_pattern() {
-    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let registry = Registry::load(None).unwrap();
     let mut rule = rule("GITHUB_TOKEN");
     rule.pattern = Some("ghp_custom_{hex:8}".to_string());
     let mut config = config_with("gh", rule);
@@ -425,7 +444,7 @@ mod tests {
   }
   #[tokio::test]
   async fn empty_explicit_pattern_falls_back_to_the_registry() {
-    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let registry = Registry::load(None).unwrap();
     let mut rule = rule("GITHUB_TOKEN");
     rule.pattern = Some(String::new());
     let mut config = config_with("gh", rule);
@@ -434,25 +453,25 @@ mod tests {
   }
   #[tokio::test]
   async fn missing_hosts_error_by_default() {
-    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let registry = Registry::load(None).unwrap();
     let mut config = config_with("unknown", rule("NO_SUCH_SERVICE_TOKEN"));
     let err = resolve(&mut config, &registry, None).await.unwrap_err();
     assert!(err.to_string().contains("no hosts"), "{err:?}");
   }
   #[tokio::test]
   async fn missing_hosts_warn_drops_the_rule() {
-    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let registry = Registry::load(None).unwrap();
     let mut rule = rule("NO_SUCH_SERVICE_TOKEN");
-    rule.if_missing = hodor_config::config::IfMissing::Warn;
+    rule.if_missing = IfMissing::Warn;
     let mut config = config_with("unknown", rule);
     resolve(&mut config, &registry, None).await.unwrap();
     assert!(config.rules.is_empty());
   }
   #[tokio::test]
   async fn missing_hosts_ignore_drops_the_rule_silently() {
-    let registry = hodor_config::registry::Registry::load(None).unwrap();
+    let registry = Registry::load(None).unwrap();
     let mut rule = rule("NO_SUCH_SERVICE_TOKEN");
-    rule.if_missing = hodor_config::config::IfMissing::Ignore;
+    rule.if_missing = IfMissing::Ignore;
     let mut config = config_with("unknown", rule);
     resolve(&mut config, &registry, None).await.unwrap();
     assert!(config.rules.is_empty());
@@ -461,27 +480,27 @@ mod tests {
   fn rule(env: &str) -> RuleCfg {
     RuleCfg {
       env: env.to_string(),
-      value: Some(secrecy::SecretString::from("inline")),
+      value: Some(SecretString::from("inline")),
       real: None,
       fnox_key: None,
       allow: Vec::new(),
       pattern: None,
       oauth2: None,
       registry: None,
-      if_missing: hodor_config::config::IfMissing::Error,
-      tls: std::collections::BTreeMap::new(),
+      if_missing: IfMissing::Error,
+      tls: BTreeMap::new(),
     }
   }
 
-  fn config_with(label: &str, rule: RuleCfg) -> hodor_config::config::AppConfig {
-    let mut config = hodor_config::config::AppConfig {
-      proxy: hodor_config::config::ProxyCfg {
+  fn config_with(label: &str, rule: RuleCfg) -> AppConfig {
+    let mut config = AppConfig {
+      proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
-      workspace: hodor_config::config::WorkspaceCfg::default(),
+      workspace: WorkspaceCfg::default(),
       rules: BTreeMap::new(),
       plugins: BTreeMap::new(),
       tools: BTreeMap::new(),
@@ -514,7 +533,7 @@ value = "other-real-token"
   }
 
   /// Config whose only rule pulls its value from the temp fnox file.
-  fn config_with_fnox(label: &str, env: &str) -> hodor_config::config::AppConfig {
+  fn config_with_fnox(label: &str, env: &str) -> AppConfig {
     let mut rule = rule(env);
     rule.value = None;
     config_with(label, rule)
@@ -523,12 +542,12 @@ value = "other-real-token"
   /// Test-only env removal, so the unsafe call lives in one place.
   fn unset_env(key: &str) {
     // SAFETY: test-only mutation, and nextest runs one test per process.
-    unsafe { std::env::remove_var(key) };
+    unsafe { env::remove_var(key) };
   }
 
   fn write_fnox(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("fnox.toml");
-    std::fs::write(&path, body).unwrap();
+    fs::write(&path, body).unwrap();
     path
   }
 
@@ -550,13 +569,13 @@ value = "bws-from-fnox"
     unset_env(key);
 
     let fnox = FnoxSource::open_at(&path).unwrap();
-    assert_eq!(export_provider_env(&fnox).await.unwrap(), vec![key.to_string()]);
-    assert_eq!(std::env::var(key).unwrap(), "bws-from-fnox");
+    assert_eq!(export_provider_env(&fnox).await, vec![key.to_string()]);
+    assert_eq!(env::var(key).unwrap(), "bws-from-fnox");
 
     // The shell wins, and nothing is exported twice.
-    assert!(export_provider_env(&fnox).await.unwrap().is_empty());
+    assert!(export_provider_env(&fnox).await.is_empty());
     // A name fnox does not declare is never touched.
-    assert!(std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_none());
+    assert!(env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_none());
 
     unset_env(key);
   }
@@ -564,45 +583,45 @@ value = "bws-from-fnox"
   #[tokio::test]
   async fn fnox_supplies_the_value() {
     let registry = Registry::load(None).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
     let mut config = config_with_fnox("gh", "GITHUB_TOKEN");
     let fnox = FnoxSource::open_at(&fnox_path).unwrap();
     resolve(&mut config, &registry, Some(fnox)).await.unwrap();
     let value = config.rules["gh"].value.as_ref().unwrap();
-    assert_eq!(secrecy::ExposeSecret::expose_secret(value), "real-github-token");
+    assert_eq!(value.expose_secret(), "real-github-token");
   }
 
   #[tokio::test]
   async fn inline_value_wins_over_fnox() {
     let registry = Registry::load(None).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
     let mut config = config_with_fnox("gh", "GITHUB_TOKEN");
-    config.rules.get_mut("gh").unwrap().value = Some(secrecy::SecretString::from("inline-wins"));
+    config.rules.get_mut("gh").unwrap().value = Some(SecretString::from("inline-wins"));
     let fnox = FnoxSource::open_at(&fnox_path).unwrap();
     resolve(&mut config, &registry, Some(fnox)).await.unwrap();
     let value = config.rules["gh"].value.as_ref().unwrap();
-    assert_eq!(secrecy::ExposeSecret::expose_secret(value), "inline-wins");
+    assert_eq!(value.expose_secret(), "inline-wins");
   }
 
   #[tokio::test]
   async fn fnox_key_overrides_the_env_name() {
     let registry = Registry::load(None).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
     let mut config = config_with_fnox("gh", "GITHUB_TOKEN");
     config.rules.get_mut("gh").unwrap().fnox_key = Some("OTHER_TOKEN".to_string());
     let fnox = FnoxSource::open_at(&fnox_path).unwrap();
     resolve(&mut config, &registry, Some(fnox)).await.unwrap();
     let value = config.rules["gh"].value.as_ref().unwrap();
-    assert_eq!(secrecy::ExposeSecret::expose_secret(value), "other-real-token");
+    assert_eq!(value.expose_secret(), "other-real-token");
   }
 
   #[tokio::test]
   async fn undeclared_fnox_key_follows_if_missing() {
     let registry = Registry::load(None).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_PLAIN);
     let mut config = config_with_fnox("gh", "GITHUB_TOKEN");
     config.rules.get_mut("gh").unwrap().fnox_key = Some("NOT_DECLARED".to_string());
@@ -613,20 +632,20 @@ value = "bws-from-fnox"
     assert!(err.to_string().contains("fnox does not declare"), "{err:?}");
 
     let mut lenient = config;
-    lenient.rules.get_mut("gh").unwrap().if_missing = hodor_config::config::IfMissing::Warn;
+    lenient.rules.get_mut("gh").unwrap().if_missing = IfMissing::Warn;
     resolve(&mut lenient, &registry, Some(fnox)).await.unwrap();
     assert!(lenient.rules.is_empty());
   }
 
   #[tokio::test]
   async fn missing_fnox_config_file_is_an_error() {
-    let err = match FnoxSource::open_at(std::path::Path::new("/nonexistent/hodor-absent-fnox.toml")) {
+    let err = match FnoxSource::open_at(Path::new("/nonexistent/hodor-absent-fnox.toml")) {
       Err(err) => err,
       Ok(source) => panic!("expected an error, got {source:?}"),
     };
-    assert!(err.to_string().contains("fnox"), "{err:?}");
-    // The io error stays attached as the source of the fnox context.
-    assert!(format!("{err:?}").contains("Caused by"), "{err:?}");
+    assert!(err.to_string().contains("fnox config"), "{err:?}");
+    // The io error stays attached as the error source.
+    assert!(err.source().is_some(), "{err:?}");
   }
 
   const FNOX_AGE_WITHOUT_KEY_FILE: &str = r#"
@@ -652,13 +671,9 @@ value = ""
   #[tokio::test]
   async fn declared_key_that_cannot_be_fetched_errors_under_every_if_missing() {
     let registry = Registry::load(None).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_AGE_WITHOUT_KEY_FILE);
-    for if_missing in [
-      hodor_config::config::IfMissing::Error,
-      hodor_config::config::IfMissing::Warn,
-      hodor_config::config::IfMissing::Ignore,
-    ] {
+    for if_missing in [IfMissing::Error, IfMissing::Warn, IfMissing::Ignore] {
       let mut rule = rule("GITHUB_TOKEN");
       rule.value = None;
       rule.fnox_key = Some("DECLARED_BUT_UNRESOLVABLE".to_string());
@@ -673,13 +688,9 @@ value = ""
   #[tokio::test]
   async fn declared_key_that_resolves_empty_errors_under_every_if_missing() {
     let registry = Registry::load(None).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let fnox_path = write_fnox(dir.path(), FNOX_EMPTY_VALUE);
-    for if_missing in [
-      hodor_config::config::IfMissing::Error,
-      hodor_config::config::IfMissing::Warn,
-      hodor_config::config::IfMissing::Ignore,
-    ] {
+    for if_missing in [IfMissing::Error, IfMissing::Warn, IfMissing::Ignore] {
       let mut rule = rule("GITHUB_TOKEN");
       rule.value = None;
       rule.fnox_key = Some("DECLARED_BUT_EMPTY".to_string());

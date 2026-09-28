@@ -6,13 +6,18 @@
 //!
 //! Privileges: `CAP_NET_ADMIN` (nft table, fib rules, `IP_TRANSPARENT`).
 
+use crate::Error;
 use crate::nft;
 use crate::route;
 
+use std::fs;
+use std::io;
+use std::mem;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::AsRawFd as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
 
 use netlink_packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage, NetlinkPayload};
 use netlink_packet_netfilter::none::ControlMessage;
@@ -49,7 +54,7 @@ const LISTEN_PORT: u16 = 15000;
 ///
 /// Returns an error when the capture rules cannot be installed or the
 /// listener cannot be bound.
-pub async fn run_tproxy(state: Arc<ProxyState>, allow_root_netns: bool) -> eyre::Result<()> {
+pub async fn run_tproxy(state: Arc<ProxyState>, allow_root_netns: bool) -> Result<(), Error> {
   run_tproxy_with(
     Options {
       allow_root_netns,
@@ -90,17 +95,18 @@ fn unscoped_capture_refused(has_scope: bool, isolated_netns: bool, allow_root_ne
   !has_scope && !isolated_netns && !allow_root_netns
 }
 
-fn netns_inode(path: &str) -> eyre::Result<u64> {
+fn netns_inode(path: &str) -> Result<u64, Error> {
   use std::os::unix::fs::MetadataExt as _;
-  std::fs::metadata(path)
-    .map(|meta| meta.ino())
-    .map_err(|err| eyre::eyre!("stat {path}: {err}"))
+  fs::metadata(path).map(|meta| meta.ino()).map_err(|err| Error::Stat {
+    path: path.to_string(),
+    origin: err,
+  })
 }
 
 /// True when our network namespace differs from PID 1's: `ip netns`,
 /// bubblewrap `--unshare-net`, or a VM. The root netns of a bare host reads
 /// false, which is the point.
-fn netns_isolated() -> eyre::Result<bool> {
+fn netns_isolated() -> Result<bool, Error> {
   Ok(netns_inode("/proc/self/ns/net")? != netns_inode("/proc/1/ns/net")? || in_container())
 }
 
@@ -111,7 +117,7 @@ fn in_container() -> bool {
   Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
 }
 
-fn assert_unscoped_capture_allowed(options: &Options) -> eyre::Result<()> {
+fn assert_unscoped_capture_allowed(options: &Options) -> Result<(), Error> {
   if options.allow_root_netns {
     tracing::warn!(
       "installing unscoped TPROXY capture rules by explicit request; cleanup if this process is SIGKILLed: \
@@ -121,20 +127,15 @@ fn assert_unscoped_capture_allowed(options: &Options) -> eyre::Result<()> {
   }
   let isolated = netns_isolated()?;
   if unscoped_capture_refused(options.scope.is_some(), isolated, false) {
-    eyre::bail!(
-      "refusing to install unscoped TPROXY capture rules in the host network namespace: every outbound TCP \
-       packet would be rerouted into hodor until the process exits cleanly. Run inside a network namespace \
-       (bubblewrap / ip netns / VM) or pass --tproxy-allow-root-netns (env HODOR_TPROXY_ALLOW_ROOT_NETNS=1) \
-       if this machine is disposable"
-    );
+    return Err(Error::UnscopedCapture);
   }
   Ok(())
 }
 
-pub(crate) async fn run_tproxy_with(options: Options, state: Arc<ProxyState>) -> eyre::Result<()> {
+pub(crate) async fn run_tproxy_with(options: Options, state: Arc<ProxyState>) -> Result<(), Error> {
   assert_unscoped_capture_allowed(&options)?;
   let listener = transparent_listener(options.port.unwrap_or(LISTEN_PORT)).await?;
-  let listen_port = listener.local_addr().map_err(|err| eyre::eyre!("tproxy local addr: {err}"))?.port();
+  let listen_port = listener.local_addr().map_err(|err| Error::TproxyLocalAddr { origin: err })?.port();
   let handle = route::netlink()?;
   let lo = route::link_index(&handle, "lo").await?;
   for plan in route::proxy_rules(ROUTE_TABLE) {
@@ -159,7 +160,7 @@ pub(crate) async fn run_tproxy_with(options: Options, state: Arc<ProxyState>) ->
   let install_messages = capture.install_messages();
   tokio::task::spawn_blocking(move || send_batch(install_messages))
     .await
-    .map_err(|err| eyre::eyre!("nft install task: {err}"))??;
+    .map_err(|err| Error::NftInstallTask { source: err })??;
   let _nft = NftGuard {
     teardown: Some(capture.teardown_message()),
   };
@@ -173,7 +174,7 @@ pub(crate) async fn run_tproxy_with(options: Options, state: Arc<ProxyState>) ->
   // the Drop guards when this task is dropped; SIGKILL is uncatchable and
   // the install log names the manual cleanup commands for that case.
   loop {
-    let (stream, _peer) = listener.accept().await.map_err(|err| eyre::eyre!("tproxy accept: {err}"))?;
+    let (stream, _peer) = listener.accept().await.map_err(|err| Error::TproxyAccept { origin: err })?;
     // On a transparent socket the local address IS the original destination.
     let stream = stream.stream;
     let Ok(dst) = stream.local_addr() else {
@@ -196,16 +197,18 @@ async fn tproxy_conn_task(
   dst: SocketAddr,
   upstream_override: Option<SocketAddr>,
   state: Arc<ProxyState>,
-) -> eyre::Result<()> {
+) -> Result<(), Error> {
   let dial = upstream_override.unwrap_or(dst);
   let dial_host = dial.ip().to_string();
   let snapshot: Arc<ResolvedConfig> = state.snapshot();
   let snapshot = &*snapshot;
-  serve_transparent_stream(stream, &state, snapshot, &dial_host, dial.port(), &dial_host).await
+  serve_transparent_stream(stream, &state, snapshot, &dial_host, dial.port(), &dial_host)
+    .await
+    .map_err(Error::TransparentStream)
 }
 
 /// `IP_TRANSPARENT` listener on `0.0.0.0:port`, bound through rama.
-async fn transparent_listener(port: u16) -> eyre::Result<RamaTcpListener> {
+async fn transparent_listener(port: u16) -> Result<RamaTcpListener, Error> {
   let socket = SocketOptions {
     address: Some(SocketAddress::default_ipv4(port)),
     ip_transparent: Some(true),
@@ -217,7 +220,7 @@ async fn transparent_listener(port: u16) -> eyre::Result<RamaTcpListener> {
   socket.listen(1024)?;
   RamaTcpListener::bind_socket(socket, Executor::default())
     .await
-    .map_err(|err| eyre::eyre!("tproxy bind: {err}"))
+    .map_err(|err| Error::TproxyBind { source: err })
 }
 
 /// Sends a prepared nftables batch over a fresh netfilter netlink socket
@@ -226,7 +229,7 @@ async fn transparent_listener(port: u16) -> eyre::Result<RamaTcpListener> {
 /// batch is atomic, which is what we want anyway. Sync netlink is
 /// startup/teardown-only, so it runs in `spawn_blocking` / a throwaway
 /// thread.
-fn send_batch(messages: Vec<NetlinkMessage<NetfilterMessage>>) -> eyre::Result<()> {
+fn send_batch(messages: Vec<NetlinkMessage<NetfilterMessage>>) -> Result<(), Error> {
   let mut socket = Socket::new(NETLINK_NETFILTER)?;
   // A missing kernel ACK must fail, not hang: without this, a stalled
   // batch blocks the Drop-guard threads (which join()) and the process
@@ -236,7 +239,7 @@ fn send_batch(messages: Vec<NetlinkMessage<NetfilterMessage>>) -> eyre::Result<(
     clippy::cast_possible_truncation,
     reason = "socklen_t is u32; sizeof timeval is 16 and always fits"
   )]
-  let optlen = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+  let optlen = mem::size_of::<libc::timeval>() as libc::socklen_t;
   // SAFETY: setsockopt with a valid fd, a constant option, and a timeval
   // of the exact size the kernel expects for SO_RCVTIMEO.
   let rc = unsafe {
@@ -248,7 +251,11 @@ fn send_batch(messages: Vec<NetlinkMessage<NetfilterMessage>>) -> eyre::Result<(
       optlen,
     )
   };
-  eyre::ensure!(rc == 0, "SO_RCVTIMEO on nft socket: {}", std::io::Error::last_os_error());
+  if rc != 0 {
+    return Err(Error::SetsockoptTimeout {
+      origin: io::Error::last_os_error(),
+    });
+  }
   socket.bind(&NetlinkSocketAddr::new(0, 0))?;
 
   // NFNL_MSG_BATCH_BEGIN / NFNL_MSG_BATCH_END, nfgen payload matching the
@@ -308,11 +315,22 @@ fn send_batch(messages: Vec<NetlinkMessage<NetfilterMessage>>) -> eyre::Result<(
 
   socket.send(&wire, 0)?;
   let (reply, _) = socket.recv_from_full()?;
-  let parsed = NetlinkMessage::<NetfilterMessage>::deserialize(&reply)
-    .map_err(|err| eyre::eyre!("{err} (raw {} bytes: {})", reply.len(), hex_prefix(&reply)))?;
+  let parsed = NetlinkMessage::<NetfilterMessage>::deserialize(&reply).map_err(|err| Error::NftDeserialize {
+    source: err.into(),
+    len: reply.len(),
+    hex: hex_prefix(&reply),
+  })?;
   match parsed.payload {
-    NetlinkPayload::Error(err) => eyre::ensure!(err.code.is_none(), "nft batch failed: {err}"),
-    other => eyre::bail!("unexpected nft batch reply: {other:?}"),
+    NetlinkPayload::Error(err) => {
+      if err.code.is_some() {
+        return Err(Error::NftBatchFailed { reply: err });
+      }
+    }
+    other => {
+      return Err(Error::UnexpectedNftReply {
+        detail: format!("{other:?}"),
+      });
+    }
   }
   Ok(())
 }
@@ -336,7 +354,7 @@ struct NftGuard {
 impl Drop for NftGuard {
   fn drop(&mut self) {
     if let Some(msg) = self.teardown.take() {
-      let _ = std::thread::spawn(move || {
+      let _ = thread::spawn(move || {
         let _ = send_batch(vec![msg]);
       })
       .join();
@@ -554,7 +572,7 @@ mod tests {
 
   impl Drop for DstRouteGuard {
     fn drop(&mut self) {
-      let _ = std::thread::spawn(move || {
+      let _ = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
           let Ok(handle) = route::netlink() else {

@@ -7,12 +7,14 @@
 //! closed: the hook returns [`Verdict::Close`] and the relay drops it.
 
 mod bindings;
+mod error;
 
-use std::fmt;
-use std::time::Duration;
-
+pub use error::Error;
 use hodor_config::grants::{Scheme, uri_match};
 use hodor_config::plugins::{PluginDirection, ResolvedPlugin};
+use std::fmt;
+use std::pin::Pin;
+use std::time::Duration;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -20,7 +22,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 /// Boxed sendable future for [`RewriteHook`] methods.
 ///
 /// One local line instead of a `futures` dependency.
-pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// One HTTP header: name plus raw value bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,21 +219,26 @@ fn scratch_store(engine: &Engine) -> Store<PluginStoreData> {
 /// # Errors
 ///
 /// Returns an error when the component implements neither rewrite world.
-fn probe_world(engine: &Engine, component: &Component, name: &str) -> eyre::Result<WorldSupport> {
+fn probe_world(engine: &Engine, component: &Component, name: &str) -> Result<WorldSupport, Error> {
   let mut linker = Linker::new(engine);
   // Sync flavor: the probe only instantiates (typechecks exports), never
   // calls, so it must not require an async store. Running instances use
   // the async linker in `ensure_running`.
-  wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|err| eyre::eyre!("plugin `{name}`: WASI linker failed: {err}"))?;
+  wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|err| Error::WasiLinker {
+    name: name.to_string(),
+    origin: err,
+  })?;
   let request = bindings::request::Request::instantiate(&mut scratch_store(engine), component, &linker);
   let response = bindings::response::Response::instantiate(&mut scratch_store(engine), component, &linker);
   match (&request, &response) {
     (Ok(_), Ok(_)) => Ok(WorldSupport::Both),
     (Ok(_), Err(_)) => Ok(WorldSupport::Request),
     (Err(_), Ok(_)) => Ok(WorldSupport::Response),
-    (Err(request_err), Err(response_err)) => {
-      eyre::bail!("plugin `{name}` implements neither rewrite world: request: {request_err:#}; response: {response_err:#}")
-    }
+    (Err(request_err), Err(response_err)) => Err(Error::NeitherWorld {
+      name: name.to_string(),
+      request: format!("{request_err:#}"),
+      response: format!("{response_err:#}"),
+    }),
   }
 }
 
@@ -244,15 +251,18 @@ impl Registry {
   /// # Errors
   ///
   /// Returns an error when any plugin cannot be read, compiled, or probed.
-  pub fn load(plugins: &[ResolvedPlugin]) -> eyre::Result<Self> {
+  pub fn load(plugins: &[ResolvedPlugin]) -> Result<Self, Error> {
     let mut config = Config::new();
     config.epoch_interruption(true);
     config.consume_fuel(true);
-    let engine = Engine::new(&config).map_err(|err| eyre::eyre!("plugin engine: {err}"))?;
+    let engine = Engine::new(&config).map_err(|err| Error::Engine { origin: err })?;
     let mut loaded = Vec::with_capacity(plugins.len());
     for plugin in plugins {
-      let component = Component::from_file(&engine, &plugin.path)
-        .map_err(|err| eyre::eyre!("plugin `{}`: cannot load `{}`: {err}", plugin.name, plugin.path.display()))?;
+      let component = Component::from_file(&engine, &plugin.path).map_err(|err| Error::LoadComponent {
+        name: plugin.name.clone(),
+        path: plugin.path.clone(),
+        origin: err,
+      })?;
       let support = probe_world(&engine, &component, &plugin.name)?;
       loaded.push(LoadedPlugin {
         name: plugin.name.clone(),
@@ -371,23 +381,31 @@ impl PluginInstance {
   ///
   /// Returns an error when the component does not implement the selected
   /// leg's world or instantiation traps.
-  async fn ensure_running(&mut self) -> eyre::Result<&mut Running> {
+  async fn ensure_running(&mut self) -> Result<&mut Running, Error> {
     if self.running.is_none() {
       let mut store = scratch_store(&self.engine);
       let mut linker = Linker::new(&self.engine);
-      wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-        .map_err(|err| eyre::eyre!("plugin `{}`: WASI linker failed: {err}", self.name))?;
+      wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|err| Error::WasiLinker {
+        name: self.name.clone(),
+        origin: err,
+      })?;
       let running = match self.leg {
         Direction::Request => {
           let instance = RunningRequest::instantiate_async(&mut store, &self.component, &linker)
             .await
-            .map_err(|err| eyre::eyre!("plugin `{}`: request-world instantiation failed: {err}", self.name))?;
+            .map_err(|err| Error::RequestInstantiate {
+              name: self.name.clone(),
+              origin: err,
+            })?;
           Running::Request { store, instance }
         }
         Direction::Response => {
           let instance = RunningResponse::instantiate_async(&mut store, &self.component, &linker)
             .await
-            .map_err(|err| eyre::eyre!("plugin `{}`: response-world instantiation failed: {err}", self.name))?;
+            .map_err(|err| Error::ResponseInstantiate {
+              name: self.name.clone(),
+              origin: err,
+            })?;
           Running::Response { store, instance }
         }
       };

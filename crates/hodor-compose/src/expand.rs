@@ -5,11 +5,19 @@
 //! `no_unset`, so a name found in neither is an error naming the variable —
 //! never a silent empty string that turns `$HOME/bin/x` into `/bin/x`.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::env;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use secrecy::ExposeSecret as _;
+use xpanda::Xpanda;
 
+use crate::error::Error;
+use hodor_config::config::{AppConfig, IfMissing, ProxyCfg, RuleCfg, WorkspaceCfg};
+use hodor_config::registry::Registry;
+use hodor_fnox::{FnoxSource, resolve};
 /// Collect every `${NAME}`, `${NAME:-default}` and `$NAME` reference in a
 /// value. Over-collection is harmless — a name that is not a declared fnox
 /// secret simply resolves from the process environment instead.
@@ -42,32 +50,38 @@ fn valid_env_name(name: &str) -> bool {
 }
 
 /// Build the expander over the process environment plus fnox-resolved values.
-pub(crate) fn build_expander(env: HashMap<String, String>) -> xpanda::Xpanda {
-  xpanda::Xpanda::builder().no_unset(true).with_named_vars(env).build()
+pub(crate) fn build_expander(env: HashMap<String, String>) -> Xpanda {
+  Xpanda::builder().no_unset(true).with_named_vars(env).build()
 }
 
 /// Expand one config value; an unset variable errors naming the variable.
-pub(crate) fn expand_value(expander: &xpanda::Xpanda, value: &str) -> eyre::Result<String> {
-  expander
-    .expand(value)
-    .map_err(|error| eyre::eyre!("failed to expand config value: {error:?}"))
+pub(crate) fn expand_value(expander: &Xpanda, value: &str) -> Result<String, Error> {
+  expander.expand(value).map_err(|error| Error::ExpandValue {
+    detail: format!("{error:?}"),
+  })
 }
 
 /// Expand a config value naming a path: `${VAR}` references first, then a
 /// leading `~`. Both halves matter where a user writes a path by hand —
 /// `$HOME/.cargo/bin/x` and `~/.cargo/bin/x` are equally natural and neither
 /// expanded before.
-pub(crate) fn expand_path(expander: &xpanda::Xpanda, value: &str) -> eyre::Result<String> {
+pub(crate) fn expand_path(expander: &Xpanda, value: &str) -> Result<String, Error> {
   Ok(shellexpand::tilde(&expand_value(expander, value)?).into_owned())
 }
 
 /// Run an async fnox lookup from sync generation code. The binary runs on a
 /// multi-thread runtime, so `block_in_place` lets the lookup use it; anywhere
 /// else (tests, one-shot sync contexts) a fresh current-thread runtime serves.
-pub(crate) fn block_on<Fut: Future>(future: Fut) -> eyre::Result<Fut::Output> {
+pub(crate) fn block_on<Fut: Future>(future: Fut) -> Result<Fut::Output, Error> {
   match tokio::runtime::Handle::try_current() {
     Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
-    Err(_) => Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(future)),
+    Err(_) => Ok(
+      tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| Error::BlockOn { source })?
+        .block_on(future),
+    ),
   }
 }
 
@@ -75,11 +89,11 @@ pub(crate) fn block_on<Fut: Future>(future: Fut) -> eyre::Result<Fut::Output> {
 /// declared names the environment lacks. Names found in neither are left out
 /// so the `no_unset` expander errors naming them.
 pub(crate) async fn resolution_env(
-  registry: &hodor_config::registry::Registry,
-  fnox: Option<&hodor_fnox::FnoxSource>,
+  registry: &Registry,
+  fnox: Option<&FnoxSource>,
   names: &BTreeSet<String>,
-) -> eyre::Result<HashMap<String, String>> {
-  let mut env: HashMap<String, String> = std::env::vars().collect();
+) -> Result<HashMap<String, String>, Error> {
+  let mut env: HashMap<String, String> = env::vars().collect();
   let Some(fnox) = fnox else {
     return Ok(env);
   };
@@ -89,12 +103,12 @@ pub(crate) async fn resolution_env(
     return Ok(env);
   }
   let mut synthetic = synthetic_config(&declared);
-  hodor_fnox::resolve(&mut synthetic, registry, Some(fnox.clone())).await?;
+  resolve(&mut synthetic, registry, Some(fnox.clone())).await?;
   for (label, rule) in &synthetic.rules {
     if let Some(value) = rule.value.as_ref() {
       env.insert(rule.env.clone(), value.expose_secret().to_owned());
     } else {
-      eyre::bail!("fnox secret `{label}` resolved to no value");
+      return Err(Error::SecretNoValue { name: label.clone() });
     }
   }
   Ok(env)
@@ -104,20 +118,21 @@ pub(crate) async fn resolution_env(
 /// the existing [`hodor_fnox::resolve`]: one endpoint rule per name with a
 /// dummy `allow` so the rule survives host resolution. Only `value` is read
 /// back; the rest is discarded.
-fn synthetic_config(names: &[String]) -> hodor_config::config::AppConfig {
-  hodor_config::config::AppConfig {
-    proxy: hodor_config::config::ProxyCfg {
-      listen: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+fn synthetic_config(names: &[String]) -> AppConfig {
+  AppConfig {
+    proxy: ProxyCfg {
+      listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
       ca_file: None,
+      root_certs: Vec::new(),
       handshake_timeout_secs: 10,
     },
-    workspace: hodor_config::config::WorkspaceCfg::default(),
+    workspace: WorkspaceCfg::default(),
     rules: names
       .iter()
       .map(|name| {
         (
           name.clone(),
-          hodor_config::config::RuleCfg {
+          RuleCfg {
             env: name.clone(),
             value: None,
             real: None,
@@ -126,14 +141,14 @@ fn synthetic_config(names: &[String]) -> hodor_config::config::AppConfig {
             pattern: None,
             oauth2: None,
             registry: None,
-            if_missing: hodor_config::config::IfMissing::Error,
+            if_missing: IfMissing::Error,
             tls: BTreeMap::new(),
           },
         )
       })
       .collect(),
     plugins: BTreeMap::new(),
-    agents: BTreeMap::new(),
+    tools: BTreeMap::new(),
   }
 }
 
@@ -141,7 +156,7 @@ fn synthetic_config(names: &[String]) -> hodor_config::config::AppConfig {
 /// real that contains a shorter one cannot partially shadow it.
 pub(crate) fn apply_rewrites(content: &[u8], pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
   let mut ordered: Vec<&(Vec<u8>, Vec<u8>)> = pairs.iter().collect();
-  ordered.sort_by_key(|(real, _)| std::cmp::Reverse(real.len()));
+  ordered.sort_by_key(|(real, _)| Reverse(real.len()));
   let mut out = content.to_vec();
   for (real, decoy) in ordered {
     if real.is_empty() {
@@ -163,7 +178,7 @@ pub(crate) fn apply_rewrites(content: &[u8], pairs: &[(Vec<u8>, Vec<u8>)]) -> Ve
 /// Output file name for a rewrite inside the state `files/` directory:
 /// index-prefixed basename so two sources with the same file name cannot
 /// collide.
-pub(crate) fn rewrite_file_name(index: usize, source: &std::path::Path) -> PathBuf {
+pub(crate) fn rewrite_file_name(index: usize, source: &Path) -> PathBuf {
   let base = source.file_name().and_then(|name| name.to_str()).unwrap_or("rewrite");
   PathBuf::from(format!("{index:02}-{base}"))
 }
@@ -230,9 +245,6 @@ mod tests {
   /// Index-prefixed basenames; files without a name fall back.
   #[test]
   fn names_rewrite_outputs_stably() {
-    assert_eq!(
-      rewrite_file_name(3, std::path::Path::new("/home/u/.npmrc")),
-      PathBuf::from("03-.npmrc")
-    );
+    assert_eq!(rewrite_file_name(3, Path::new("/home/u/.npmrc")), PathBuf::from("03-.npmrc"));
   }
 }

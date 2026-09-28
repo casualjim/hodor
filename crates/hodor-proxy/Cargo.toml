@@ -10,7 +10,6 @@ publish = false
 [dependencies]
 base64 = "0.22"
 bytes = "1"
-eyre = "0.6"
 hodor-config = { path = "../hodor-config" }
 hodor-pki = { path = "../hodor-pki" }
 hodor-plugin = { path = "../hodor-plugin" }

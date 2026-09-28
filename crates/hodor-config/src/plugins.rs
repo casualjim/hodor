@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
+use crate::error::Error;
 use crate::grants::EndpointScope;
 
 /// Which direction a plugin rewrites.
@@ -60,15 +61,19 @@ pub struct ResolvedPlugin {
 ///
 /// Returns an error when a plugin has an empty `allow` list or an entry
 /// is not a valid URI grant.
-pub fn resolve_plugins(cfg: &AppConfig) -> eyre::Result<Vec<ResolvedPlugin>> {
+pub fn resolve_plugins(cfg: &AppConfig) -> Result<Vec<ResolvedPlugin>, Error> {
   let mut plugins = Vec::with_capacity(cfg.plugins.len());
   for (name, plugin) in &cfg.plugins {
-    eyre::ensure!(!plugin.allow.is_empty(), "plugin `{name}`: `allow` must not be empty");
+    if plugin.allow.is_empty() {
+      return Err(Error::PluginEmptyAllow { name: name.clone() });
+    }
     let mut allow = Vec::with_capacity(plugin.allow.len());
     for entry in &plugin.allow {
-      let uri: EndpointScope = entry
-        .parse()
-        .map_err(|err| eyre::eyre!("plugin `{name}`: invalid allow entry `{entry}`: {err}"))?;
+      let uri: EndpointScope = entry.parse().map_err(|err| Error::PluginBadAllow {
+        name: name.clone(),
+        entry: entry.clone(),
+        detail: err,
+      })?;
       allow.push(uri);
     }
     plugins.push(ResolvedPlugin {
@@ -86,6 +91,7 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
+  use crate::config::{ProxyCfg, WorkspaceCfg};
   use crate::grants::Scheme;
 
   fn endpoint(scope: &EndpointScope) -> &EndpointScope {
@@ -102,13 +108,13 @@ mod tests {
       },
     );
     AppConfig {
-      proxy: crate::config::ProxyCfg {
+      proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
-      workspace: crate::config::WorkspaceCfg::default(),
+      workspace: WorkspaceCfg::default(),
       rules: BTreeMap::new(),
       plugins,
       tools: BTreeMap::new(),

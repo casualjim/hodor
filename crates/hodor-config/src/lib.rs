@@ -6,11 +6,13 @@
 
 pub mod cli;
 pub mod config;
+mod error;
 pub mod grants;
 pub mod import;
 pub mod plugins;
 pub mod registry;
 pub use config::{AppConfig, ProxyCfg, RuleCfg, fake_for, load};
+pub use error::Error;
 pub use grants::{
   Credential, DatabaseScope, EndpointScope, Grant, HostPat, ResolvedConfig, Scheme, SslMode, SslNegotiation, decoy_for_rule, resolve,
   uri_match,

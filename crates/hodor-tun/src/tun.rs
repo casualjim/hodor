@@ -16,6 +16,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpCidr};
 use tokio::sync::mpsc;
 
+use crate::Error;
 use crate::chan::ChanStream;
 use crate::classify::{IpPacket, classify_packet};
 use crate::phy::{TUN_MTU, TunPhy};
@@ -42,7 +43,7 @@ const CHANNEL_CAP: usize = 32;
 ///
 /// Returns an error when the TUN device cannot be opened, when policy routes
 /// cannot be installed, or when the in-process stack fails to start.
-pub async fn run_tun(state: Arc<ProxyState>) -> eyre::Result<()> {
+pub async fn run_tun(state: Arc<ProxyState>) -> Result<(), Error> {
   run_tun_named(TUN_NAME, TUN_ADDR, true, None, state).await
 }
 
@@ -54,7 +55,7 @@ pub(crate) async fn run_tun_named(
   install_routes: bool,
   dns_override: Option<SocketAddr>,
   state: Arc<ProxyState>,
-) -> eyre::Result<()> {
+) -> Result<(), Error> {
   let mut config = tun::Configuration::default();
   config
     .tun_name(name)
@@ -62,7 +63,7 @@ pub(crate) async fn run_tun_named(
     .netmask(Ipv4Addr::new(255, 255, 255, 0))
     .mtu(TUN_MTU)
     .up();
-  let device = Arc::new(tun::create_as_async(&config).map_err(|err| eyre::eyre!("TUN create: {err}"))?);
+  let device = Arc::new(tun::create_as_async(&config).map_err(|err| Error::TunCreate { origin: err })?);
   let _guard = if install_routes {
     let handle = netlink()?;
     let tun_idx = link_index(&handle, name).await?;
@@ -94,7 +95,7 @@ async fn run_loop(
   dns_upstream: SocketAddr,
   upstream_override: Option<SocketAddr>,
   state: Arc<ProxyState>,
-) -> eyre::Result<()> {
+) -> Result<(), Error> {
   let mut phy = TunPhy::default();
   let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut phy, Instant::now());
   iface.set_any_ip(true);
@@ -104,7 +105,7 @@ async fn run_loop(
   iface
     .routes_mut()
     .add_default_ipv4_route(tun_addr)
-    .map_err(|_table| eyre::eyre!("route table full"))?;
+    .map_err(|_table| Error::RouteTableFull)?;
   let mut sockets = SocketSet::new(vec![]);
   let mut tracker = TcpTracker::default();
   let mut udp: HashMap<UdpKey, mpsc::Sender<Vec<u8>>> = HashMap::new();

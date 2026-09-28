@@ -8,7 +8,6 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
-eyre = "0.6"
 futures-util = "0.3.34"
 hodor-config = { path = "../hodor-config" }
 hodor-pki = { path = "../hodor-pki" }
@@ -21,6 +20,7 @@ rama = { git = "https://github.com/plabayo/rama", rev = "4f4a221bdaa931c75160a95
 rtnetlink = "0.23.0"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 secrecy = { version = "0.10", features = ["serde"] }
+thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26"
 tracing = "0.1"

@@ -8,7 +8,7 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
-eyre = "0.6"
+thiserror = "2"
 hodor-config = { path = "../hodor-config" }
 tracing = "0.1"
 wasmtime = { version = "48", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }

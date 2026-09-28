@@ -12,6 +12,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use std::time::Duration;
 
+use crate::Error;
+
 /// Hard cap for a single `ClientHello` (RFC 8446 §5.1: a record payload is at
 /// most 2^14 bytes, plus the 5-byte record header).
 const MAX_HELLO: usize = 16 * 1024 + 5;
@@ -100,7 +102,7 @@ pub(crate) async fn read_client_hello<G: AsyncRead + Unpin>(
   guest: &mut G,
   initial: &[u8],
   budget: Duration,
-) -> eyre::Result<Option<Hello>> {
+) -> Result<Option<Hello>, Error> {
   let mut buf = initial.to_vec();
   let mut chunk = [0u8; 4096];
   // Total pre-auth budget: per-read timeouts re-arm, so a dripping client
@@ -146,7 +148,7 @@ pub(crate) async fn read_http_head<G: AsyncRead + Unpin>(
   initial: &[u8],
   budget: Duration,
   default_port: u16,
-) -> eyre::Result<Option<(Vec<u8>, String, u16)>> {
+) -> Result<Option<(Vec<u8>, String, u16)>, Error> {
   let mut buf = initial.to_vec();
   let mut chunk = [0u8; 4096];
   let deadline = tokio::time::Instant::now() + budget;

@@ -121,15 +121,15 @@ async fn main() -> eyre::Result<()> {
     }
     Command::Init(args) => {
       let workspace = workspace_arg(args.workspace.as_deref());
-      hodor_compose::init_command(&workspace, args.backend)
+      Ok(hodor_compose::init_command(&workspace, args.backend)?)
     }
     Command::Agent(args) => {
       let workspace = workspace_arg(args.workspace.as_deref());
-      hodor_compose::agent_command(&workspace, &args.command, args.rm)
+      Ok(hodor_compose::agent_command(&workspace, &args.command, args.rm)?)
     }
-    Command::Up(args) => hodor_compose::up_command(&workspace_arg(args.workspace.as_deref())),
-    Command::Down(args) => hodor_compose::down_command(&workspace_arg(args.workspace.as_deref())),
-    Command::Logs(args) => hodor_compose::logs_command(&workspace_arg(args.workspace.as_deref()), &args),
+    Command::Up(args) => Ok(hodor_compose::up_command(&workspace_arg(args.workspace.as_deref()))?),
+    Command::Down(args) => Ok(hodor_compose::down_command(&workspace_arg(args.workspace.as_deref()))?),
+    Command::Logs(args) => Ok(hodor_compose::logs_command(&workspace_arg(args.workspace.as_deref()), &args)?),
     Command::Fwd => {
       #[cfg(not(target_os = "linux"))]
       eyre::bail!("hodor fwd reads /proc/net/tcp and exists on Linux only");
@@ -144,10 +144,10 @@ async fn main() -> eyre::Result<()> {
 /// the global `rules.d`, then the workspace's own when one encloses the
 /// working directory.
 fn generation_registry() -> eyre::Result<hodor_config::registry::Registry> {
-  hodor_config::registry::Registry::load_union(
+  Ok(hodor_config::registry::Registry::load_union(
     hodor_config::config::rules_dir().as_deref(),
     hodor_config::config::cwd_project_rules_dir().as_deref(),
-  )
+  )?)
 }
 
 /// `hodor serve`: bind the explicit listener, then run the selected capture
@@ -170,7 +170,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   let needs_fnox = config.rules.values().any(|rule| rule.value.is_none() || rule.is_database());
   let fnox = if needs_fnox { hodor_fnox::FnoxSource::open()? } else { None };
   if let Some(source) = &fnox {
-    for name in hodor_fnox::export_provider_env(source).await? {
+    for name in hodor_fnox::export_provider_env(source).await {
       tracing::debug!(name, "provider credential taken from fnox");
     }
   }
@@ -218,14 +218,19 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     let capture = std::sync::Arc::clone(&state);
     // Dropping the task runs its teardown guard, which removes the policy
     // routes; a leaked default route in the capture table blackholes all egress.
-    return with_capture(listener, state, "TUN", async move { hodor_tun::run_tun(capture).await }).await;
+    return with_capture(listener, state, "TUN", async move {
+      hodor_tun::run_tun(capture).await.map_err(eyre::Report::from)
+    })
+    .await;
   }
   #[cfg(target_os = "linux")]
   if args.proxy_backend == ProxyBackend::Tproxy {
     let capture = std::sync::Arc::clone(&state);
     let allow_root_netns = args.tproxy_allow_root_netns;
     return with_capture(listener, state, "TPROXY", async move {
-      hodor_tproxy::run_tproxy(capture, allow_root_netns).await
+      hodor_tproxy::run_tproxy(capture, allow_root_netns)
+        .await
+        .map_err(eyre::Report::from)
     })
     .await;
   }
@@ -236,7 +241,10 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
       .clone()
       .ok_or_else(|| eyre::eyre!("--ebpf-cgroup is required for --proxy-backend ebpf"))?;
     let capture = std::sync::Arc::clone(&state);
-    return with_capture(listener, state, "eBPF", async move { hodor_ebpf::run_ebpf(capture, cgroup).await }).await;
+    return with_capture(listener, state, "eBPF", async move {
+      hodor_ebpf::run_ebpf(capture, cgroup).await.map_err(eyre::Report::from)
+    })
+    .await;
   }
   hodor_proxy::serve(listener, state).await;
   Ok(())

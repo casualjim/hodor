@@ -2,7 +2,12 @@
 //! iproute2): two fib rules and one local-default route for TPROXY
 //! delivery.
 
+use std::mem;
 use std::net::Ipv4Addr;
+use std::thread;
+use std::time::Duration;
+
+use crate::Error;
 
 use futures_util::TryStreamExt as _;
 use rtnetlink::packet_route::route::{RouteAttribute, RouteMessage, RouteType};
@@ -32,17 +37,20 @@ pub(crate) enum Undo {
   DelRulePref(u32),
 }
 
-pub(super) fn netlink() -> eyre::Result<rtnetlink::Handle> {
-  let (conn, handle, _) = rtnetlink::new_connection().map_err(|err| eyre::eyre!("netlink: {err}"))?;
+pub(super) fn netlink() -> Result<rtnetlink::Handle, Error> {
+  let (conn, handle, _) = rtnetlink::new_connection().map_err(|err| Error::Netlink { origin: err })?;
   tokio::spawn(conn);
   Ok(handle)
 }
 
-pub(super) async fn link_index(handle: &rtnetlink::Handle, name: &str) -> eyre::Result<u32> {
+pub(super) async fn link_index(handle: &rtnetlink::Handle, name: &str) -> Result<u32, Error> {
   let mut links = handle.link().get().match_name(name.to_string()).execute();
-  match links.try_next().await.map_err(|err| eyre::eyre!("link get {name}: {err}"))? {
+  match links.try_next().await.map_err(|err| Error::LinkGet {
+    name: name.to_string(),
+    origin: err,
+  })? {
     Some(link) => Ok(link.header.index),
-    None => eyre::bail!("interface {name} not found"),
+    None => Err(Error::InterfaceNotFound { name: name.to_string() }),
   }
 }
 
@@ -60,7 +68,7 @@ pub(crate) fn proxy_undos(table: u8) -> Vec<Undo> {
   vec![Undo::FlushTable(table), Undo::DelRulePref(RULE_PREF_CAPTURE)]
 }
 
-pub(super) async fn add_local_route(handle: &rtnetlink::Handle, table: u8, lo_index: u32) -> eyre::Result<()> {
+pub(super) async fn add_local_route(handle: &rtnetlink::Handle, table: u8, lo_index: u32) -> Result<(), Error> {
   let message = RouteMessageBuilder::<Ipv4Addr>::new()
     .kind(RouteType::Local)
     // `ip route add local ...` implies host scope; the kernel rejects the
@@ -75,11 +83,11 @@ pub(super) async fn add_local_route(handle: &rtnetlink::Handle, table: u8, lo_in
     .replace()
     .execute()
     .await
-    .map_err(|err| eyre::eyre!("local route add: {err}"))?;
+    .map_err(|err| Error::LocalRouteAdd { origin: err })?;
   Ok(())
 }
 
-pub(super) async fn add_rule(handle: &rtnetlink::Handle, plan: &RulePlan) -> eyre::Result<()> {
+pub(super) async fn add_rule(handle: &rtnetlink::Handle, plan: &RulePlan) -> Result<(), Error> {
   let mut req = handle.rule().add();
   if let Some(mark) = plan.fwmark {
     req = req.fw_mark(mark);
@@ -92,18 +100,21 @@ pub(super) async fn add_rule(handle: &rtnetlink::Handle, plan: &RulePlan) -> eyr
     .replace()
     .execute()
     .await
-    .map_err(|err| eyre::eyre!("rule add pref {}: {err}", plan.pref))?;
+    .map_err(|err| Error::RuleAdd {
+      pref: plan.pref,
+      origin: err,
+    })?;
   Ok(())
 }
 
-async fn del_rule_pref(handle: &rtnetlink::Handle, pref: u32) -> eyre::Result<()> {
+async fn del_rule_pref(handle: &rtnetlink::Handle, pref: u32) -> Result<(), Error> {
   let rules: Vec<RuleMessage> = handle
     .rule()
     .get(rtnetlink::IpVersion::V4)
     .execute()
     .try_collect()
     .await
-    .map_err(|err| eyre::eyre!("rule list: {err}"))?;
+    .map_err(|err| Error::RuleList { origin: err })?;
   for msg in rules {
     let is_pref = msg
       .attributes
@@ -115,20 +126,20 @@ async fn del_rule_pref(handle: &rtnetlink::Handle, pref: u32) -> eyre::Result<()
         .del(msg)
         .execute()
         .await
-        .map_err(|err| eyre::eyre!("rule del pref {pref}: {err}"))?;
+        .map_err(|err| Error::RuleDel { pref, origin: err })?;
     }
   }
   Ok(())
 }
 
-async fn flush_table(handle: &rtnetlink::Handle, table: u8) -> eyre::Result<()> {
+async fn flush_table(handle: &rtnetlink::Handle, table: u8) -> Result<(), Error> {
   let routes: Vec<RouteMessage> = handle
     .route()
     .get(RouteMessage::default())
     .execute()
     .try_collect()
     .await
-    .map_err(|err| eyre::eyre!("route list: {err}"))?;
+    .map_err(|err| Error::RouteList { origin: err })?;
   for msg in routes {
     let in_table = msg
       .attributes
@@ -140,13 +151,13 @@ async fn flush_table(handle: &rtnetlink::Handle, table: u8) -> eyre::Result<()> 
         .del(msg)
         .execute()
         .await
-        .map_err(|err| eyre::eyre!("route del: {err}"))?;
+        .map_err(|err| Error::RouteDel { origin: err })?;
     }
   }
   Ok(())
 }
 
-async fn apply_undo(handle: &rtnetlink::Handle, undo: &Undo) -> eyre::Result<()> {
+async fn apply_undo(handle: &rtnetlink::Handle, undo: &Undo) -> Result<(), Error> {
   match undo {
     Undo::DelRulePref(pref) => del_rule_pref(handle, *pref).await,
     Undo::FlushTable(table) => flush_table(handle, *table).await,
@@ -169,8 +180,8 @@ impl RouteGuard {
 
 impl Drop for RouteGuard {
   fn drop(&mut self) {
-    let undos = std::mem::take(&mut self.undos);
-    let _ = std::thread::spawn(move || {
+    let undos = mem::take(&mut self.undos);
+    let _ = thread::spawn(move || {
       let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
         return;
       };
@@ -185,7 +196,7 @@ impl Drop for RouteGuard {
         for undo in undos.iter().rev() {
           // Bounded: cleanup must never block process exit on a stalled
           // rtnetlink exchange.
-          match tokio::time::timeout(std::time::Duration::from_secs(5), apply_undo(&handle, undo)).await {
+          match tokio::time::timeout(Duration::from_secs(5), apply_undo(&handle, undo)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
               tracing::error!(?err, ?undo, "route cleanup undo failed; capture routes may be stale");

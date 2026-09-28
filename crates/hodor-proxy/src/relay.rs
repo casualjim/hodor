@@ -1,8 +1,8 @@
 //! Bidirectional pump through two wire directions.
 
-use eyre::WrapErr as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+use crate::Error;
 use crate::wire::{Rewritten, Wire};
 
 /// Bidirectional relay through the two directions' wire formats. Guest FIN
@@ -18,7 +18,7 @@ pub(crate) async fn relay_guarded<G, S, M>(
   downstream: &mut M,
   upstream: &mut M,
   first: &[u8],
-) -> eyre::Result<()>
+) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
@@ -37,8 +37,11 @@ where
       Rewritten::Close => return Ok(()),
       Rewritten::Hold => {}
       Rewritten::Emit(out) => {
-        server.write_all(&out).await.context("relay request head to upstream")?;
-        server.flush().await.context("relay request head flush")?;
+        server
+          .write_all(&out)
+          .await
+          .map_err(|err| Error::RequestHeadToUpstream { source: err })?;
+        server.flush().await.map_err(|err| Error::RequestHeadFlush { source: err })?;
       }
     }
   }
@@ -61,7 +64,7 @@ where
             drain_reply(&mut guest, downstream).await?;
             log_hits(&hits);
             if let Rewritten::Emit(flushed) = rewritten {
-              server.write_all(&flushed).await.context("relay request flush to upstream")?;
+              server.write_all(&flushed).await.map_err(|err| Error::RequestFlushToUpstream { source: err })?;
             }
             // Upstream may already have closed its write side; a failed
             // shutdown must not abort the relay — keep draining the
@@ -80,11 +83,11 @@ where
               Rewritten::Close => break,
               Rewritten::Hold => {}
               Rewritten::Emit(out) => {
-                server.write_all(&out).await.context("relay request chunk to upstream")?;
+                server.write_all(&out).await.map_err(|err| Error::RequestChunkToUpstream { source: err })?;
               }
             }
           }
-          Err(err) => return Err(eyre::eyre!("guest read: {err}")),
+          Err(err) => return Err(Error::GuestRead { source: err }),
         }
       }
       result = server.read(&mut server_buf) => {
@@ -99,7 +102,7 @@ where
             match rewritten {
               Rewritten::Close | Rewritten::Hold => break,
               Rewritten::Emit(flushed) => {
-                guest.write_all(&flushed).await.context("relay response flush to guest")?;
+                guest.write_all(&flushed).await.map_err(|err| Error::ResponseFlushToGuest { source: err })?;
                 break;
               }
             }
@@ -115,17 +118,17 @@ where
               }
               Rewritten::Hold => {}
               Rewritten::Emit(out) => {
-                guest.write_all(&out).await.context("relay response chunk to guest")?;
-                guest.flush().await.context("relay guest flush")?;
+                guest.write_all(&out).await.map_err(|err| Error::ResponseChunkToGuest { source: err })?;
+                guest.flush().await.map_err(|err| Error::GuestFlush { source: err })?;
               }
             }
           }
-          Err(err) => return Err(eyre::eyre!("upstream read: {err}")),
+          Err(err) => return Err(Error::UpstreamRead { source: err }),
         }
       }
     }
   }
-  guest.flush().await.context("relay final guest flush")?;
+  guest.flush().await.map_err(|err| Error::FinalGuestFlush { source: err })?;
   let _ = guest.shutdown().await;
   Ok(())
 }
@@ -133,10 +136,13 @@ where
 /// Flush one queued guest-bound protocol reply, if the last chunk queued
 /// one (Postgres negotiation refusals). Only the downstream direction ever
 /// queues.
-async fn drain_reply<G: AsyncWrite + Unpin, M: Wire>(guest: &mut G, wire: &mut M) -> eyre::Result<()> {
+async fn drain_reply<G: AsyncWrite + Unpin, M: Wire>(guest: &mut G, wire: &mut M) -> Result<(), Error> {
   if let Some(reply) = wire.take_reply() {
-    guest.write_all(&reply).await.context("relay protocol reply to guest")?;
-    guest.flush().await.context("relay protocol reply flush")?;
+    guest
+      .write_all(&reply)
+      .await
+      .map_err(|err| Error::ProtocolReplyToGuest { source: err })?;
+    guest.flush().await.map_err(|err| Error::ProtocolReplyFlush { source: err })?;
   }
   Ok(())
 }

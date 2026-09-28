@@ -2,17 +2,21 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use confique::{Config as _, Layer as _};
-use eyre::WrapErr as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use validator::{Validate, ValidationError};
 
 use crate::cli::{Cli, Command};
+use crate::error::Error;
+use crate::grants::{EndpointScope, GuestTlsMode, HostPat};
+use crate::plugins::PluginCfg;
+use crate::registry::{OAuthFlow, validate_flow};
 use code_workspace::{Workspace, resolve_root};
 
 /// Pattern used when neither the rule nor the registry supplies one.
@@ -34,7 +38,7 @@ pub struct AppConfig {
   /// WASM rewrite plugins by name; loaded at startup, fail closed.
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-  pub plugins: BTreeMap<String, crate::plugins::PluginCfg>,
+  pub plugins: BTreeMap<String, PluginCfg>,
   /// Tool config mounts by tool name; extends or overrides the built-in table.
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -192,7 +196,7 @@ pub struct RuleCfg {
   pub pattern: Option<String>,
   /// `OAuth2` token-issuer flow overriding the registry.
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub oauth2: Option<crate::registry::OAuthFlow>,
+  pub oauth2: Option<OAuthFlow>,
   /// Consult the host registry for this rule (default true).
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub registry: Option<bool>,
@@ -235,7 +239,7 @@ pub struct HostTlsCfg {
   pub root_cert: Option<PathBuf>,
   /// How the guest leg treats client certificates.
   #[serde(default)]
-  pub guest_tls_mode: crate::grants::GuestTlsMode,
+  pub guest_tls_mode: GuestTlsMode,
   /// Container-internal path the guest's minted certificate mounts at.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub guest_cert: Option<PathBuf>,
@@ -247,7 +251,7 @@ pub struct HostTlsCfg {
 /// `allow` entries must all parse as URI grants.
 fn validate_allow(entries: &Vec<String>) -> Result<(), ValidationError> {
   for entry in entries {
-    entry.parse::<crate::grants::EndpointScope>().map_err(|err| {
+    entry.parse::<EndpointScope>().map_err(|err| {
       let mut error = ValidationError::new("allow");
       error.message = Some(format!("bad allow entry `{entry}`: {err}").into());
       error
@@ -290,8 +294,8 @@ pub enum IfMissing {
 ///
 /// Returns an error when the working directory is unreadable, when a config
 /// layer is malformed, or when an `allow` entry fails to resolve.
-pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
-  let cwd = env::current_dir()?;
+pub fn load(cli: &Cli) -> Result<(AppConfig, Option<Workspace>), Error> {
+  let cwd = env::current_dir().map_err(Error::CurrentDir)?;
   let mut cli_layer = <AppConfig as confique::Config>::Layer::empty();
   if let Some(Command::Serve(args)) = &cli.command {
     cli_layer.proxy = args.proxy.clone();
@@ -312,7 +316,7 @@ pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
     builder = builder.file(path);
   }
 
-  let mut config: AppConfig = builder.load().map_err(eyre::Report::from)?;
+  let mut config: AppConfig = builder.load()?;
   // confique merges the `rules` map wholesale per winning file, so re-merge
   // by label here: global entries first, project entries replace by label.
   // This second read of the same files is deliberate. confique's builder
@@ -339,19 +343,27 @@ pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
 
 /// Merge `[rules]` tables by label: global first, project wins wholesale
 /// per label. Errors name the file + label.
-fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> eyre::Result<BTreeMap<String, RuleCfg>> {
+fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> Result<BTreeMap<String, RuleCfg>, Error> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
-    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
+    let text = fs::read_to_string(path).map_err(|source| Error::ReadFile {
+      path: path.to_path_buf(),
+      source,
+    })?;
+    let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
+      path: path.to_path_buf(),
+      source,
+    })?;
     let Some(rules) = doc.get("rules") else {
       continue;
     };
-    let table = rules
-      .as_table()
-      .ok_or_else(|| eyre::eyre!("{}: `rules` must be a table", path.display()))?;
+    let table = rules.as_table().ok_or_else(|| Error::RulesNotTable { path: path.to_path_buf() })?;
     for (label, entry) in table {
-      let cfg = RuleCfg::deserialize(entry.clone()).wrap_err_with(|| format!("{}: rule `{label}`", path.display()))?;
+      let cfg = RuleCfg::deserialize(entry.clone()).map_err(|source| Error::BadRule {
+        path: path.to_path_buf(),
+        label: label.clone(),
+        source,
+      })?;
       merged.insert(label.clone(), cfg);
     }
   }
@@ -359,17 +371,25 @@ fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> eyre::Res
 }
 
 /// Merge `[tools]` tables by name: global first, project wins per name.
-fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> eyre::Result<BTreeMap<String, ToolCfg>> {
+fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> Result<BTreeMap<String, ToolCfg>, Error> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
-    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
+    let text = std::fs::read_to_string(path).map_err(|source| Error::ReadFile {
+      path: path.to_path_buf(),
+      source,
+    })?;
+    let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
+      path: path.to_path_buf(),
+      source,
+    })?;
     if let Some(tools) = doc.get("tools") {
-      let table = tools
-        .as_table()
-        .ok_or_else(|| eyre::eyre!("{}: `tools` must be a table", path.display()))?;
+      let table = tools.as_table().ok_or_else(|| Error::ToolsNotTable { path: path.to_path_buf() })?;
       for (name, entry) in table {
-        let cfg = ToolCfg::deserialize(entry.clone()).wrap_err_with(|| format!("{}: tool `{name}`", path.display()))?;
+        let cfg = ToolCfg::deserialize(entry.clone()).map_err(|source| Error::BadTool {
+          path: path.to_path_buf(),
+          name: name.clone(),
+          source,
+        })?;
         merged.insert(name.clone(), cfg);
       }
     }
@@ -438,28 +458,35 @@ pub fn valid_profile(name: &str) -> bool {
 /// cookie without a `parent` key inherits the shared base directly, it does
 /// not fall through to the other layer's cookie. No cookie at all means the
 /// shared base. The shared base itself takes no parent.
-fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) -> eyre::Result<Option<String>> {
+fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) -> Result<Option<String>, Error> {
   for layer in [project, global].into_iter().flatten() {
     let cookie = layer.join(profile).join("profile.toml");
     if !cookie.is_file() {
       continue;
     }
-    let text = std::fs::read_to_string(&cookie).wrap_err_with(|| format!("read {}", cookie.display()))?;
-    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", cookie.display()))?;
+    let text = std::fs::read_to_string(&cookie).map_err(|source| Error::ReadFile {
+      path: cookie.clone(),
+      source,
+    })?;
+    let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
+      path: cookie.clone(),
+      source,
+    })?;
     let Some(parent) = doc.get("profile").and_then(|table| table.get("parent")) else {
       return Ok(None);
     };
     let Some(parent) = parent.as_str() else {
-      eyre::bail!("{}: `[profile] parent` must be a string", cookie.display());
+      return Err(Error::ProfileParentNotString { path: cookie.clone() });
     };
     if profile == SHARED_PROFILE {
-      eyre::bail!("{}: the shared base profile takes no parent", cookie.display());
+      return Err(Error::SharedProfileParent { path: cookie.clone() });
     }
-    eyre::ensure!(
-      valid_profile(parent),
-      "{}: parent `{parent}` is not a plain directory name",
-      cookie.display()
-    );
+    if !valid_profile(parent) {
+      return Err(Error::BadProfileParent {
+        path: cookie.clone(),
+        parent: parent.to_string(),
+      });
+    }
     return Ok(Some(parent.to_string()));
   }
   Ok(None)
@@ -479,8 +506,12 @@ fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) 
 ///
 /// Never panics: the chain starts at one element and the loop only appends,
 /// so `chain.last()` always finds a name.
-pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &str) -> eyre::Result<Vec<String>> {
-  eyre::ensure!(valid_profile(selected), "profile `{selected}` is not a plain directory name");
+pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &str) -> Result<Vec<String>, Error> {
+  if !valid_profile(selected) {
+    return Err(Error::BadProfileName {
+      name: selected.to_string(),
+    });
+  }
   let mut chain = vec![selected.to_string()];
   loop {
     let name = chain.last().expect("the chain never empties").clone();
@@ -489,9 +520,16 @@ pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &s
       break;
     }
     let parent = profile_parent(project, global, &name)?.unwrap_or_else(|| SHARED_PROFILE.to_string());
-    eyre::ensure!(!chain.contains(&parent), "profile inheritance cycle through `{parent}`");
+    if chain.contains(&parent) {
+      return Err(Error::ProfileCycle { parent: parent.clone() });
+    }
     let held = parent == SHARED_PROFILE || [project, global].into_iter().flatten().any(|layer| layer.join(&parent).is_dir());
-    eyre::ensure!(held, "profile `{name}` inherits `{parent}`, which no layer holds");
+    if !held {
+      return Err(Error::ProfileParentMissing {
+        name: name.clone(),
+        parent: parent.clone(),
+      });
+    }
     chain.push(parent);
   }
   let held = [project, global].into_iter().flatten().any(|layer| layer.join(selected).is_dir());
@@ -539,42 +577,57 @@ pub fn rules_dir() -> Option<PathBuf> {
 }
 
 impl AppConfig {
-  fn validate(&self) -> eyre::Result<()> {
+  fn validate(&self) -> Result<(), Error> {
     let mut env_names: BTreeMap<&str, &str> = BTreeMap::new();
     for (label, rule) in &self.rules {
       if let Some(previous) = env_names.insert(rule.env.as_str(), label.as_str()) {
-        eyre::bail!("rules `{previous}` and `{label}` share env name `{}`", rule.env);
+        return Err(Error::DuplicateEnv {
+          previous: previous.to_string(),
+          label: label.clone(),
+          env: rule.env.clone(),
+        });
       }
-      eyre::ensure!(!rule.env.is_empty(), "rule `{label}`: `env` must not be empty");
-      if let Some(value) = &rule.value {
-        eyre::ensure!(!value.expose_secret().is_empty(), "rule `{label}`: `value` must not be empty");
+      if rule.env.is_empty() {
+        return Err(Error::EmptyEnv { label: label.clone() });
+      }
+      if let Some(value) = &rule.value
+        && value.expose_secret().is_empty()
+      {
+        return Err(Error::EmptyValue { label: label.clone() });
       }
       for entry in &rule.allow {
-        let scope: crate::grants::EndpointScope = entry
-          .parse()
-          .map_err(|err| eyre::eyre!("rule `{label}`: bad allow entry `{entry}`: {err}"))?;
-        if matches!(scope.host, crate::grants::HostPat::Any) {
+        let scope: EndpointScope = entry.parse().map_err(|err| Error::BadAllow {
+          label: label.clone(),
+          entry: entry.clone(),
+          detail: err,
+        })?;
+        if matches!(scope.host, HostPat::Any) {
           tracing::warn!(label, entry, "grant matches any host; secret is exfil-risky");
         }
       }
       if let Some(pattern) = rule.pattern.as_deref().filter(|p| !p.is_empty()) {
-        validate_pattern(pattern).map_err(|err| eyre::eyre!("rule `{label}`: bad pattern `{pattern}`: {err}"))?;
+        validate_pattern(pattern).map_err(|err| Error::BadPattern {
+          label: label.clone(),
+          pattern: pattern.to_string(),
+          detail: err,
+        })?;
       }
       if let Some(flow) = &rule.oauth2 {
-        crate::registry::validate_flow(flow, "config", label)?;
+        validate_flow(flow, "config", label)?;
       }
     }
     for port in &self.workspace.ports {
-      eyre::ensure!(*port != 0, "[workspace] ports: port 0 cannot be published");
+      if *port == 0 {
+        return Err(Error::PortZero);
+      }
       // The capture listeners hold these ports inside the shared netns, and
       // the `fwd` sidecar only forwards agent-owned listeners, so a published
       // capture port would shadow a host port with a dead binding. The
       // literals must stay in step with hodor-ebpf's `TCP_LISTEN_PORT` and
       // `UDP_LISTEN_PORT`.
-      eyre::ensure!(
-        *port != 15_000 && *port != 15_001,
-        "[workspace] port {port} is a capture listener port and cannot be published"
-      );
+      if *port == 15_000 || *port == 15_001 {
+        return Err(Error::CapturePort { port: *port });
+      }
     }
     Ok(())
   }
@@ -723,15 +776,16 @@ fn fill_encoding(seed: &str, encoding: Encoding, count: usize) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::ffi::OsStr;
   use std::io::Write as _;
-  use std::sync::{Mutex, MutexGuard};
+  use std::sync::{Mutex, MutexGuard, PoisonError};
 
   use clap::Parser as _;
 
   static ENV_LOCK: Mutex<()> = Mutex::new(());
 
   fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
   fn scrub_env() {
@@ -742,16 +796,16 @@ mod tests {
   }
 
   /// Test-only env write; callers hold `ENV_LOCK`.
-  fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+  fn set_env(key: &str, value: impl AsRef<OsStr>) {
     // SAFETY: test-only mutation, serialized by ENV_LOCK.
     unsafe { env::set_var(key, value) };
   }
 
   fn write_file(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
-      std::fs::create_dir_all(parent).unwrap();
+      fs::create_dir_all(parent).unwrap();
     }
-    let mut file = std::fs::File::create(path).unwrap();
+    let mut file = fs::File::create(path).unwrap();
     file.write_all(body.as_bytes()).unwrap();
   }
 
@@ -817,7 +871,7 @@ allow = ["https://c.example"]
     set_env("HODOR_CONFIG", &global);
     let nested = project_root.join("crates").join("inner");
     write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
-    std::fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&nested).unwrap();
     let _cwd = CwdGuard::enter(&nested);
     let cli = cli_for(&["hodor", "serve"]);
     let (config, _ws) = load(&cli).unwrap();
@@ -918,7 +972,7 @@ allow = ["https://c.example"]
     set_env("HODOR_CONFIG", &global);
     let nested = project_root.join("crates").join("inner");
     write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
-    std::fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&nested).unwrap();
     let _cwd = CwdGuard::enter(&nested);
     // project beats global
     let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
@@ -951,7 +1005,7 @@ allow = ["https://c.example"]
     write_file(&override_file, "[proxy]\nlisten = \"127.0.0.1:5555\"\n");
     set_env("HODOR_CONFIG", &global);
     let markerless = dir.path().join("markerless");
-    std::fs::create_dir_all(&markerless).unwrap();
+    fs::create_dir_all(&markerless).unwrap();
     let _cwd = CwdGuard::enter(&markerless);
     let cli = cli_for(&["hodor", "--config", override_file.to_str().unwrap(), "serve"]);
     let (config, _) = load(&cli).unwrap();
@@ -964,14 +1018,14 @@ allow = ["https://c.example"]
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("ws");
     let nested = root.join("crates").join("inner");
-    std::fs::create_dir_all(&nested).unwrap();
-    std::fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
     write_file(&root.join("Cargo.toml"), "[workspace]\n");
     let project = root.join(".config").join("hodor.toml");
     write_file(&project, "[proxy]\n");
     assert_eq!(discover_project_config(&nested), Some(project));
     // same tree without the file: no project layer
-    std::fs::remove_file(root.join(".config").join("hodor.toml")).unwrap();
+    fs::remove_file(root.join(".config").join("hodor.toml")).unwrap();
     assert_eq!(discover_project_config(&nested), None);
   }
 

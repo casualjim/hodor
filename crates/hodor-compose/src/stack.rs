@@ -1,14 +1,25 @@
 //! Compose stack generation: decoy selection, mount resolution, and YAML.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::env;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
-use eyre::WrapErr as _;
-use hodor_config::cli::ProxyBackend;
-use hodor_config::config::{SHARED_PROFILE, ToolCfg};
+use dirs::{config_dir as dirs_config_dir, home_dir, state_dir};
+use hodor_config::cli::{Cli, ProxyBackend};
+use hodor_config::config::{
+  AppConfig, FileRewrite, HostTlsCfg, RuleCfg, SHARED_PROFILE, ToolCfg, config_dir, load, project_rules_dir, rules_dir, valid_profile,
+};
 use hodor_config::grants::GuestTlsMode;
+use hodor_config::registry::Registry;
+use hodor_fnox::{FNOX_ENV, FnoxSource, selected_envs};
+use hodor_pki::ca::{CertAuthority, load_or_generate, load_or_generate_client_pair};
+use libc::getuid;
+use xpanda::Xpanda;
 
+use crate::error::Error;
 use crate::expand::{
   apply_rewrites, block_on, build_expander, collect_referenced_variables, expand_path, expand_value, resolution_env, rewrite_file_name,
 };
@@ -44,8 +55,8 @@ pub(crate) struct Decoy {
 }
 
 /// Select every fnox-declared name the registry knows, with its decoy.
-pub(crate) fn select(fnox: Option<&hodor_fnox::FnoxSource>, registry: &hodor_config::registry::Registry) -> Vec<Decoy> {
-  hodor_fnox::selected_envs(fnox, registry)
+pub(crate) fn select(fnox: Option<&FnoxSource>, registry: &Registry) -> Vec<Decoy> {
+  selected_envs(fnox, registry)
     .into_iter()
     .map(|env| {
       let value = registry.decoy(&env, None);
@@ -57,11 +68,7 @@ pub(crate) fn select(fnox: Option<&hodor_fnox::FnoxSource>, registry: &hodor_con
 /// Reshape a selection with each rule's own pattern. Serve-time substitution
 /// derives its fake from `rule.pattern`, so a decoy built from the registry
 /// default instead would never match and the swap would silently not happen.
-pub(crate) fn with_rule_patterns(
-  decoys: Vec<Decoy>,
-  registry: &hodor_config::registry::Registry,
-  rules: &BTreeMap<String, hodor_config::config::RuleCfg>,
-) -> Vec<Decoy> {
+pub(crate) fn with_rule_patterns(decoys: Vec<Decoy>, registry: &Registry, rules: &BTreeMap<String, RuleCfg>) -> Vec<Decoy> {
   decoys
     .into_iter()
     .map(|decoy| {
@@ -79,7 +86,7 @@ pub(crate) fn with_rule_patterns(
 
 /// Split a selection by whether the registry states hosts for the name.
 /// Active rules come first, names with no endpoint second.
-pub(crate) fn by_hosts(registry: &hodor_config::registry::Registry, decoys: Vec<Decoy>) -> (Vec<Decoy>, Vec<Decoy>) {
+pub(crate) fn by_hosts(registry: &Registry, decoys: Vec<Decoy>) -> (Vec<Decoy>, Vec<Decoy>) {
   decoys
     .into_iter()
     .partition(|decoy| registry.lookup(&decoy.env).is_some_and(|known| !known.hosts.is_empty()))
@@ -91,20 +98,14 @@ pub(crate) fn by_hosts(registry: &hodor_config::registry::Registry, decoys: Vec<
 /// # Errors
 ///
 /// Returns an error naming the offending name when it overlaps.
-pub(crate) fn validate_passthrough(
-  rules: &BTreeMap<String, hodor_config::config::RuleCfg>,
-  decoys: &[Decoy],
-  passthrough: &[String],
-) -> eyre::Result<()> {
+pub(crate) fn validate_passthrough(rules: &BTreeMap<String, RuleCfg>, decoys: &[Decoy], passthrough: &[String]) -> Result<(), Error> {
   for name in passthrough {
-    eyre::ensure!(
-      !rules.values().any(|rule| &rule.env == name),
-      "[workspace] passthrough `{name}` is also a [rules.*] env: pick one path"
-    );
-    eyre::ensure!(
-      !decoys.iter().any(|decoy| &decoy.env == name),
-      "[workspace] passthrough `{name}` overlaps a selected decoy: pick one path"
-    );
+    if rules.values().any(|rule| &rule.env == name) {
+      return Err(Error::PassthroughOverlapRule { name: name.clone() });
+    }
+    if decoys.iter().any(|decoy| &decoy.env == name) {
+      return Err(Error::PassthroughOverlapDecoy { name: name.clone() });
+    }
   }
   Ok(())
 }
@@ -115,7 +116,7 @@ pub(crate) fn validate_passthrough(
 pub(crate) fn uncovered_names(declared: &BTreeSet<String>, selected: &[String], passthrough: &[String]) -> Vec<String> {
   declared
     .iter()
-    .filter(|name| !selected.contains(name) && !passthrough.contains(name) && !hodor_fnox::FNOX_ENV.contains(&name.as_str()))
+    .filter(|name| !selected.contains(name) && !passthrough.contains(name) && !FNOX_ENV.contains(&name.as_str()))
     .cloned()
     .collect()
 }
@@ -147,11 +148,11 @@ pub(crate) fn uncovered_warning(names: &[String]) -> Option<String> {
 /// # Errors
 ///
 /// Returns an error when the registry or the fnox source cannot be opened.
-pub fn rules_command(root: Option<&Path>) -> eyre::Result<String> {
+pub fn rules_command(root: Option<&Path>) -> Result<String, Error> {
   let registry = generation_registry(root)?;
   let fnox = open_fnox()?;
   let (with_hosts, hostless) = by_hosts(&registry, select(fnox.as_ref(), &registry));
-  let known = hodor_fnox::selected_envs(fnox.as_ref(), &registry);
+  let known = selected_envs(fnox.as_ref(), &registry);
   let unknown = fnox
     .as_ref()
     .map(|fnox| {
@@ -189,18 +190,18 @@ pub(crate) fn split_mode(entry: &Path) -> (PathBuf, bool) {
 ///
 /// Returns an error when a pair cannot be minted or written.
 pub(crate) fn guest_identity_mounts(
-  rules: &BTreeMap<String, hodor_config::config::RuleCfg>,
-  ca: &hodor_pki::ca::CertAuthority,
+  rules: &BTreeMap<String, RuleCfg>,
+  ca: &CertAuthority,
   guests_dir: &Path,
   home: &str,
-) -> eyre::Result<Vec<Mount>> {
+) -> Result<Vec<Mount>, Error> {
   let mut mounts = Vec::new();
   for (label, rule) in rules {
-    let mtls: Vec<&hodor_config::config::HostTlsCfg> = rule.tls.values().filter(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls).collect();
+    let mtls: Vec<&HostTlsCfg> = rule.tls.values().filter(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls).collect();
     if mtls.is_empty() {
       continue;
     }
-    let (cert, key) = hodor_pki::ca::load_or_generate_client_pair(ca, guests_dir, label)?;
+    let (cert, key) = load_or_generate_client_pair(ca, guests_dir, label)?;
     for tls in mtls {
       let cert_container = tls
         .guest_cert
@@ -246,10 +247,10 @@ pub(crate) struct FnoxBinds {
 /// The fnox config directory fnox itself resolves: `FNOX_CONFIG_DIR`, else
 /// `<config-dir>/fnox`.
 pub(crate) fn fnox_config_dir(host_home: Option<&Path>) -> Option<PathBuf> {
-  if let Some(dir) = std::env::var_os("FNOX_CONFIG_DIR") {
+  if let Some(dir) = env::var_os("FNOX_CONFIG_DIR") {
     return Some(PathBuf::from(dir));
   }
-  dirs::config_dir()
+  dirs_config_dir()
     .or_else(|| host_home.map(|home| home.join(".config")))
     .map(|dir| dir.join("fnox"))
 }
@@ -296,30 +297,26 @@ pub(crate) fn fnox_binds(fnox_dir: Option<&Path>, config_dir: Option<&Path>) -> 
 /// way `covering` wants them: parents first, so a covering mount wins and
 /// covered paths drop out. A path that is not there is an error rather than a
 /// warning, because docker mounts an empty directory in its place.
-pub(crate) fn include_entries(root: &Path, includes: &[PathBuf], host_home: Option<&Path>) -> eyre::Result<Vec<(PathBuf, bool)>> {
+pub(crate) fn include_entries(root: &Path, includes: &[PathBuf], host_home: Option<&Path>) -> Result<Vec<(PathBuf, bool)>, Error> {
   let mut entries = vec![(root.to_path_buf(), false)];
   for entry in includes {
     let (path, ro) = split_mode(entry);
     let host = expand(&path, root, host_home);
-    eyre::ensure!(
-      host.exists(),
-      "[workspace] include `{}` does not exist; docker would mount an empty directory in its place",
-      entry.display()
-    );
+    if !host.exists() {
+      return Err(Error::IncludeMissing { entry: entry.clone() });
+    }
     entries.push((host, ro));
   }
-  entries.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+  entries.sort_by_key(|(path, _)| Reverse(path.components().count()));
   Ok(entries)
 }
 
-pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> eyre::Result<String> {
+pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> Result<String, Error> {
   let registry = generation_registry(Some(root))?;
   let config = workspace_config(root)?;
-  let raw_home = config
-    .workspace
-    .home
-    .clone()
-    .ok_or_else(|| eyre::eyre!("[workspace] home is required for stack generation"))?;
+  let raw_home = config.workspace.home.clone().ok_or_else(|| Error::HomeRequired {
+    detail: "for stack generation".to_string(),
+  })?;
   let fnox = open_fnox()?;
   let mut referenced = BTreeSet::new();
   for entry in &config.workspace.include {
@@ -334,13 +331,13 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> eyre::Result
   let env = block_on(resolution_env(&registry, fnox.as_ref(), &referenced))??;
   let expander = build_expander(env.clone());
   let home = expand_value(&expander, &raw_home)?;
-  let host_home = dirs::home_dir();
+  let host_home = home_dir();
   let includes: Vec<PathBuf> = config
     .workspace
     .include
     .iter()
     .map(|entry| expand_path(&expander, &entry.to_string_lossy()).map(PathBuf::from))
-    .collect::<eyre::Result<_>>()?;
+    .collect::<Result<_, Error>>()?;
   let entries = include_entries(root, &includes, host_home.as_deref())?;
   let mounts = covering(
     entries
@@ -376,18 +373,20 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> eyre::Result
     .values()
     .any(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls))
   {
-    let ca_path = hodor_config::config::config_dir()
-      .ok_or_else(|| eyre::eyre!("a guest identity needs the hodor config directory to load the CA from"))?
+    let ca_path = config_dir()
+      .ok_or_else(|| Error::ConfigDir {
+        detail: "a guest identity needs the hodor config directory to load the CA from".to_string(),
+      })?
       .join("ca.pem");
-    let ca = hodor_pki::ca::load_or_generate(&ca_path).map_err(|err| eyre::eyre!("guest identity CA `{}`: {err}", ca_path.display()))?;
+    let ca = load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
+      path: ca_path.clone(),
+      source,
+    })?;
     guest_identity_mounts(&config.rules, &ca, &workspace_state_dir(root).join("guests"), &home)?
   } else {
     Vec::new()
   };
-  let fnox = fnox_binds(
-    fnox_config_dir(host_home.as_deref()).as_deref(),
-    hodor_config::config::config_dir().as_deref(),
-  );
+  let fnox = fnox_binds(fnox_config_dir(host_home.as_deref()).as_deref(), config_dir().as_deref());
   let root_container = translate(root, host_home.as_deref(), &home);
   let project = config.workspace.name.clone().unwrap_or_else(|| workspace_slug(root));
   let storage = workspace_state_dir(root).join("containers");
@@ -424,13 +423,13 @@ pub(crate) struct RewriteInputs<'a> {
   /// Workspace root relative sources resolve against.
   pub(crate) root: &'a Path,
   /// Rewrite entries from `[workspace] file_rewrite`.
-  pub(crate) rewrites: &'a [hodor_config::config::FileRewrite],
+  pub(crate) rewrites: &'a [FileRewrite],
   /// Selected decoys supplying the replacement values.
   pub(crate) decoys: &'a [Decoy],
   /// Resolved real values keyed by env name.
   pub(crate) env: &'a HashMap<String, String>,
   /// Xpanda expander for sources and dests.
-  pub(crate) expander: &'a xpanda::Xpanda,
+  pub(crate) expander: &'a Xpanda,
   /// Container home expanding `{home}` in dests.
   pub(crate) home: &'a str,
   /// Host home relative sources and `~` expand against.
@@ -446,7 +445,7 @@ pub(crate) struct RewriteInputs<'a> {
 /// Returns an error naming the variable when a path fails to expand, naming
 /// the env name when a rewrite names one with no known real value or no
 /// decoy, or when a source file cannot be read or an output written.
-pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> eyre::Result<Vec<Mount>> {
+pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> Result<Vec<Mount>, Error> {
   let RewriteInputs {
     files_dir,
     root,
@@ -461,33 +460,44 @@ pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> eyre::Result<Vec<Moun
     return Ok(Vec::new());
   }
   let by_env: BTreeMap<&str, &str> = decoys.iter().map(|decoy| (decoy.env.as_str(), decoy.value.as_str())).collect();
-  std::fs::create_dir_all(files_dir).wrap_err_with(|| format!("create {}", files_dir.display()))?;
+  fs::create_dir_all(files_dir).map_err(|source| Error::CreateDir {
+    path: files_dir.to_path_buf(),
+    source,
+  })?;
   let mut mounts = Vec::new();
   for (index, rewrite) in rewrites.iter().enumerate() {
     let mut pairs = Vec::new();
     for name in &rewrite.envs {
-      let real = env.get(name).filter(|value| !value.is_empty()).ok_or_else(|| {
-        eyre::eyre!(
-          "file rewrite `{}` names `{name}` with no known real value",
-          rewrite.source.display()
-        )
+      let real = env
+        .get(name)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::RewriteNoValue {
+          file: rewrite.source.clone(),
+          name: name.clone(),
+        })?;
+      let decoy = by_env.get(name.as_str()).ok_or_else(|| Error::RewriteNoDecoy {
+        file: rewrite.source.clone(),
+        name: name.clone(),
       })?;
-      let decoy = by_env
-        .get(name.as_str())
-        .ok_or_else(|| eyre::eyre!("file rewrite `{}` names `{name}` with no decoy", rewrite.source.display()))?;
       pairs.push((real.as_bytes().to_vec(), decoy.as_bytes().to_vec()));
     }
     let expanded_source = PathBuf::from(expand_path(expander, &rewrite.source.to_string_lossy())?);
     let host = expand(&expanded_source, root, host_home);
-    let content = std::fs::read(&host).wrap_err_with(|| format!("read {}", host.display()))?;
+    let content = fs::read(&host).map_err(|source| Error::ReadFile {
+      path: host.clone(),
+      source,
+    })?;
     let out_path = files_dir.join(rewrite_file_name(index, &host));
-    std::fs::write(&out_path, apply_rewrites(&content, &pairs)).wrap_err_with(|| format!("write {}", out_path.display()))?;
+    fs::write(&out_path, apply_rewrites(&content, &pairs)).map_err(|source| Error::WriteFile {
+      path: out_path.clone(),
+      source,
+    })?;
     let container = expand_value(expander, &rewrite.dest)?.replace("{home}", home);
-    eyre::ensure!(
-      container.starts_with('/'),
-      "file rewrite dest `{}` does not expand to an absolute container path",
-      rewrite.dest
-    );
+    if !container.starts_with('/') {
+      return Err(Error::RewriteDestNotAbsolute {
+        dest: rewrite.dest.clone(),
+      });
+    }
     mounts.push(Mount {
       host: out_path,
       container: PathBuf::from(container),
@@ -501,7 +511,7 @@ pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> eyre::Result<Vec<Moun
 /// without the subprocess.
 pub(crate) fn current_uid() -> u32 {
   // Safety: `getuid` takes no arguments, cannot fail, and touches no memory.
-  unsafe { libc::getuid() }
+  unsafe { getuid() }
 }
 
 /// `[rules.*]` TOML for the selection: env names only, values resolve from
@@ -690,7 +700,7 @@ impl Stack<'_> {
     let _ = writeln!(
       out,
       "      - {}:/certs/ca.pem",
-      hodor_config::config::config_dir()
+      config_dir()
         .unwrap_or_else(|| Path::new("~/.config/hodor").to_path_buf())
         .join("ca.pem")
         .display()
@@ -776,7 +786,7 @@ impl Stack<'_> {
       let mode = if mount.ro { "ro" } else { "rw" };
       let _ = writeln!(out, "      - {}:{}:{mode}", mount.host.display(), mount.container.display());
     }
-    let cfg_dir = hodor_config::config::config_dir();
+    let cfg_dir = config_dir();
     let entrypoint_host = cfg_dir
       .as_deref()
       .unwrap_or_else(|| Path::new("~/.config/hodor"))
@@ -913,10 +923,11 @@ pub(crate) fn profile_mounts(
   profile: &str,
   configured: &BTreeMap<String, ToolCfg>,
   home: &str,
-) -> eyre::Result<Vec<Mount>> {
+) -> Result<Vec<Mount>, Error> {
   let chain = hodor_config::config::profile_chain(roots.project, roots.global, profile)?;
   if let Some(global) = roots.global {
-    std::fs::create_dir_all(global.join(SHARED_PROFILE)).wrap_err_with(|| format!("create {}", global.join(SHARED_PROFILE).display()))?;
+    let dir = global.join(SHARED_PROFILE);
+    fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
   }
   let mut names: Vec<String> = TOOL_CONFIG_DIRS.iter().map(|(tool, _)| (*tool).to_string()).collect();
   names.extend(configured.keys().cloned());
@@ -924,10 +935,9 @@ pub(crate) fn profile_mounts(
   names.dedup();
   let mut mounts = Vec::new();
   for name in &names {
-    eyre::ensure!(
-      hodor_config::config::valid_profile(name),
-      "[tools.{name}] is not a plain directory name to mount"
-    );
+    if !valid_profile(name) {
+      return Err(Error::ToolNameInvalid { name: name.clone() });
+    }
     let template = configured
       .get(name)
       .map(|tool| tool.config_dir.as_str())
@@ -936,10 +946,12 @@ pub(crate) fn profile_mounts(
       continue;
     };
     let container = template.replace("{home}", home);
-    eyre::ensure!(
-      container.starts_with('/'),
-      "[tools.{name}] config_dir `{template}` does not expand to an absolute container path"
-    );
+    if !container.starts_with('/') {
+      return Err(Error::ToolConfigNotAbsolute {
+        name: name.clone(),
+        template: template.to_string(),
+      });
+    }
     let mut host = None;
     for layer in [roots.project, roots.global].into_iter().flatten() {
       if let Some(dir) = chain.iter().map(|parent| layer.join(parent).join(name)).find(|dir| dir.is_dir()) {
@@ -952,7 +964,7 @@ pub(crate) fn profile_mounts(
       && let Some(base) = roots.project.or(roots.global)
     {
       let dir = base.join(profile).join(name);
-      std::fs::create_dir_all(&dir).wrap_err_with(|| format!("create {}", dir.display()))?;
+      fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
       host = Some(dir);
     }
     if let Some(host) = host {
@@ -968,23 +980,23 @@ pub(crate) fn profile_mounts(
 
 /// Registry for the generation commands: bundled table, global `rules.d`,
 /// then the workspace's own.
-pub(crate) fn generation_registry(root: Option<&Path>) -> eyre::Result<hodor_config::registry::Registry> {
-  hodor_config::registry::Registry::load_union(
-    hodor_config::config::rules_dir().as_deref(),
-    root.map(hodor_config::config::project_rules_dir).as_deref(),
-  )
+pub(crate) fn generation_registry(root: Option<&Path>) -> Result<Registry, Error> {
+  Ok(Registry::load_union(
+    rules_dir().as_deref(),
+    root.map(project_rules_dir).as_deref(),
+  )?)
 }
 
 /// Open fnox via its own discovery; no hodor-specific env vars.
-pub(crate) fn open_fnox() -> eyre::Result<Option<hodor_fnox::FnoxSource>> {
-  hodor_fnox::FnoxSource::open()
+pub(crate) fn open_fnox() -> Result<Option<FnoxSource>, Error> {
+  Ok(FnoxSource::open()?)
 }
 
 /// The workspace's state directory: `<state-dir>/hodor/ws/<slug>`. The
 /// generated stack lives here and the agent's inner-runtime storage sits
 /// beside it.
 pub(crate) fn workspace_state_dir(root: &Path) -> PathBuf {
-  dirs::state_dir()
+  state_dir()
     .unwrap_or_else(|| PathBuf::from("."))
     .join("hodor")
     .join("ws")
@@ -1006,7 +1018,7 @@ pub(crate) fn workspace_slug(root: &Path) -> String {
   let slug: Vec<String> = root
     .components()
     .filter_map(|component| match component {
-      std::path::Component::Normal(part) => {
+      Component::Normal(part) => {
         let text = part.to_string_lossy().to_lowercase();
         let cleaned: String = text.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
         (!cleaned.trim_matches('-').is_empty()).then(|| cleaned.trim_matches('-').to_string())
@@ -1019,26 +1031,29 @@ pub(crate) fn workspace_slug(root: &Path) -> String {
 
 /// The workspace's own config, as generation and support-file setup read it:
 /// the unified project layer when it exists, the legacy flat file otherwise.
-pub(crate) fn workspace_config(root: &Path) -> eyre::Result<hodor_config::config::AppConfig> {
-  let cli = hodor_config::cli::Cli {
+pub(crate) fn workspace_config(root: &Path) -> Result<AppConfig, Error> {
+  let cli = Cli {
     config: hodor_config::config::project_config_file(root),
     command: None,
   };
-  Ok(hodor_config::config::load(&cli)?.0)
+  Ok(load(&cli)?.0)
 }
 
 #[cfg(test)]
 mod tests {
   use super::{guest_identity_mounts, uncovered_names, uncovered_warning, validate_passthrough};
+  use hodor_config::config::{HostTlsCfg, IfMissing, RuleCfg};
   use hodor_config::grants::GuestTlsMode;
+  use hodor_pki::ca::CertAuthority;
   use std::collections::{BTreeMap, BTreeSet};
+  use std::fs;
   use std::path::PathBuf;
 
-  fn mtls_rule(guest_cert: Option<&str>, guest_key: Option<&str>) -> BTreeMap<String, hodor_config::config::RuleCfg> {
+  fn mtls_rule(guest_cert: Option<&str>, guest_key: Option<&str>) -> BTreeMap<String, RuleCfg> {
     let mut tls = BTreeMap::new();
     tls.insert(
       "https://api.github.com".to_string(),
-      hodor_config::config::HostTlsCfg {
+      HostTlsCfg {
         client_cert: None,
         client_key: None,
         root_cert: None,
@@ -1047,7 +1062,7 @@ mod tests {
         guest_key: guest_key.map(PathBuf::from),
       },
     );
-    let rule = hodor_config::config::RuleCfg {
+    let rule = RuleCfg {
       env: "GITHUB_TOKEN".into(),
       value: None,
       real: None,
@@ -1057,7 +1072,7 @@ mod tests {
       registry: None,
       oauth2: None,
       tls,
-      if_missing: hodor_config::config::IfMissing::default(),
+      if_missing: IfMissing::default(),
     };
     let mut rules = BTreeMap::new();
     rules.insert("github".to_string(), rule);
@@ -1068,7 +1083,7 @@ mod tests {
   /// paths, and the second call is a no-op: the pair on disk is kept.
   #[test]
   fn guest_identity_mounts_declared_paths_and_keeps_an_existing_pair() {
-    let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
+    let ca = CertAuthority::generate().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let guests = dir.path().join("guests");
     let rules = mtls_rule(Some("/safe/cert.pem"), Some("/safe/cert.key"));
@@ -1078,17 +1093,17 @@ mod tests {
     assert_eq!(mounts[1].container, PathBuf::from("/safe/cert.key"));
     assert!(mounts.iter().all(|mount| mount.ro));
     assert!(mounts[0].host.is_file() && mounts[1].host.is_file());
-    let cert_before = std::fs::read(&mounts[0].host).unwrap();
+    let cert_before = fs::read(&mounts[0].host).unwrap();
     let again = guest_identity_mounts(&rules, &ca, &guests, "/root").unwrap();
     assert_eq!(again[0].host, mounts[0].host);
-    assert_eq!(std::fs::read(&mounts[0].host).unwrap(), cert_before);
+    assert_eq!(fs::read(&mounts[0].host).unwrap(), cert_before);
   }
 
   /// An entry that declares no container paths gets the per-rule default
   /// under the agent's home.
   #[test]
   fn guest_identity_defaults_the_container_paths_when_none_declared() {
-    let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
+    let ca = CertAuthority::generate().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let rules = mtls_rule(None, None);
     let mounts = guest_identity_mounts(&rules, &ca, &dir.path().join("guests"), "/root").unwrap();

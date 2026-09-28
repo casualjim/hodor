@@ -3710,7 +3710,6 @@ name = "hodor-compose"
 version = "0.1.16"
 dependencies = [
  "dirs",
- "eyre",
  "hodor-config",
  "hodor-fnox",
  "hodor-pki",
@@ -3719,6 +3718,7 @@ dependencies = [
  "secrecy",
  "shellexpand",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "toml_edit 0.25.15+spec-1.1.0",
  "tracing",
@@ -3734,7 +3734,6 @@ dependencies = [
  "code-workspace",
  "confique",
  "dirs",
- "eyre",
  "hex",
  "pretty_assertions",
  "secrecy",
@@ -3742,6 +3741,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.20",
  "toml 0.8.23",
  "tracing",
  "url",
@@ -3756,7 +3756,6 @@ dependencies = [
  "aya-build",
  "aya-obj",
  "dashmap",
- "eyre",
  "hodor-config",
  "hodor-pki",
  "hodor-proxy",
@@ -3764,6 +3763,7 @@ dependencies = [
  "rustls 0.23.45",
  "secrecy",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls 0.26.5",
  "tracing",
@@ -3780,7 +3780,6 @@ dependencies = [
 name = "hodor-fnox"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "fnox-core",
  "hodor-config",
  "miette",
@@ -3788,6 +3787,7 @@ dependencies = [
  "secrecy",
  "serde",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "toml 0.8.23",
  "toml_edit 0.25.15+spec-1.1.0",
@@ -3798,12 +3798,12 @@ dependencies = [
 name = "hodor-pki"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "pretty_assertions",
  "rama",
  "rcgen",
  "rustls 0.23.45",
  "tempfile",
+ "thiserror 2.0.20",
  "time",
  "tracing",
 ]
@@ -3812,10 +3812,10 @@ dependencies = [
 name = "hodor-plugin"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "hodor-config",
  "pretty_assertions",
  "tempfile",
+ "thiserror 2.0.20",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
@@ -3828,7 +3828,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
- "eyre",
  "futures",
  "h2 0.4.19",
  "hodor-config",
@@ -3860,7 +3859,6 @@ dependencies = [
 name = "hodor-tproxy"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "futures-util",
  "hodor-config",
  "hodor-pki",
@@ -3875,6 +3873,7 @@ dependencies = [
  "rustls 0.23.45",
  "secrecy",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls 0.26.5",
  "tracing",
@@ -3884,7 +3883,6 @@ dependencies = [
 name = "hodor-tun"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "futures-sink",
  "futures-util",
  "hodor-config",
@@ -3897,6 +3895,7 @@ dependencies = [
  "smoltcp",
  "socket2 0.6.5",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls 0.26.5",
  "tokio-util",

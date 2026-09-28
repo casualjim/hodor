@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::Error;
 use secrecy::SecretString;
 
 /// One minted pair: the real freshly issued value and the decoy standing in
@@ -49,8 +50,10 @@ impl MintStore {
   /// # Errors
   ///
   /// Returns an error when the value is empty.
-  pub fn mint(&self, label: &str, pattern: Option<&str>, field: &str, value: &str, expires_in: Option<u64>) -> eyre::Result<String> {
-    eyre::ensure!(!value.is_empty(), "cannot mint a decoy for an empty value");
+  pub fn mint(&self, label: &str, pattern: Option<&str>, field: &str, value: &str, expires_in: Option<u64>) -> Result<String, Error> {
+    if value.is_empty() {
+      return Err(Error::MintEmpty);
+    }
     let mut pairs = self.pairs.lock().expect("mint store poisoned");
     if let Some(pair) = pairs.get(value) {
       return Ok(pair.decoy.clone());
@@ -92,7 +95,7 @@ impl MintHandle {
   /// # Errors
   ///
   /// Returns an error when the value is empty.
-  pub fn mint(&self, label: &str, pattern: Option<&str>, field: &str, value: &str, expires_in: Option<u64>) -> eyre::Result<String> {
+  pub fn mint(&self, label: &str, pattern: Option<&str>, field: &str, value: &str, expires_in: Option<u64>) -> Result<String, Error> {
     self.store.mint(label, pattern, field, value, expires_in)
   }
 

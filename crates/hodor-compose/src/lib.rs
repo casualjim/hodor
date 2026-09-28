@@ -5,23 +5,29 @@
 //! in one go.
 
 mod confine;
+mod error;
 mod expand;
 mod paths;
 mod stack;
 
 pub use confine::{agent_command, down_command, init_command, logs_command, up_command};
+pub use error::Error;
 pub use stack::rules_command;
 
 #[cfg(test)]
 mod tests {
   use std::collections::BTreeMap;
   use std::ffi::OsString;
+  use std::fs;
   use std::path::{Path, PathBuf};
+  use std::slice::from_ref;
 
   use hodor_config::cli::{LogsArgs, ProxyBackend};
-  use hodor_config::config::ToolCfg;
+  use hodor_config::config::{FileRewrite, ToolCfg};
+  use tempfile::tempdir;
 
   use crate::confine::*;
+  use crate::expand::*;
   use crate::paths::*;
   use crate::stack::*;
 
@@ -1003,7 +1009,7 @@ mod tests {
       );
     }
     assert!(
-      yaml.contains(&format!("HODOR_LISTEN: {}", crate::stack::EXPLICIT_LISTEN)),
+      yaml.contains(&format!("HODOR_LISTEN: {EXPLICIT_LISTEN}")),
       "the explicit proxy must not hold the common dev-server port:\n{yaml}"
     );
     assert!(!yaml.contains("HODOR_LISTEN: 127.0.0.1:8080"), "{yaml}");
@@ -1068,13 +1074,10 @@ mod tests {
   fn file_rewrites_swap_reals_for_decoys_on_disk() {
     use std::collections::HashMap;
 
-    use crate::expand::build_expander;
-    use crate::stack::write_rewrites;
-
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let source = dir.path().join("npmrc");
-    std::fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
-    let rewrite = hodor_config::config::FileRewrite {
+    fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
+    let rewrite = FileRewrite {
       source: source.clone(),
       dest: "{home}/.npmrc".to_string(),
       envs: vec!["NPM_TOKEN".to_string()],
@@ -1086,10 +1089,10 @@ mod tests {
     let env = HashMap::from([("NPM_TOKEN".to_string(), "real-secret-1".to_string())]);
     let expander = build_expander(HashMap::new());
     let files = dir.path().join("files");
-    let mounts = write_rewrites(crate::stack::RewriteInputs {
+    let mounts = write_rewrites(RewriteInputs {
       files_dir: &files,
       root: dir.path(),
-      rewrites: std::slice::from_ref(&rewrite),
+      rewrites: from_ref(&rewrite),
       decoys: &decoys,
       env: &env,
       expander: &expander,
@@ -1100,13 +1103,13 @@ mod tests {
     assert_eq!(mounts.len(), 1);
     assert!(mounts[0].ro);
     assert_eq!(mounts[0].container, PathBuf::from("/home/eng/.npmrc"));
-    let body = std::fs::read_to_string(&mounts[0].host).unwrap();
+    let body = fs::read_to_string(&mounts[0].host).unwrap();
     assert!(body.contains("decoy-9"), "{body}");
     assert!(!body.contains("real-secret-1"), "{body}");
-    let error = write_rewrites(crate::stack::RewriteInputs {
+    let error = write_rewrites(RewriteInputs {
       files_dir: &files,
       root: dir.path(),
-      rewrites: &[hodor_config::config::FileRewrite {
+      rewrites: &[FileRewrite {
         source: source.clone(),
         dest: "{home}/.npmrc".to_string(),
         envs: vec!["UNKNOWN_NAME".to_string()],
@@ -1145,13 +1148,13 @@ mod tests {
   /// overwritten; without the mise pair nothing happens.
   #[test]
   fn mise_agent_file_is_created_once_and_never_overwritten() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     assert!(!ensure_mise_agent(dir.path(), "/home/eng").unwrap());
-    std::fs::write(dir.path().join("mise.toml"), "[tools]\n").unwrap();
-    std::fs::write(dir.path().join("mise.local.toml"), "[env]\nA = \"1\"\n").unwrap();
+    fs::write(dir.path().join("mise.toml"), "[tools]\n").unwrap();
+    fs::write(dir.path().join("mise.local.toml"), "[env]\nA = \"1\"\n").unwrap();
     assert!(ensure_mise_agent(dir.path(), "/home/eng").unwrap());
-    std::fs::write(dir.path().join("mise.agent.toml"), "edited").unwrap();
+    fs::write(dir.path().join("mise.agent.toml"), "edited").unwrap();
     assert!(!ensure_mise_agent(dir.path(), "/home/eng").unwrap());
-    assert_eq!(std::fs::read_to_string(dir.path().join("mise.agent.toml")).unwrap(), "edited");
+    assert_eq!(fs::read_to_string(dir.path().join("mise.agent.toml")).unwrap(), "edited");
   }
 }

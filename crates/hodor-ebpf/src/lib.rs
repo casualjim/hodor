@@ -18,13 +18,14 @@ use aya::{
   maps::{Array, MapData},
   programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr},
 };
-use eyre::Context as _;
 use hodor_proxy::ProxyState;
 
+mod error;
 mod flow;
 mod tcp;
 mod udp;
 
+pub use error::Error;
 /// Loopback port the TCP leg listens on. Also written into the BPF `CONFIG`
 /// map, which is what actually sends connections here.
 pub const TCP_LISTEN_PORT: u16 = 15000;
@@ -49,15 +50,10 @@ const CGROUP2_MOUNT: &str = "/sys/fs/cgroup";
 /// `cgroup_parent` on both services wants attached. hodor is a member of the
 /// attached subtree here, so the recorded proxy PID is what keeps its own
 /// sockets out of the capture loop.
-fn enclosing_cgroup() -> eyre::Result<PathBuf> {
-  let content = std::fs::read_to_string("/proc/self/cgroup").wrap_err("read /proc/self/cgroup")?;
-  let own = own_cgroup_path(&content).ok_or_else(|| eyre::eyre!("no `0::<path>` line in /proc/self/cgroup: not a cgroup v2 process"))?;
-  enclosing_from(&own).ok_or_else(|| {
-    eyre::eyre!(
-      "no cgroup encloses {}: it is the cgroup root, where attaching would capture every process on the machine; pass an explicit --ebpf-cgroup path",
-      own.display()
-    )
-  })
+fn enclosing_cgroup() -> Result<PathBuf, Error> {
+  let content = std::fs::read_to_string("/proc/self/cgroup").map_err(|err| Error::ReadCgroupFile { origin: err })?;
+  let own = own_cgroup_path(&content).ok_or(Error::NotCgroupV2)?;
+  enclosing_from(&own).ok_or_else(|| Error::NoEnclosingCgroup { path: own.clone() })
 }
 
 /// This process's own path in the cgroup v2 tree, from the `0::<path>` line.
@@ -205,7 +201,7 @@ fn own_netns_cookie() -> u64 {
 /// cannot be bound. Every one of these is fatal for capture, so they surface
 /// rather than degrade: a silent failure here would leave traffic flowing
 /// unproxied while the operator believes it is captured.
-pub async fn run_ebpf(state: Arc<ProxyState>, cgroup: PathBuf) -> eyre::Result<()> {
+pub async fn run_ebpf(state: Arc<ProxyState>, cgroup: PathBuf) -> Result<(), Error> {
   run_ebpf_with(
     Options {
       cgroup: Some(cgroup),
@@ -216,22 +212,25 @@ pub async fn run_ebpf(state: Arc<ProxyState>, cgroup: PathBuf) -> eyre::Result<(
   .await
 }
 
-pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> eyre::Result<()> {
+pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> Result<(), Error> {
   let cgroup = match options.cgroup.as_deref() {
     Some(path) if path == Path::new(ENCLOSING) => enclosing_cgroup()?,
     Some(path) => path.to_path_buf(),
-    None => eyre::bail!("ebpf capture needs a cgroup directory to attach to, or `--ebpf-cgroup {ENCLOSING}`"),
+    None => return Err(Error::NoCgroup),
   };
   let tcp_port = options.tcp_port.unwrap_or(TCP_LISTEN_PORT);
   let udp_port = options.udp_port.unwrap_or(UDP_LISTEN_PORT);
 
-  let mut bpf = Ebpf::load(PROGRAMS).wrap_err("load eBPF programs")?;
-  configure(&mut bpf, tcp_port, udp_port, options.self_exclusion).wrap_err("write eBPF CONFIG map")?;
+  let mut bpf = Ebpf::load(PROGRAMS).map_err(|err| Error::LoadPrograms { origin: err })?;
+  configure(&mut bpf, tcp_port, udp_port, options.self_exclusion).map_err(|err| Error::WriteConfigMap { origin: err.into() })?;
 
   // `bpf` is held on the stack for as long as this task lives, so the programs
   // stay attached: dropping `Ebpf` detaches them and unloads them, which means
   // there is no kernel residue and nothing to clean up on exit.
-  attach(&mut bpf, &cgroup).wrap_err_with(|| format!("attach to cgroup {}", cgroup.display()))?;
+  attach(&mut bpf, &cgroup).map_err(|err| Error::AttachCgroup {
+    path: cgroup.clone(),
+    origin: err.into(),
+  })?;
 
   let flow = flow::FlowTables::from_bpf(&mut bpf)?;
   if let Some(ready) = options.ready {
@@ -248,7 +247,7 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> e
 }
 
 /// Write the loader-side configuration the programs read at runtime.
-fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfExclusion) -> eyre::Result<()> {
+fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfExclusion) -> Result<(), Error> {
   let netns_cookie = own_netns_cookie();
   if netns_cookie == 0 {
     tracing::warn!(
@@ -263,14 +262,13 @@ fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfE
     udp_port: u32::from(udp_port),
     netns_cookie,
   };
-  config
-    .validate()
-    .map_err(|err| eyre::eyre!("refusing to write an unusable CONFIG: {err}"))?;
-  let map = bpf
-    .map_mut("CONFIG")
-    .ok_or_else(|| eyre::eyre!("CONFIG map missing from the eBPF object"))?;
-  let mut map: Array<&mut MapData, Config> = map.try_into().map_err(|err| eyre::eyre!("CONFIG has an unexpected type: {err}"))?;
-  map.set(0, config, 0).map_err(|err| eyre::eyre!("write CONFIG: {err}"))
+  config.validate().map_err(|_| Error::ConfigInvalid)?;
+  let map = bpf.map_mut("CONFIG").ok_or(Error::MapMissing { name: "CONFIG" })?;
+  let mut map: Array<&mut MapData, Config> = map.try_into().map_err(|err| Error::UnexpectedMapType {
+    name: "CONFIG",
+    origin: err,
+  })?;
+  map.set(0, config, 0).map_err(|err| Error::SetConfig { origin: err })
 }
 
 /// Configuration map layout; must match `hodor-ebpf-programs::Config`.
@@ -416,20 +414,34 @@ impl FlowKey {
 ///
 /// The links live inside the loaded object, so keeping `bpf` alive keeps the
 /// programs attached; there are no handles to hold here.
-fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> eyre::Result<()> {
-  let file = File::open(cgroup).wrap_err_with(|| format!("open cgroup {}", cgroup.display()))?;
+fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> Result<(), Error> {
+  let file = File::open(cgroup).map_err(|err| Error::OpenCgroup {
+    path: cgroup.to_path_buf(),
+    origin: err,
+  })?;
   let mode = CgroupAttachMode::Single;
   attach_sock_addr(bpf, "connect4", &file, mode)?;
   attach_sock_addr(bpf, "recvmsg4", &file, mode)?;
   let program: &mut CgroupSkb = bpf
     .program_mut("capture_egress")
-    .ok_or_else(|| eyre::eyre!("capture_egress program missing from the eBPF object"))?
+    .ok_or_else(|| Error::ProgramMissing {
+      name: "capture_egress".to_string(),
+    })?
     .try_into()
-    .map_err(|err| eyre::eyre!("capture_egress has an unexpected type: {err}"))?;
-  program.load().map_err(|err| eyre::eyre!("load capture_egress: {err}"))?;
+    .map_err(|err| Error::UnexpectedProgramType {
+      name: "capture_egress".to_string(),
+      origin: err,
+    })?;
+  program.load().map_err(|err| Error::LoadProgram {
+    name: "capture_egress".to_string(),
+    origin: err,
+  })?;
   program
     .attach(&file, CgroupSkbAttachType::Egress, mode)
-    .map_err(|err| eyre::eyre!("attach capture_egress: {err}"))?;
+    .map_err(|err| Error::AttachProgram {
+      name: "capture_egress".to_string(),
+      origin: err,
+    })?;
   Ok(())
 }
 
@@ -437,14 +449,23 @@ fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> eyre::Result<()> {
 ///
 /// The attach type comes from the program's own section name, which `load`
 /// reads, so nothing about it needs passing here.
-fn attach_sock_addr(bpf: &mut Ebpf, name: &str, cgroup: &File, mode: CgroupAttachMode) -> eyre::Result<()> {
+fn attach_sock_addr(bpf: &mut Ebpf, name: &str, cgroup: &File, mode: CgroupAttachMode) -> Result<(), Error> {
   let program: &mut CgroupSockAddr = bpf
     .program_mut(name)
-    .ok_or_else(|| eyre::eyre!("{name} program missing from the eBPF object"))?
+    .ok_or_else(|| Error::ProgramMissing { name: name.to_string() })?
     .try_into()
-    .map_err(|err| eyre::eyre!("{name} has an unexpected type: {err}"))?;
-  program.load().map_err(|err| eyre::eyre!("load {name}: {err}"))?;
-  program.attach(cgroup, mode).map_err(|err| eyre::eyre!("attach {name}: {err}"))?;
+    .map_err(|err| Error::UnexpectedProgramType {
+      name: name.to_string(),
+      origin: err,
+    })?;
+  program.load().map_err(|err| Error::LoadProgram {
+    name: name.to_string(),
+    origin: err,
+  })?;
+  program.attach(cgroup, mode).map_err(|err| Error::AttachProgram {
+    name: name.to_string(),
+    origin: err,
+  })?;
   Ok(())
 }
 

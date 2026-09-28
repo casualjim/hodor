@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -35,6 +36,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use hodor_config::grants::{DatabaseScope, EndpointScope, GuestTlsMode, ResolvedConfig, RootCert, SslMode, SslNegotiation};
 use hodor_pki::ca::CertAuthority;
 
+use crate::Error;
 use crate::into_box_error;
 use crate::protocol::{PairCtx, https_framing};
 use crate::relay::relay_guarded;
@@ -48,8 +50,11 @@ pub(crate) struct GuestIo<S> {
 }
 
 impl<S> GuestIo<S> {
-  pub(crate) fn with_target(inner: S, identity: &str, port: u16) -> eyre::Result<Self> {
-    let host: Host = identity.parse().map_err(|err| eyre::eyre!("bad MITM identity {identity}: {err}"))?;
+  pub(crate) fn with_target(inner: S, identity: &str, port: u16) -> Result<Self, Error> {
+    let host: Host = identity.parse().map_err(|err: <Host as FromStr>::Err| Error::BadIdentity {
+      identity: identity.to_string(),
+      source: err,
+    })?;
     let extensions = Extensions::new();
     extensions.insert(ConnectorTarget(HostWithPort::new(host, port)));
     Ok(Self { inner, extensions })
@@ -97,14 +102,28 @@ impl<S> ExtensionsRef for GuestIo<S> {
 /// Load an upstream client identity (mTLS) from the entry's PEM paths: the
 /// certificate chain and its key, ready for the relay's egress. Only the
 /// entry names this identity; nothing invents one.
-pub(crate) fn client_identity(cert: &Path, key: &Path) -> eyre::Result<ClientAuth> {
-  let cert_bytes = std::fs::read(cert).map_err(|err| eyre::eyre!("read `{}`: {err}", cert.display()))?;
-  let key_bytes = std::fs::read(key).map_err(|err| eyre::eyre!("read `{}`: {err}", key.display()))?;
+pub(crate) fn client_identity(cert: &Path, key: &Path) -> Result<ClientAuth, Error> {
+  let cert_bytes = std::fs::read(cert).map_err(|err| Error::ReadFile {
+    path: cert.to_path_buf(),
+    source: err,
+  })?;
+  let key_bytes = std::fs::read(key).map_err(|err| Error::ReadFile {
+    path: key.to_path_buf(),
+    source: err,
+  })?;
   let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_bytes)
     .collect::<Result<Vec<_>, _>>()
-    .map_err(|err| eyre::eyre!("certificate `{}`: {err}", cert.display()))?;
-  eyre::ensure!(!chain.is_empty(), "`{}` holds no certificates", cert.display());
-  let private = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|err| eyre::eyre!("key `{}`: {err}", key.display()))?;
+    .map_err(|err| Error::GuestCertificate {
+      path: cert.to_path_buf(),
+      source: err.into(),
+    })?;
+  if chain.is_empty() {
+    return Err(Error::EmptyChain { path: cert.to_path_buf() });
+  }
+  let private = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|err| Error::ClientKey {
+    path: key.to_path_buf(),
+    source: err.into(),
+  })?;
   Ok(ClientAuth::Single(ClientAuthData {
     cert_chain: chain,
     private_key: private,
@@ -115,7 +134,7 @@ pub(crate) fn client_identity(cert: &Path, key: &Path) -> eyre::Result<ClientAut
 /// upstream identity when upstream requests one, plus a guest-certificate
 /// demand in `Mtls` mode. `None` keeps the relay default (anonymous ingress,
 /// no egress identity).
-pub(crate) fn client_auth_policy(scope: &EndpointScope, trust: &X509Store) -> eyre::Result<Option<TlsMitmClientAuthPolicy>> {
+pub(crate) fn client_auth_policy(scope: &EndpointScope, trust: &X509Store) -> Result<Option<TlsMitmClientAuthPolicy>, Error> {
   let auth = match (&scope.client_cert, &scope.client_key) {
     (Some(cert), Some(key)) => Some(client_identity(cert, key)?),
     (Some(_) | None, None) | (None, Some(_)) => None,
@@ -124,7 +143,7 @@ pub(crate) fn client_auth_policy(scope: &EndpointScope, trust: &X509Store) -> ey
     (GuestTlsMode::Tls, None) => Ok(None),
     (GuestTlsMode::Tls, Some(auth)) => TlsMitmClientAuthPolicy::try_from(auth)
       .map(Some)
-      .map_err(|err| eyre::eyre!("client identity: {err}")),
+      .map_err(|err| Error::ClientAuthPolicy { source: err }),
     (GuestTlsMode::Mtls, auth) => mtls_policy(trust, auth).map(Some),
   }
 }
@@ -132,11 +151,11 @@ pub(crate) fn client_auth_policy(scope: &EndpointScope, trust: &X509Store) -> ey
 /// Policy demanding a guest certificate trusted by `store`, offering the
 /// entry's upstream identity only when upstream requests one (`None` admits
 /// the guest without an egress identity).
-fn mtls_policy(store: &X509Store, auth: Option<ClientAuth>) -> eyre::Result<TlsMitmClientAuthPolicy> {
+fn mtls_policy(store: &X509Store, auth: Option<ClientAuth>) -> Result<TlsMitmClientAuthPolicy, Error> {
   let credential: Option<SslCredential> = auth
     .map(|auth| {
-      let configured = ConnectorConfigClientAuth::try_from(auth).map_err(|err| eyre::eyre!("client identity: {err}"))?;
-      SslCredential::try_from(configured).map_err(|err| eyre::eyre!("client identity: {err}"))
+      let configured = ConnectorConfigClientAuth::try_from(auth).map_err(|err| Error::ClientAuthPolicy { source: err })?;
+      SslCredential::try_from(configured).map_err(|err| Error::ClientAuthPolicy { source: err })
     })
     .transpose()?;
   let store = store.clone();
@@ -149,7 +168,7 @@ fn mtls_policy(store: &X509Store, auth: Option<ClientAuth>) -> eyre::Result<TlsM
 
 /// Failure loading an upstream CA bundle for one entry's extra egress trust.
 #[derive(Debug, Error)]
-pub(crate) enum TrustAnchorsError {
+pub enum TrustAnchorsError {
   /// The bundle file could not be read.
   #[error("read `{path}`: {source}")]
   Read {
@@ -341,7 +360,7 @@ impl PgTransport {
   /// # Errors
   ///
   /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> eyre::Result<Self> {
+  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
     Ok(Self {
       // An own handle on the same CA: minting needs its signing key, and the
       // caller's borrow ends with this call.
@@ -364,7 +383,7 @@ impl PgTransport {
     sni: &str,
     guest: G,
     guest_tls: GuestTlsMode,
-  ) -> eyre::Result<tokio_rustls::server::TlsStream<G>>
+  ) -> Result<tokio_rustls::server::TlsStream<G>, Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
   {
@@ -377,7 +396,7 @@ impl PgTransport {
     TlsAcceptor::from(config)
       .accept(guest)
       .await
-      .map_err(|err| eyre::eyre!("guest postgres TLS: {err}"))
+      .map_err(|err| Error::GuestPostgresTls { source: err })
   }
 
   /// Handshake the server, verifying only what the entry asked to verify.
@@ -391,7 +410,7 @@ impl PgTransport {
     scope: &DatabaseScope,
     server_name: &str,
     server: S,
-  ) -> eyre::Result<tokio_rustls::client::TlsStream<S>>
+  ) -> Result<tokio_rustls::client::TlsStream<S>, Error>
   where
     S: AsyncRead + AsyncWrite + Unpin,
   {
@@ -412,11 +431,14 @@ impl PgTransport {
       // presents it; nothing else invents one.
       (Some(cert), Some(key)) => {
         let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          eyre::bail!("client identity `{}` is empty", cert.display());
+          return Err(Error::EmptyClientIdentity { path: cert.clone() });
         };
         builder
           .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| eyre::eyre!("client identity `{}`: {err}", cert.display()))?
+          .map_err(|err| Error::ClientIdentity {
+            path: cert.clone(),
+            source: err,
+          })?
       }
       _ => builder.with_no_client_auth(),
     };
@@ -425,16 +447,16 @@ impl PgTransport {
       // the same for `h2`). A negotiated-shape client offers nothing.
       config.alpn_protocols = vec![POSTGRESQL_ALPN.to_vec()];
     }
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| eyre::eyre!("postgres server name: {err}"))?;
+    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::PostgresServerName { source: err.into() })?;
     TlsConnector::from(Arc::new(config))
       .connect(name, server)
       .await
-      .map_err(|err| eyre::eyre!("server postgres TLS: {err}"))
+      .map_err(|err| Error::ServerPostgresTls { source: err })
   }
 
   /// Leaf for one name, cached. Minted outside the lock so two guests naming
   /// the same host keygen at most twice and never while a lock is held.
-  fn leaf(&self, sni: &str) -> eyre::Result<Arc<rustls::ServerConfig>> {
+  fn leaf(&self, sni: &str) -> Result<Arc<rustls::ServerConfig>, Error> {
     if let Some(config) = self.lock_leaves().get(sni) {
       return Ok(Arc::clone(config));
     }
@@ -454,7 +476,7 @@ impl PgTransport {
   ///
   /// Returns an error when the leaf cannot be minted or the verifier cannot
   /// be built.
-  fn leaf_mtls(&self, sni: &str) -> eyre::Result<Arc<rustls::ServerConfig>> {
+  fn leaf_mtls(&self, sni: &str) -> Result<Arc<rustls::ServerConfig>, Error> {
     let cache_key = format!("{sni}|mtls");
     if let Some(config) = self.lock_leaves().get(&cache_key) {
       return Ok(Arc::clone(config));
@@ -463,14 +485,14 @@ impl PgTransport {
     let mut roots = RootCertStore::empty();
     roots
       .add(self.ca.cert_der().clone())
-      .map_err(|err| eyre::eyre!("mtls guest roots: {err}"))?;
+      .map_err(|err| Error::MtlsGuestRoots { source: err })?;
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
       .build()
-      .map_err(|err| eyre::eyre!("mtls guest verifier: {err}"))?;
+      .map_err(|err| Error::MtlsGuestVerifier { source: err.into() })?;
     let mut config = rustls::ServerConfig::builder()
       .with_client_cert_verifier(verifier)
       .with_single_cert(chain, key_der)
-      .map_err(|err| eyre::eyre!("mtls leaf: {err}"))?;
+      .map_err(|err| Error::MtlsLeaf { source: err })?;
     config.alpn_protocols = vec![POSTGRESQL_ALPN.to_vec()];
     let config = Arc::new(config);
     self.lock_leaves().insert(cache_key, Arc::clone(&config));
@@ -478,37 +500,50 @@ impl PgTransport {
   }
 
   /// Trust anchors from the entry's `sslrootcert`, read once per path.
-  fn roots_for(&self, root: &RootCert) -> eyre::Result<Arc<RootCertStore>> {
+  fn roots_for(&self, root: &RootCert) -> Result<Arc<RootCertStore>, Error> {
     if let Some(store) = self.lock_roots().get(root) {
       return Ok(Arc::clone(store));
     }
     let store = match root {
       RootCert::Path(path) => {
-        let pem = std::fs::read(path).map_err(|err| eyre::eyre!("sslrootcert {}: {err}", path.display()))?;
+        let pem = std::fs::read(path).map_err(|err| Error::SslRootCert {
+          path: path.clone(),
+          source: err.into(),
+        })?;
         let mut store = RootCertStore::empty();
         let mut anchors = 0usize;
         for cert in CertificateDer::pem_slice_iter(&pem) {
-          let cert = cert.map_err(|err| eyre::eyre!("sslrootcert {}: {err}", path.display()))?;
-          store
-            .add(cert)
-            .map_err(|err| eyre::eyre!("sslrootcert {}: {err}", path.display()))?;
+          let cert = cert.map_err(|err| Error::SslRootCert {
+            path: path.clone(),
+            source: err.into(),
+          })?;
+          store.add(cert).map_err(|err| Error::SslRootCert {
+            path: path.clone(),
+            source: err.into(),
+          })?;
           anchors += 1;
         }
-        eyre::ensure!(anchors > 0, "sslrootcert {}: no certificate in file", path.display());
+        if anchors == 0 {
+          return Err(Error::EmptyRootCert { path: path.clone() });
+        }
         store
       }
       // `system` names the platform trust store exactly; an unreadable or
       // empty store fails closed rather than silently verifying nothing.
       RootCert::System => {
-        let native = rustls_native_certs::load_native_certs();
-        if let Some(err) = native.errors.first() {
-          eyre::bail!("sslrootcert system store: {err}");
+        let mut native = rustls_native_certs::load_native_certs();
+        if !native.errors.is_empty() {
+          return Err(Error::SystemStore {
+            source: native.errors.remove(0).into(),
+          });
         }
         let mut store = RootCertStore::empty();
         for cert in native.certs {
-          store.add(cert).map_err(|err| eyre::eyre!("sslrootcert system store: {err}"))?;
+          store.add(cert).map_err(|err| Error::SystemStore { source: err.into() })?;
         }
-        eyre::ensure!(!store.is_empty(), "sslrootcert system store holds no certificates");
+        if store.is_empty() {
+          return Err(Error::EmptySystemStore);
+        }
         store
       }
     };

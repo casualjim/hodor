@@ -3,17 +3,25 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use eyre::WrapErr as _;
-
-use hodor_config::cli::{LogsArgs, ProxyBackend};
-
+use crate::error::Error;
 use crate::paths::translate;
 use crate::stack::{
-  STACK_SHAPE, current_uid, generate_stack, rules_command, stack_shape_in, uncovered_names, uncovered_warning, workspace_config,
-  workspace_file, workspace_state_dir,
+  STACK_SHAPE, current_uid, generate_stack, generation_registry, open_fnox, rules_command, stack_shape_in, uncovered_names,
+  uncovered_warning, workspace_config, workspace_file, workspace_state_dir,
 };
+use dirs::home_dir;
+use hodor_config::cli::{LogsArgs, ProxyBackend};
+use hodor_config::config::{AppConfig, config_dir};
+use hodor_fnox::selected_envs;
+use hodor_pki::ca::load_or_generate;
+use libc::{SIG_DFL, SIGINT, c_int, sighandler_t, signal};
+use toml_edit::{DocumentMut, Formatted, Item, Value};
 
 /// The entrypoint the generated agent service runs: it makes hodor's CA trusted
 /// inside the container before handing off, by installing it into the system
@@ -60,12 +68,12 @@ exec "$@"
 /// point at, not `[proxy] ca_file`: that describes a host-run hodor, not the
 /// container's mount. The storage directory is this workspace's, under the
 /// state directory.
-pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> eyre::Result<Vec<(PathBuf, bool)>> {
+pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> Result<Vec<(PathBuf, bool)>, Error> {
   let ca = dir.join("ca.pem");
   let entrypoint = dir.join("agent-entrypoint.sh");
   let mut files = Vec::new();
   let created = !ca.exists();
-  match hodor_pki::ca::load_or_generate(&ca) {
+  match load_or_generate(&ca) {
     Ok(_) => files.push((ca, created)),
     // A read-only or unwritable config directory only warns: the stack still
     // starts when a compose layer mounts a CA made with `hodor ca`.
@@ -75,7 +83,7 @@ pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> eyre::Result<V
   // The agent's inner container storage — see the generated compose file for
   // why this directory has to exist before the stack starts.
   let storage_created = !storage.exists();
-  match std::fs::create_dir_all(storage) {
+  match fs::create_dir_all(storage) {
     Ok(()) => files.push((storage.to_path_buf(), storage_created)),
     Err(err) => println!("warning: could not prepare {}: {err}", storage.display()),
   }
@@ -86,16 +94,21 @@ pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> eyre::Result<V
 /// never drift: the file is generated output, and a compose layer overriding
 /// `entrypoint:` is the way to run a custom script instead. Executable: docker
 /// runs it directly.
-pub(crate) fn write_entrypoint(path: &Path) -> eyre::Result<bool> {
-  use std::os::unix::fs::PermissionsExt as _;
-  if let Ok(existing) = std::fs::read_to_string(path)
+pub(crate) fn write_entrypoint(path: &Path) -> Result<bool, Error> {
+  if let Ok(existing) = fs::read_to_string(path)
     && existing == ENTRYPOINT_SCRIPT
   {
     return Ok(false);
   }
   let regenerated = path.exists();
-  std::fs::write(path, ENTRYPOINT_SCRIPT).wrap_err_with(|| format!("write {}", path.display()))?;
-  std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).wrap_err_with(|| format!("chmod {}", path.display()))?;
+  fs::write(path, ENTRYPOINT_SCRIPT).map_err(|source| Error::WriteFile {
+    path: path.to_path_buf(),
+    source,
+  })?;
+  fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|source| Error::ChmodFile {
+    path: path.to_path_buf(),
+    source,
+  })?;
   if regenerated {
     println!("regenerated {} (replaced a stale or edited copy)", path.display());
   }
@@ -104,8 +117,10 @@ pub(crate) fn write_entrypoint(path: &Path) -> eyre::Result<bool> {
 
 /// Resolve the config directory and this workspace's state directory, then
 /// create what the stack mounts from them.
-pub(crate) fn prepare_support_files(root: &Path) -> eyre::Result<Vec<(PathBuf, bool)>> {
-  let dir = hodor_config::config::config_dir().ok_or_else(|| eyre::eyre!("unable to resolve the hodor config directory"))?;
+pub(crate) fn prepare_support_files(root: &Path) -> Result<Vec<(PathBuf, bool)>, Error> {
+  let dir = config_dir().ok_or_else(|| Error::ConfigDir {
+    detail: "unable to resolve the hodor config directory".to_string(),
+  })?;
   ensure_support_files(&dir, &workspace_state_dir(root).join("containers"))
 }
 
@@ -122,25 +137,23 @@ pub(crate) fn report_created(files: &[(PathBuf, bool)]) {
 /// `ebpf` otherwise. Linux only — the generated serve command and the host
 /// wiring that goes with it exist for Linux capture backends, so any other
 /// host is refused here rather than producing a stack that cannot capture.
-pub(crate) fn resolve_backend(backend: Option<ProxyBackend>) -> eyre::Result<ProxyBackend> {
-  eyre::ensure!(
-    cfg!(target_os = "linux"),
-    "hodor init supports Linux only: there is no capture backend for this host"
-  );
+pub(crate) fn resolve_backend(backend: Option<ProxyBackend>) -> Result<ProxyBackend, Error> {
+  if !cfg!(target_os = "linux") {
+    return Err(Error::LinuxOnly);
+  }
   match backend {
     None => Ok(ProxyBackend::Ebpf),
-    Some(ProxyBackend::None) => {
-      eyre::bail!("`--backend none` is not valid for init: the generated stack needs a capture backend")
-    }
+    Some(ProxyBackend::None) => Err(Error::BackendNone),
     Some(backend) => Ok(backend),
   }
 }
 
 /// Canonicalize the workspace root the commands operate on.
-fn resolve_root(workspace: &Path) -> eyre::Result<PathBuf> {
-  workspace
-    .canonicalize()
-    .wrap_err_with(|| format!("resolve workspace {}", workspace.display()))
+fn resolve_root(workspace: &Path) -> Result<PathBuf, Error> {
+  workspace.canonicalize().map_err(|source| Error::ResolveWorkspace {
+    path: workspace.to_path_buf(),
+    source,
+  })
 }
 
 /// The workspace layer of the config overlay: the file `hodor init` writes when
@@ -154,14 +167,20 @@ fn workspace_config_file(root: &Path) -> PathBuf {
 /// Write `content` unless the file is already there; `true` means it was
 /// written now. Nothing existing is ever overwritten — that file is the
 /// user's.
-pub(crate) fn write_if_absent(path: &Path, content: &str) -> eyre::Result<bool> {
+pub(crate) fn write_if_absent(path: &Path, content: &str) -> Result<bool, Error> {
   if path.exists() {
     return Ok(false);
   }
   if let Some(parent) = path.parent() {
-    std::fs::create_dir_all(parent).wrap_err_with(|| format!("create {}", parent.display()))?;
+    fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
+      path: parent.to_path_buf(),
+      source,
+    })?;
   }
-  std::fs::write(path, content).wrap_err_with(|| format!("write {}", path.display()))?;
+  fs::write(path, content).map_err(|source| Error::WriteFile {
+    path: path.to_path_buf(),
+    source,
+  })?;
   Ok(true)
 }
 
@@ -170,12 +189,12 @@ pub(crate) fn write_if_absent(path: &Path, content: &str) -> eyre::Result<bool> 
 /// Without a rule nothing is substituted — every decoy the agent holds stays a
 /// decoy — so `init` writes the file rather than serving a workspace that
 /// cannot swap anything. The file is the user's to trim from then on.
-fn ensure_workspace_config(root: &Path) -> eyre::Result<(PathBuf, bool)> {
+fn ensure_workspace_config(root: &Path) -> Result<(PathBuf, bool), Error> {
   if let Some(existing) = hodor_config::config::project_config_file(root) {
     return Ok((existing, false));
   }
   let path = workspace_config_file(root);
-  let content = rules_command(Some(root)).wrap_err("generate the workspace rules")?;
+  let content = rules_command(Some(root)).map_err(|source| Error::GenerateRules { source: source.into() })?;
   let written = write_if_absent(&path, &content)?;
   Ok((path, written))
 }
@@ -189,13 +208,16 @@ fn ensure_workspace_config(root: &Path) -> eyre::Result<(PathBuf, bool)> {
 ///
 /// Returns an error when the local file cannot be read, rewritten, or
 /// written.
-pub(crate) fn ensure_mise_agent(root: &Path, home: &str) -> eyre::Result<bool> {
+pub(crate) fn ensure_mise_agent(root: &Path, home: &str) -> Result<bool, Error> {
   if !root.join("mise.toml").is_file() || !root.join("mise.local.toml").is_file() || root.join("mise.agent.toml").exists() {
     return Ok(false);
   }
   let local = root.join("mise.local.toml");
-  let content = std::fs::read_to_string(&local).wrap_err_with(|| format!("read {}", local.display()))?;
-  let rewritten = rewrite_mise_toml(&content, dirs::home_dir().as_deref(), home)?;
+  let content = fs::read_to_string(&local).map_err(|source| Error::ReadFile {
+    path: local.clone(),
+    source,
+  })?;
+  let rewritten = rewrite_mise_toml(&content, home_dir().as_deref(), home)?;
   write_if_absent(&root.join("mise.agent.toml"), &rewritten)
 }
 
@@ -206,47 +228,46 @@ pub(crate) fn ensure_mise_agent(root: &Path, home: &str) -> eyre::Result<bool> {
 /// # Errors
 ///
 /// Returns an error when the content is not valid TOML.
-pub(crate) fn rewrite_mise_toml(content: &str, host_home: Option<&Path>, home: &str) -> eyre::Result<String> {
-  let mut document: toml_edit::DocumentMut = content.parse().wrap_err("parse mise.local.toml")?;
+pub(crate) fn rewrite_mise_toml(content: &str, host_home: Option<&Path>, home: &str) -> Result<String, Error> {
+  let mut document: DocumentMut = content.parse().map_err(|source| Error::MiseParse { source })?;
   rewrite_mise_item(document.as_item_mut(), host_home, home);
   Ok(document.to_string())
 }
 
 /// Rewrite one TOML value tree in place: every string under a home prefix
 /// moves to the container home.
-fn rewrite_mise_item(item: &mut toml_edit::Item, host_home: Option<&Path>, home: &str) {
+fn rewrite_mise_item(item: &mut Item, host_home: Option<&Path>, home: &str) {
   match item {
-    toml_edit::Item::Value(value) => rewrite_mise_value(value, host_home, home),
-    toml_edit::Item::Table(table) => {
+    Item::Value(value) => rewrite_mise_value(value, host_home, home),
+    Item::Table(table) => {
       for (_, item) in table.iter_mut() {
         rewrite_mise_item(item, host_home, home);
       }
     }
-    toml_edit::Item::ArrayOfTables(tables) => {
+    Item::ArrayOfTables(tables) => {
       for table in tables.iter_mut() {
         for (_, item) in table.iter_mut() {
           rewrite_mise_item(item, host_home, home);
         }
       }
     }
-    toml_edit::Item::None => {}
+    Item::None => {}
   }
 }
-
 /// Rewrite one TOML value: arrays recurse, strings under the host home move
 /// to the container home, everything else stays.
-fn rewrite_mise_value(value: &mut toml_edit::Value, host_home: Option<&Path>, home: &str) {
+fn rewrite_mise_value(value: &mut Value, host_home: Option<&Path>, home: &str) {
   match value {
-    toml_edit::Value::String(text) => {
+    Value::String(text) => {
       let rewritten = rewrite_mise_string(text.value(), host_home, home);
-      *text = toml_edit::Formatted::new(rewritten);
+      *text = Formatted::new(rewritten);
     }
-    toml_edit::Value::Array(items) => {
+    Value::Array(items) => {
       for item in items.iter_mut() {
         rewrite_mise_value(item, host_home, home);
       }
     }
-    toml_edit::Value::InlineTable(table) => {
+    Value::InlineTable(table) => {
       for (_, value) in table.iter_mut() {
         rewrite_mise_value(value, host_home, home);
       }
@@ -369,10 +390,13 @@ pub(crate) fn generated_backend(compose: &str) -> Option<ProxyBackend> {
 /// Generate the workspace stack when it is absent, and regenerate it when the
 /// workspace config changed since it was generated; a stack whose config is
 /// unchanged is left alone, so hand edits survive until then.
-fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) -> eyre::Result<()> {
+fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) -> Result<(), Error> {
   let state_ws = workspace_state_dir(root);
   let ws_compose = state_ws.join("compose.yml");
-  std::fs::create_dir_all(&state_ws).wrap_err_with(|| format!("create {}", state_ws.display()))?;
+  fs::create_dir_all(&state_ws).map_err(|source| Error::CreateDir {
+    path: state_ws.clone(),
+    source,
+  })?;
   let (config_file, written) = ensure_workspace_config(root)?;
   if written {
     println!("wrote {}", config_file.display());
@@ -387,7 +411,7 @@ fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) ->
   {
     println!("wrote {}", root.join("mise.agent.toml").display());
   }
-  let existing = std::fs::read_to_string(&ws_compose).ok();
+  let existing = fs::read_to_string(&ws_compose).ok();
   if existing.is_some() {
     if !stack_is_stale(&state_ws, root) {
       println!("exists, left untouched: {}", ws_compose.display());
@@ -404,9 +428,14 @@ fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) ->
     _ => backend,
   };
   let stack = generate_stack(root, backend)?;
-  std::fs::write(&ws_compose, stack).wrap_err_with(|| format!("write {}", ws_compose.display()))?;
-  std::fs::write(state_ws.join("config.digest"), config_digest(root).to_string())
-    .wrap_err_with(|| format!("write {}", state_ws.join("config.digest").display()))?;
+  fs::write(&ws_compose, stack).map_err(|source| Error::WriteFile {
+    path: ws_compose.clone(),
+    source,
+  })?;
+  fs::write(state_ws.join("config.digest"), config_digest(root).to_string()).map_err(|source| Error::WriteFile {
+    path: state_ws.join("config.digest"),
+    source,
+  })?;
   println!("generated: {}", ws_compose.display());
   Ok(())
 }
@@ -414,7 +443,7 @@ fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) ->
 /// The compose files on disk, in layer order.
 fn compose_layers(root: &Path) -> Vec<PathBuf> {
   [
-    hodor_config::config::config_dir().map(|dir| dir.join("compose.yml")),
+    config_dir().map(|dir| dir.join("compose.yml")),
     Some(workspace_state_dir(root).join("compose.yml")),
     Some(workspace_file(root)),
   ]
@@ -425,14 +454,12 @@ fn compose_layers(root: &Path) -> Vec<PathBuf> {
 }
 
 /// A `docker compose` command over those layers.
-fn compose_command(root: &Path) -> eyre::Result<std::process::Command> {
+fn compose_command(root: &Path) -> Result<Command, Error> {
   let layers = compose_layers(root);
-  eyre::ensure!(
-    !layers.is_empty(),
-    "no compose layers for {}; run `hodor init` first or create one of the layer files",
-    root.display()
-  );
-  let mut command = std::process::Command::new("docker");
+  if layers.is_empty() {
+    return Err(Error::NoComposeLayers { root: root.to_path_buf() });
+  }
+  let mut command = Command::new("docker");
   command.arg("compose");
   for layer in layers {
     command.arg("-f").arg(layer);
@@ -441,23 +468,31 @@ fn compose_command(root: &Path) -> eyre::Result<std::process::Command> {
 }
 
 /// Run a compose command and fail on a non-zero exit; its output is the user's.
-fn compose_status(command: &mut std::process::Command) -> eyre::Result<()> {
-  let status = command.status().wrap_err("spawn docker compose")?;
-  eyre::ensure!(status.success(), "docker compose failed: {status}");
+fn compose_status(command: &mut Command) -> Result<(), Error> {
+  let status = command.status().map_err(|source| Error::SpawnCompose { source })?;
+  if !status.success() {
+    return Err(Error::ComposeFailed {
+      status: status.to_string(),
+    });
+  }
   Ok(())
 }
 
 /// The same, for a compose command the user is meant to interrupt — an exec
 /// session, a `--follow` log read. compose reports that interrupt as 130, and
 /// an interrupt is the user getting what they asked for, not a failure.
-fn compose_status_interruptible(command: &mut std::process::Command) -> eyre::Result<()> {
-  let status = command.status().wrap_err("spawn docker compose")?;
-  eyre::ensure!(status.success() || status.code() == Some(130), "docker compose failed: {status}");
+fn compose_status_interruptible(command: &mut Command) -> Result<(), Error> {
+  let status = command.status().map_err(|source| Error::SpawnCompose { source })?;
+  if !(status.success() || status.code() == Some(130)) {
+    return Err(Error::ComposeFailed {
+      status: status.to_string(),
+    });
+  }
   Ok(())
 }
 
 /// Start the layered project, making sure what it mounts exists first.
-fn up_workspace(root: &Path) -> eyre::Result<()> {
+fn up_workspace(root: &Path) -> Result<(), Error> {
   report_created(&prepare_support_files(root)?);
   let mut command = compose_command(root)?;
   command.arg("up").arg("-d");
@@ -465,7 +500,7 @@ fn up_workspace(root: &Path) -> eyre::Result<()> {
 }
 
 /// Stop the layered project.
-fn down_workspace(root: &Path) -> eyre::Result<()> {
+fn down_workspace(root: &Path) -> Result<(), Error> {
   let mut command = compose_command(root)?;
   command.arg("down");
   compose_status(&mut command)
@@ -489,7 +524,7 @@ pub(crate) fn logs_argv(args: &LogsArgs) -> Vec<OsString> {
 }
 
 /// Read the stack's logs.
-fn logs_workspace(root: &Path, args: &LogsArgs) -> eyre::Result<()> {
+fn logs_workspace(root: &Path, args: &LogsArgs) -> Result<(), Error> {
   let mut command = compose_command(root)?;
   command.args(logs_argv(args));
   compose_status_interruptible(&mut command)
@@ -497,15 +532,13 @@ fn logs_workspace(root: &Path, args: &LogsArgs) -> eyre::Result<()> {
 
 /// Enter the agent environment at the translated workspace directory: the
 /// configured shell, or `command` when the caller passed one.
-fn exec_agent(root: &Path, command: &[OsString]) -> eyre::Result<()> {
+fn exec_agent(root: &Path, command: &[OsString]) -> Result<(), Error> {
   let config = workspace_config(root)?;
-  let home = config
-    .workspace
-    .home
-    .clone()
-    .ok_or_else(|| eyre::eyre!("[workspace] home is required for the agent workdir"))?;
-  let workdir = translate(root, dirs::home_dir().as_deref(), &home);
-  warn_uncovered(&config);
+  let home = config.workspace.home.clone().ok_or_else(|| Error::HomeRequired {
+    detail: "for the agent workdir".to_string(),
+  })?;
+  let workdir = translate(root, home_dir().as_deref(), &home);
+  warn_uncovered(root, &config);
   let uid = current_uid();
   let argv: Vec<OsString> = if command.is_empty() {
     vec![config.workspace.shell.clone().unwrap_or_else(|| "sh".to_string()).into()]
@@ -528,17 +561,17 @@ fn exec_agent(root: &Path, command: &[OsString]) -> eyre::Result<()> {
 /// Print one sorted warning for fnox-declared names no rule, passthrough, or
 /// provider wiring covers, every time the agent is entered. Never prints
 /// values. A missing fnox setup means nothing to cover, so it stays silent.
-fn warn_uncovered(config: &hodor_config::config::AppConfig) {
-  let Ok(fnox) = crate::stack::open_fnox() else {
+fn warn_uncovered(root: &Path, config: &AppConfig) {
+  let Ok(fnox) = open_fnox() else {
     return;
   };
   let Some(fnox) = fnox else {
     return;
   };
-  let Ok(registry) = crate::stack::generation_registry() else {
+  let Ok(registry) = generation_registry(Some(root)) else {
     return;
   };
-  let selected = hodor_fnox::selected_envs(Some(&fnox), &registry);
+  let selected = selected_envs(Some(&fnox), &registry);
   if let Some(warning) = uncovered_warning(&uncovered_names(fnox.declared(), &selected, &config.workspace.passthrough)) {
     println!("{warning}");
   }
@@ -556,7 +589,7 @@ fn warn_uncovered(config: &hodor_config::config::AppConfig) {
 /// Returns an error when the host is not Linux, when the workspace cannot be
 /// resolved or its stack generated, when `hodor rules` cannot be computed, or
 /// when a file cannot be written.
-pub fn init_command(workspace: &Path, backend: Option<ProxyBackend>) -> eyre::Result<()> {
+pub fn init_command(workspace: &Path, backend: Option<ProxyBackend>) -> Result<(), Error> {
   let root = resolve_root(workspace)?;
   init_workspace(&root, resolve_backend(backend)?, backend.is_some())
 }
@@ -572,7 +605,7 @@ pub fn init_command(workspace: &Path, backend: Option<ProxyBackend>) -> eyre::Re
 /// Returns an error under the same conditions as [`init_command`], plus when
 /// the compose command fails. A failed `rm` teardown is reported too, because
 /// the stack the caller asked to stop is still up.
-pub fn agent_command(workspace: &Path, command: &[OsString], rm: bool) -> eyre::Result<()> {
+pub fn agent_command(workspace: &Path, command: &[OsString], rm: bool) -> Result<(), Error> {
   let root = resolve_root(workspace)?;
   init_workspace(&root, resolve_backend(None)?, false)?;
   up_workspace(&root)?;
@@ -599,7 +632,7 @@ impl SurviveInterrupt {
   #[must_use]
   fn new() -> Self {
     // Safety: the handler only returns, so no work happens inside the signal.
-    unsafe { libc::signal(libc::SIGINT, swallow_interrupt as *const () as libc::sighandler_t) };
+    unsafe { signal(SIGINT, swallow_interrupt as *const () as sighandler_t) };
     Self
   }
 }
@@ -607,11 +640,11 @@ impl SurviveInterrupt {
 impl Drop for SurviveInterrupt {
   fn drop(&mut self) {
     // Safety: restores the disposition every process starts with.
-    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+    unsafe { signal(SIGINT, SIG_DFL) };
   }
 }
 
-extern "C" fn swallow_interrupt(_: libc::c_int) {}
+extern "C" fn swallow_interrupt(_: c_int) {}
 
 /// `hodor up [workspace]`: start the layered compose project `hodor init`
 /// generated, making sure what it mounts exists first.
@@ -620,7 +653,7 @@ extern "C" fn swallow_interrupt(_: libc::c_int) {}
 ///
 /// Returns an error when the workspace cannot be resolved, when the support
 /// files cannot be written, or when the compose command fails.
-pub fn up_command(workspace: &Path) -> eyre::Result<()> {
+pub fn up_command(workspace: &Path) -> Result<(), Error> {
   up_workspace(&resolve_root(workspace)?)
 }
 
@@ -630,7 +663,7 @@ pub fn up_command(workspace: &Path) -> eyre::Result<()> {
 ///
 /// Returns an error when the workspace cannot be resolved or when the compose
 /// command fails.
-pub fn down_command(workspace: &Path) -> eyre::Result<()> {
+pub fn down_command(workspace: &Path) -> Result<(), Error> {
   down_workspace(&resolve_root(workspace)?)
 }
 
@@ -640,6 +673,6 @@ pub fn down_command(workspace: &Path) -> eyre::Result<()> {
 ///
 /// Returns an error when the workspace cannot be resolved or when the compose
 /// command fails.
-pub fn logs_command(workspace: &Path, args: &LogsArgs) -> eyre::Result<()> {
+pub fn logs_command(workspace: &Path, args: &LogsArgs) -> Result<(), Error> {
   logs_workspace(&resolve_root(workspace)?, args)
 }

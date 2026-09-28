@@ -18,7 +18,7 @@ mod tests {
   use std::path::{Path, PathBuf};
 
   use hodor_config::cli::{LogsArgs, ProxyBackend};
-  use hodor_config::config::AgentCfg;
+  use hodor_config::config::ToolCfg;
 
   use crate::confine::*;
   use crate::paths::*;
@@ -64,7 +64,7 @@ mod tests {
       decoys: decoys(),
       agent: agent_paths("/home/eng"),
       mounts: Vec::new(),
-      agent_configs: Vec::new(),
+      tool_mounts: Vec::new(),
       fnox: FnoxBinds::default(),
       guest: Vec::new(),
       init: None,
@@ -95,7 +95,7 @@ mod tests {
 
   #[test]
   fn names_the_registry_states_no_hosts_for_split_out_of_the_active_rules() {
-    let registry = generation_registry().unwrap();
+    let registry = generation_registry(None).unwrap();
     let decoys = vec![
       Decoy {
         env: "GITHUB_TOKEN".to_string(),
@@ -177,18 +177,21 @@ mod tests {
     assert_eq!(expand(Path::new("/opt/data"), root, host_home), PathBuf::from("/opt/data"));
   }
 
-  #[test]
-  fn agent_config_directories_mount_at_each_agents_default_location() {
-    let host_home = tempfile::tempdir().unwrap();
-    let config_dir = host_home.path().join(".config").join("hodor");
-    let agents = config_dir.join("agents");
-    std::fs::create_dir_all(agents.join("pi")).unwrap();
-    std::fs::create_dir_all(agents.join("opencode")).unwrap();
-    std::fs::create_dir_all(agents.join("not-an-agent")).unwrap();
-    std::fs::write(agents.join("stray-file"), "x").unwrap();
+  /// Roots over a temp global config dir: the profiles dir plus the config
+  /// dir holding the profiles tree.
+  fn temp_global(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join(".config").join("hodor").join("profiles")
+  }
 
-    let mounts = agent_config_mounts(Some(&config_dir), &BTreeMap::new(), "/home/eng").unwrap();
-    let rendered: Vec<String> = mounts
+  fn temp_roots(profiles: &Path) -> ProfileRoots<'_> {
+    ProfileRoots {
+      project: None,
+      global: Some(profiles),
+    }
+  }
+
+  fn rendered_mounts(mounts: &[Mount]) -> Vec<String> {
+    mounts
       .iter()
       .map(|entry| {
         format!(
@@ -198,51 +201,163 @@ mod tests {
           if entry.ro { "ro" } else { "rw" }
         )
       })
-      .collect();
+      .collect()
+  }
+
+  #[test]
+  fn shared_profile_mounts_tools_at_each_tools_default_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let shared = profiles.join("__shared__");
+    std::fs::create_dir_all(shared.join("pi")).unwrap();
+    std::fs::create_dir_all(shared.join("opencode")).unwrap();
+    std::fs::create_dir_all(shared.join("not-a-tool")).unwrap();
+    std::fs::write(shared.join("stray-file"), "x").unwrap();
+
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "__shared__", &BTreeMap::new(), "/home/eng").unwrap();
     assert_eq!(
-      rendered,
+      rendered_mounts(&mounts),
       vec![
-        format!("{}:/home/eng/.config/opencode:rw", agents.join("opencode").display()),
-        format!("{}:/home/eng/.pi:rw", agents.join("pi").display()),
+        format!("{}:/home/eng/.config/opencode:rw", shared.join("opencode").display()),
+        format!("{}:/home/eng/.pi:rw", shared.join("pi").display()),
       ]
     );
 
     let yaml = Stack {
       agent: agent_paths("/home/eng/github/hodor"),
-      agent_configs: mounts.clone(),
+      tool_mounts: mounts.clone(),
       ..test_stack(ProxyBackend::Tproxy)
     }
     .render();
     assert!(
-      yaml.contains(&format!("- {}:/home/eng/.pi:rw", agents.join("pi").display())),
+      yaml.contains(&format!("- {}:/home/eng/.pi:rw", shared.join("pi").display())),
       "{yaml}"
     );
-    assert!(!yaml.contains("not-an-agent"), "{yaml}");
+    assert!(!yaml.contains("not-a-tool"), "{yaml}");
   }
 
   #[test]
-  fn configured_agents_extend_and_override_the_built_in_table() {
-    let host_home = tempfile::tempdir().unwrap();
-    let config_dir = host_home.path().join(".config").join("hodor");
-    let agents = config_dir.join("agents");
-    std::fs::create_dir_all(agents.join("pi")).unwrap();
-    std::fs::create_dir_all(agents.join("trae")).unwrap();
+  fn shared_root_is_created_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "__shared__", &BTreeMap::new(), "/home/eng").unwrap();
+    assert!(mounts.is_empty(), "{mounts:?}");
+    assert!(
+      profiles.join("__shared__").is_dir(),
+      "the base every profile inherits is always made"
+    );
+  }
+
+  #[test]
+  fn named_profile_inherits_shared_tools_it_does_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    std::fs::create_dir_all(profiles.join("__shared__").join("pi")).unwrap();
+    std::fs::create_dir_all(profiles.join("work").join("gh")).unwrap();
+
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
+    assert_eq!(
+      rendered_mounts(&mounts),
+      vec![
+        format!("{}:/home/eng/.config/gh:rw", profiles.join("work").join("gh").display()),
+        format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display()),
+      ]
+    );
+  }
+
+  #[test]
+  fn cookie_chains_inherit_grandparent_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    std::fs::create_dir_all(profiles.join("__shared__").join("pi")).unwrap();
+    std::fs::create_dir_all(profiles.join("mid").join("opencode")).unwrap();
+    std::fs::create_dir_all(profiles.join("leaf")).unwrap();
+    std::fs::write(profiles.join("mid").join("profile.toml"), "[profile]\nparent = \"__shared__\"\n").unwrap();
+    std::fs::write(profiles.join("leaf").join("profile.toml"), "[profile]\nparent = \"mid\"\n").unwrap();
+
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "leaf", &BTreeMap::new(), "/home/eng").unwrap();
+    assert_eq!(
+      rendered_mounts(&mounts),
+      vec![
+        format!("{}:/home/eng/.config/opencode:rw", profiles.join("mid").join("opencode").display()),
+        format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display()),
+      ]
+    );
+  }
+
+  #[test]
+  fn project_layer_beats_global_at_each_inheritance_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let project = dir.path().join("ws").join(".config").join("hodor").join("profiles");
+    std::fs::create_dir_all(project.join("work").join("pi")).unwrap();
+    std::fs::create_dir_all(profiles.join("work").join("pi")).unwrap();
+    std::fs::create_dir_all(project.join("__shared__").join("opencode")).unwrap();
+    std::fs::create_dir_all(profiles.join("__shared__").join("opencode")).unwrap();
+
+    let roots = ProfileRoots {
+      project: Some(project.as_path()),
+      global: Some(profiles.as_path()),
+    };
+    let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
+    assert_eq!(
+      rendered_mounts(&mounts),
+      vec![
+        format!(
+          "{}:/home/eng/.config/opencode:rw",
+          project.join("__shared__").join("opencode").display()
+        ),
+        format!("{}:/home/eng/.pi:rw", project.join("work").join("pi").display()),
+      ]
+    );
+  }
+
+  #[test]
+  fn project_default_beats_global_named_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let project = dir.path().join("ws").join(".config").join("hodor").join("profiles");
+    std::fs::create_dir_all(project.join("__shared__").join("pi")).unwrap();
+    std::fs::create_dir_all(profiles.join("work").join("pi")).unwrap();
+
+    let roots = ProfileRoots {
+      project: Some(project.as_path()),
+      global: Some(profiles.as_path()),
+    };
+    let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
+    assert_eq!(
+      rendered_mounts(&mounts),
+      vec![format!("{}:/home/eng/.pi:rw", project.join("__shared__").join("pi").display()),]
+    );
+  }
+  #[test]
+  fn configured_tools_extend_and_override_the_built_in_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let shared = profiles.join("__shared__");
+    std::fs::create_dir_all(shared.join("pi")).unwrap();
+    std::fs::create_dir_all(shared.join("trae")).unwrap();
 
     let configured = BTreeMap::from([
       (
         "pi".to_string(),
-        AgentCfg {
+        ToolCfg {
           config_dir: "{home}/.pi-alt".to_string(),
         },
       ),
       (
         "trae".to_string(),
-        AgentCfg {
+        ToolCfg {
           config_dir: "{home}/.trae".to_string(),
         },
       ),
     ]);
-    let mounts = agent_config_mounts(Some(&config_dir), &configured, "/home/eng").unwrap();
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "__shared__", &configured, "/home/eng").unwrap();
     let rendered: Vec<String> = mounts
       .iter()
       .map(|entry| format!("{}:{}", entry.host.display(), entry.container.display()))
@@ -250,19 +365,80 @@ mod tests {
     assert_eq!(
       rendered,
       vec![
-        format!("{}:/home/eng/.pi-alt", agents.join("pi").display()),
-        format!("{}:/home/eng/.trae", agents.join("trae").display()),
+        format!("{}:/home/eng/.pi-alt", shared.join("pi").display()),
+        format!("{}:/home/eng/.trae", shared.join("trae").display()),
       ]
     );
 
     let relative = BTreeMap::from([(
       "pi".to_string(),
-      AgentCfg {
+      ToolCfg {
         config_dir: "relative/pi".to_string(),
       },
     )]);
-    let err = agent_config_mounts(Some(&config_dir), &relative, "/home/eng").unwrap_err();
+    let err = profile_mounts(&roots, "__shared__", &relative, "/home/eng").unwrap_err();
     assert!(err.to_string().contains("absolute"), "{err:?}");
+  }
+
+  #[test]
+  fn configured_tool_names_must_be_plain_directory_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let configured = BTreeMap::from([(
+      "../escape".to_string(),
+      ToolCfg {
+        config_dir: "{home}/.escape".to_string(),
+      },
+    )]);
+    let roots = temp_roots(&profiles);
+    let err = profile_mounts(&roots, "__shared__", &configured, "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("not a plain directory name"), "{err:?}");
+    assert!(
+      !profiles
+        .parent()
+        .and_then(|p| p.parent())
+        .is_some_and(|config| config.join("escape").is_dir()),
+      "the escape must not create anything outside the profiles root"
+    );
+  }
+
+  #[test]
+  fn configured_tool_is_created_under_the_selected_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let configured = BTreeMap::from([(
+      "custom".to_string(),
+      ToolCfg {
+        config_dir: "{home}/.custom".to_string(),
+      },
+    )]);
+
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "work", &configured, "/home/eng").unwrap();
+    let host = profiles.join("work").join("custom");
+    assert!(host.is_dir(), "explicit intent makes the directory");
+    assert_eq!(rendered_mounts(&mounts), vec![format!("{}:/home/eng/.custom:rw", host.display())]);
+  }
+
+  #[test]
+  fn profile_cycles_and_unknown_parents_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    for name in ["aaa", "bbb"] {
+      std::fs::create_dir_all(profiles.join(name)).unwrap();
+    }
+    std::fs::write(profiles.join("aaa").join("profile.toml"), "[profile]\nparent = \"bbb\"\n").unwrap();
+    std::fs::write(profiles.join("bbb").join("profile.toml"), "[profile]\nparent = \"aaa\"\n").unwrap();
+    std::fs::create_dir_all(profiles.join("orphan")).unwrap();
+    std::fs::write(profiles.join("orphan").join("profile.toml"), "[profile]\nparent = \"missing\"\n").unwrap();
+
+    let roots = temp_roots(&profiles);
+    let err = profile_mounts(&roots, "aaa", &BTreeMap::new(), "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("cycle"), "{err:?}");
+    let err = profile_mounts(&roots, "orphan", &BTreeMap::new(), "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("missing"), "{err:?}");
+    let err = profile_mounts(&roots, "../x", &BTreeMap::new(), "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("plain directory name"), "{err:?}");
   }
 
   #[test]
@@ -344,7 +520,7 @@ mod tests {
 
   #[test]
   fn the_example_workspace_loads_and_inherits_registry_hosts() {
-    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/agentic-devenv/.config/hodor.toml");
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/agentic-devenv/.config/hodor/config.toml");
     let cli = hodor_config::cli::Cli {
       config: Some(example.clone()),
       command: None,
@@ -352,7 +528,7 @@ mod tests {
     let (config, _) = hodor_config::config::load(&cli).unwrap_or_else(|err| panic!("{} does not load: {err}", example.display()));
     assert_eq!(config.workspace.home.as_deref(), Some("/home/eng"));
     assert_eq!(config.workspace.shell.as_deref(), Some("bash"));
-    let registry = generation_registry().unwrap();
+    let registry = generation_registry(None).unwrap();
     for (label, env) in [("anthropic", "ANTHROPIC_API_KEY"), ("github", "GH_TOKEN")] {
       let rule = config
         .rules
@@ -615,7 +791,7 @@ mod tests {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let config = root.path().join(".config");
-    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(config.join("hodor")).unwrap();
 
     assert!(
       stack_is_stale(state.path(), root.path()),
@@ -624,13 +800,53 @@ mod tests {
     std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
     assert!(!stack_is_stale(state.path(), root.path()), "an untouched config keeps the stack");
 
-    std::fs::write(config.join("hodor.toml"), "[rules.x]\nenv = \"X\"\n").unwrap();
+    std::fs::write(config.join("hodor").join("config.toml"), "[rules.x]\nenv = \"X\"\n").unwrap();
     assert!(
       stack_is_stale(state.path(), root.path()),
       "a config that appeared after generation is a change"
     );
     std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
     assert!(!stack_is_stale(state.path(), root.path()));
+  }
+
+  /// Generation reads the `rules.d` override trees on both layers, so an
+  /// edit there changes the derived decoys and must regenerate the stack.
+  #[test]
+  fn the_stack_is_stale_when_the_rules_overrides_change() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let global = tempfile::tempdir().unwrap();
+    set_env("XDG_CONFIG_HOME", global.path());
+    let global_rules = global.path().join("hodor").join("rules.d");
+    let project_rules = root.path().join(".config").join("hodor").join("rules.d");
+
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    assert!(!stack_is_stale(state.path(), root.path()), "absent rules trees are stable");
+
+    std::fs::create_dir_all(&project_rules).unwrap();
+    std::fs::write(
+      project_rules.join("10-late.toml"),
+      "[names.LATE_TOKEN]\nhosts = [\"https://late.example\"]\n",
+    )
+    .unwrap();
+    assert!(
+      stack_is_stale(state.path(), root.path()),
+      "a project rules.d file that appeared after generation is a change"
+    );
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    assert!(!stack_is_stale(state.path(), root.path()));
+
+    std::fs::create_dir_all(&global_rules).unwrap();
+    std::fs::write(
+      global_rules.join("10-glob.toml"),
+      "[names.GLOB_TOKEN]\nhosts = [\"https://glob.example\"]\n",
+    )
+    .unwrap();
+    assert!(
+      stack_is_stale(state.path(), root.path()),
+      "a global rules.d file that appeared after generation is a change"
+    );
+    unset_env("XDG_CONFIG_HOME");
   }
 
   /// Generation reads the global layer too, so an edit there — where `[workspace]`
@@ -713,10 +929,10 @@ mod tests {
   /// to be said out loud rather than served silently.
   #[test]
   fn serving_no_rules_is_announced() {
-    let config_file = Path::new("/ws/.config/hodor.toml");
+    let config_file = Path::new("/ws/.config/hodor/config.toml");
     let warning = rules_warning(&BTreeMap::new(), config_file).expect("no rules is worth a warning");
     assert!(
-      warning.contains("no [rules.*]") && warning.contains("/ws/.config/hodor.toml"),
+      warning.contains("no [rules.*]") && warning.contains("/ws/.config/hodor/config.toml"),
       "{warning}"
     );
 

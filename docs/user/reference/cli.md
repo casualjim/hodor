@@ -54,7 +54,7 @@ Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document.
 
 ## `hodor init [--backend <BACKEND>] [WORKSPACE]`
 
-Generate the workspace stack as editable files: `[rules.*]` blocks in `<workspace>/.config/hodor.toml` when the workspace has none, the CA and the agent entrypoint when they are missing, and `<state-dir>/hodor/ws/<slug>/compose.yml`. Nothing existing is overwritten; the stack is regenerated when the workspace config or the generator's stack shape changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.
+Generate the workspace stack as editable files: `[rules.*]` blocks in `<workspace>/.config/hodor/config.toml` when the workspace has none, the CA and the agent entrypoint when they are missing, and `<state-dir>/hodor/ws/<slug>/compose.yml`. Nothing existing is overwritten; the stack is regenerated when the workspace config or the generator's stack shape changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.
 
 ## `hodor agent [WORKSPACE] [--rm] [-- <COMMAND>...]`
 

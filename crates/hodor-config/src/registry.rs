@@ -161,7 +161,18 @@ impl Registry {
   /// Returns an error when the bundled table is malformed, when the override
   /// directory cannot be read, or when an override does not parse.
   pub fn load(rules_dir: Option<&Path>) -> eyre::Result<Self> {
-    let dirs = rules_dir.into_iter().collect::<Vec<_>>();
+    Self::load_union(rules_dir, None)
+  }
+
+  /// Load the bundled table, then the global override directory, then the
+  /// project one: later files win, mirroring the `[rules]` label merge.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the bundled table is malformed, when an override
+  /// directory cannot be read, or when an override does not parse.
+  pub fn load_union(global: Option<&Path>, project: Option<&Path>) -> eyre::Result<Self> {
+    let dirs = [global, project].into_iter().flatten().collect::<Vec<_>>();
     let mut registry = Self::default();
     registry.apply(BUNDLED, Path::new("<bundled>"))?;
     for dir in dirs.iter().filter(|dir| dir.is_dir()) {

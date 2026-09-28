@@ -35,19 +35,22 @@ pub struct AppConfig {
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
   pub plugins: BTreeMap<String, crate::plugins::PluginCfg>,
-  /// Agent config mounts by directory name; extends or overrides the built-in
-  /// table.
+  /// Tool config mounts by tool name; extends or overrides the built-in table.
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-  pub agents: BTreeMap<String, AgentCfg>,
+  pub tools: BTreeMap<String, ToolCfg>,
 }
 
-/// One agent config mount: the directory of this name under
-/// `<config-dir>/agents/` mounts at `config_dir` inside the agent container,
-/// so the agent finds its own configuration where it looks by default.
+/// The profile every other profile inherits off: the shared base namespace.
+/// Selected when `[workspace] profile` is unset.
+pub const SHARED_PROFILE: &str = "__shared__";
+
+/// One tool config mount: the directory of this name under
+/// `profiles/<profile>/` mounts at `config_dir` inside the agent container,
+/// so the tool finds its own configuration where it looks by default.
 #[derive(confique::Config, Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentCfg {
+pub struct ToolCfg {
   /// Container path the directory mounts at; `{home}` expands to
   /// `[workspace] home`.
   pub config_dir: String,
@@ -79,6 +82,10 @@ pub struct WorkspaceCfg {
   /// translate into this prefix, others mount at their own path.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub home: Option<String>,
+  /// Profile selecting the isolated tool-config namespace the generated
+  /// stack mounts; unset selects the shared base profile.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub profile: Option<String>,
   /// Ports the generated stack publishes on the host as stable `127.0.0.1`
   /// bindings, forwarded to the same port inside the agent's shared network
   /// namespace: the `fwd` sidecar exposes every agent-owned loopback
@@ -88,6 +95,14 @@ pub struct WorkspaceCfg {
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub ports: Vec<u16>,
+}
+
+impl WorkspaceCfg {
+  /// Selected profile name, or the shared base when unset.
+  #[must_use]
+  pub fn profile_name(&self) -> &str {
+    self.profile.as_deref().unwrap_or(SHARED_PROFILE)
+  }
 }
 /// Proxy listener settings (CLI/env/file overlay).
 #[derive(confique::Config, Clone, Debug, Serialize)]
@@ -266,6 +281,7 @@ pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
   // from the other. Do not collapse it into a single read without accounting
   // for that.
   config.rules = load_merged_rules(project.as_deref(), global.as_deref())?;
+  config.tools = load_merged_tools(project.as_deref(), global.as_deref())?;
   config.validate()?;
 
   let workspace = resolve_root(None, &cwd).ok().and_then(|root| Workspace::from_root(&root).ok());
@@ -273,12 +289,12 @@ pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
 }
 
 /// Locate the project-layer file: resolve the workspace root upward from
-/// `start`, then check `<root>/.config/hodor.toml`.
+/// `start`, then check the unified project config path with a legacy
+/// fallback.
 #[must_use]
 pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
   let root = resolve_root(None, start).ok()?;
-  let path = root.join(".config").join("hodor.toml");
-  path.exists().then_some(path)
+  project_config_file(&root)
 }
 
 /// Merge `[rules]` tables by label: global first, project wins wholesale
@@ -300,6 +316,152 @@ fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> eyre::Res
     }
   }
   Ok(merged)
+}
+
+/// Merge `[tools]` tables by name: global first, project wins per name.
+fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> eyre::Result<BTreeMap<String, ToolCfg>> {
+  let mut merged = BTreeMap::new();
+  for path in [global, project].into_iter().flatten() {
+    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
+    if let Some(tools) = doc.get("tools") {
+      let table = tools
+        .as_table()
+        .ok_or_else(|| eyre::eyre!("{}: `tools` must be a table", path.display()))?;
+      for (name, entry) in table {
+        let cfg = ToolCfg::deserialize(entry.clone()).wrap_err_with(|| format!("{}: tool `{name}`", path.display()))?;
+        merged.insert(name.clone(), cfg);
+      }
+    }
+  }
+  Ok(merged)
+}
+
+/// Project config directory: `<root>/.config/hodor/`, mirroring the global
+/// config directory layout.
+#[must_use]
+pub fn project_config_dir(root: &Path) -> PathBuf {
+  root.join(".config").join("hodor")
+}
+
+/// Project-layer file: the unified path first, the legacy flat file when the
+/// unified one is absent.
+#[must_use]
+pub fn project_config_file(root: &Path) -> Option<PathBuf> {
+  let unified = project_config_dir(root).join("config.toml");
+  if unified.is_file() {
+    return Some(unified);
+  }
+  let legacy = root.join(".config").join("hodor.toml");
+  if legacy.is_file() {
+    tracing::warn!(path = %legacy.display(), "legacy project config path; move it to .config/hodor/config.toml");
+    return Some(legacy);
+  }
+  None
+}
+
+/// Path `hodor init` writes the workspace config to: always the unified one.
+#[must_use]
+pub fn project_config_write_path(root: &Path) -> PathBuf {
+  project_config_dir(root).join("config.toml")
+}
+
+/// Project registry overrides: `<root>/.config/hodor/rules.d/`.
+#[must_use]
+pub fn project_rules_dir(root: &Path) -> PathBuf {
+  project_config_dir(root).join("rules.d")
+}
+
+/// Project profile roots: `<root>/.config/hodor/profiles/`.
+#[must_use]
+pub fn project_profiles_dir(root: &Path) -> PathBuf {
+  project_config_dir(root).join("profiles")
+}
+
+/// Project registry overrides for the workspace enclosing the working
+/// directory, when one encloses it.
+#[must_use]
+pub fn cwd_project_rules_dir() -> Option<PathBuf> {
+  let cwd = env::current_dir().ok()?;
+  let root = resolve_root(None, &cwd).ok()?;
+  Some(project_rules_dir(&root))
+}
+
+/// One profile dir name: a single path segment, never `.` or `..`.
+#[must_use]
+pub fn valid_profile(name: &str) -> bool {
+  !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
+}
+
+/// The parent a profile inherits off, from its `profile.toml` cookie. The
+/// first layer holding a cookie wins outright, project before global: a
+/// cookie without a `parent` key inherits the shared base directly, it does
+/// not fall through to the other layer's cookie. No cookie at all means the
+/// shared base. The shared base itself takes no parent.
+fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) -> eyre::Result<Option<String>> {
+  for layer in [project, global].into_iter().flatten() {
+    let cookie = layer.join(profile).join("profile.toml");
+    if !cookie.is_file() {
+      continue;
+    }
+    let text = std::fs::read_to_string(&cookie).wrap_err_with(|| format!("read {}", cookie.display()))?;
+    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", cookie.display()))?;
+    let Some(parent) = doc.get("profile").and_then(|table| table.get("parent")) else {
+      return Ok(None);
+    };
+    let Some(parent) = parent.as_str() else {
+      eyre::bail!("{}: `[profile] parent` must be a string", cookie.display());
+    };
+    if profile == SHARED_PROFILE {
+      eyre::bail!("{}: the shared base profile takes no parent", cookie.display());
+    }
+    eyre::ensure!(
+      valid_profile(parent),
+      "{}: parent `{parent}` is not a plain directory name",
+      cookie.display()
+    );
+    return Ok(Some(parent.to_string()));
+  }
+  Ok(None)
+}
+
+/// Inheritance chain for `selected`, nearest first, ending at the shared
+/// base. A profile missing from every layer resolves to the shared base
+/// alone only when nothing names it; the selected profile missing everywhere
+/// warns, since that is usually a misspelled `[workspace] profile`.
+///
+/// # Errors
+///
+/// Returns an error on an inheritance cycle, an invalid parent name, a
+/// parent no layer holds, or a parent on the shared base.
+///
+/// # Panics
+///
+/// Never panics: the chain starts at one element and the loop only appends,
+/// so `chain.last()` always finds a name.
+pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &str) -> eyre::Result<Vec<String>> {
+  eyre::ensure!(valid_profile(selected), "profile `{selected}` is not a plain directory name");
+  let mut chain = vec![selected.to_string()];
+  loop {
+    let name = chain.last().expect("the chain never empties").clone();
+    if name == SHARED_PROFILE {
+      profile_parent(project, global, &name)?;
+      break;
+    }
+    let parent = profile_parent(project, global, &name)?.unwrap_or_else(|| SHARED_PROFILE.to_string());
+    eyre::ensure!(!chain.contains(&parent), "profile inheritance cycle through `{parent}`");
+    let held = parent == SHARED_PROFILE || [project, global].into_iter().flatten().any(|layer| layer.join(&parent).is_dir());
+    eyre::ensure!(held, "profile `{name}` inherits `{parent}`, which no layer holds");
+    chain.push(parent);
+  }
+  let held = [project, global].into_iter().flatten().any(|layer| layer.join(selected).is_dir());
+  if !held && selected != SHARED_PROFILE {
+    tracing::warn!(
+      profile = selected,
+      "selected profile holds no directory in any layer; only shared tools mount"
+    );
+  }
+  Ok(chain)
 }
 
 fn global_config_path() -> Option<PathBuf> {
@@ -624,6 +786,81 @@ allow = ["https://c.example"]
     assert_eq!(config.rules["b"].value.as_ref().unwrap().expose_secret(), "project-b");
     assert_eq!(config.rules["c"].value.as_ref().unwrap().expose_secret(), "project-c");
     scrub_env();
+  }
+
+  #[test]
+  fn unified_project_path_wins_over_the_legacy_flat_file() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let project_root = dir.path().join("proj");
+    write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
+    write_file(
+      &project_root.join(".config").join("hodor.toml"),
+      "[proxy]\nlisten = \"127.0.0.1:2222\"\n",
+    );
+    write_file(
+      &project_root.join(".config").join("hodor").join("config.toml"),
+      "[proxy]\nlisten = \"127.0.0.1:3333\"\n",
+    );
+    let nested = project_root.join("inner");
+    std::fs::create_dir_all(&nested).unwrap();
+    let _cwd = CwdGuard::enter(&nested);
+    assert_eq!(
+      discover_project_config(&nested),
+      Some(project_root.join(".config").join("hodor").join("config.toml"))
+    );
+    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:3333");
+    assert_eq!(WorkspaceCfg::default().profile_name(), SHARED_PROFILE);
+    scrub_env();
+  }
+
+  #[test]
+  fn tools_merge_by_name_with_project_winning() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    let project_root = dir.path().join("proj");
+    write_file(
+      &global,
+      "[tools.pi]\nconfig_dir = \"{home}/.pi\"\n[tools.gh]\nconfig_dir = \"{home}/.config/gh\"\n",
+    );
+    write_file(
+      &project_root.join(".config").join("hodor.toml"),
+      "[workspace]\nprofile = \"work\"\n[tools.pi]\nconfig_dir = \"{home}/.pi-proj\"\n",
+    );
+    write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
+    set_env("HODOR_CONFIG", &global);
+    let _cwd = CwdGuard::enter(&project_root);
+    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    assert_eq!(config.tools["pi"].config_dir, "{home}/.pi-proj");
+    assert_eq!(config.tools["gh"].config_dir, "{home}/.config/gh");
+    assert_eq!(config.workspace.profile_name(), "work");
+    scrub_env();
+  }
+
+  #[test]
+  fn profile_chain_follows_cookies_project_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("g").join("profiles");
+    let project = dir.path().join("p").join("profiles");
+    for d in [
+      global.join("__shared__"),
+      global.join("mid"),
+      project.join("leaf"),
+      project.join("mid"),
+    ] {
+      std::fs::create_dir_all(&d).unwrap();
+    }
+    write_file(&global.join("mid").join("profile.toml"), "[profile]\nparent = \"__shared__\"\n");
+    write_file(&project.join("leaf").join("profile.toml"), "[profile]\nparent = \"mid\"\n");
+    let chain = profile_chain(Some(project.as_path()), Some(global.as_path()), "leaf").unwrap();
+    assert_eq!(chain, vec!["leaf", "mid", "__shared__"]);
+    write_file(&project.join("leaf").join("profile.toml"), "[profile]\nparent = \"ghost\"\n");
+    let err = profile_chain(Some(project.as_path()), Some(global.as_path()), "leaf").unwrap_err();
+    assert!(err.to_string().contains("ghost"), "{err:?}");
   }
 
   #[test]

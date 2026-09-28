@@ -1,6 +1,6 @@
 # Confined agent workspace
 
-This is a workspace you can confine. `.config/hodor.toml` is the whole input, and `hodor init` turns it into a two-service docker compose stack: hodor, and the agent. `hodor agent` does that, starts it, and drops you into the agent in one go.
+This is a workspace you can confine. `.config/hodor/config.toml` is the whole input, and `hodor init` turns it into a two-service docker compose stack: hodor, and the agent. `hodor agent` does that, starts it, and drops you into the agent in one go.
 
 The agent container holds decoy credentials and shares hodor's network namespace, so every connection it makes is captured, with no proxy setting to find and no way around the proxy. hodor swaps a decoy for the real value only on the hosts your rules allow, and puts the decoy back on the response.
 
@@ -27,7 +27,7 @@ The agent container holds decoy credentials and shares hodor's network namespace
 ## Before you start
 
 - docker with compose, and hodor on `PATH`.
-- The secrets this workspace uses, declared to fnox under the names in `.config/hodor.toml`.
+- The secrets this workspace uses, declared to fnox under the names in `.config/hodor/config.toml`.
 - Your fnox setup readable by the hodor container: the stack mounts your fnox config directory and hodor's fnox files read-only, and forwards the provider credentials in your environment, so a value that resolves here resolves there.
 
 ## Run it
@@ -89,7 +89,7 @@ substituted label=anthropic location=Header
 - UDP is passed through. DNS goes to the system resolver, and QUIC on port 443 is dropped, so clients fall back to TCP.
 - The listener is on loopback in the shared namespace, so `HTTPS_PROXY=http://127.0.0.1:8080` works as a fallback if you would rather not rely on capture. Both paths can be live at once.
 - Keep your own mounts, devices, and environment on the `agent` service: the generated file is a normal compose file for you to edit. To run other images, override `image:` in a compose layer.
-- Every directory under `~/.config/hodor/agents/` mounts into the agent at that agent's default config location, writable.
+- Each `profiles/<name>/<tool>/` directory mounts into the agent at that tool's default config location, writable. `__shared__` is the base every profile inherits.
 - Recreate the two services together. The agent shares hodor's network namespace, so recreating hodor alone leaves it attached to a dead namespace and its DNS stops resolving.
 
 [How to confine a workspace](../../docs/user/how-to/confine-a-workspace.md) covers the whole flow, and the [main README](../../README.md) covers allow entries, decoy patterns, and the rest of the configuration.

@@ -797,7 +797,7 @@ mod tests {
       workspace: crate::config::WorkspaceCfg::default(),
       rules,
       plugins: BTreeMap::new(),
-      agents: BTreeMap::new(),
+      tools: BTreeMap::new(),
     }
   }
 
@@ -847,7 +847,7 @@ mod tests {
       workspace: crate::config::WorkspaceCfg::default(),
       rules,
       plugins: BTreeMap::new(),
-      agents: BTreeMap::new(),
+      tools: BTreeMap::new(),
     }
   }
 
@@ -877,7 +877,7 @@ mod tests {
       workspace: crate::config::WorkspaceCfg::default(),
       rules,
       plugins: BTreeMap::new(),
-      agents: BTreeMap::new(),
+      tools: BTreeMap::new(),
     }
   }
 

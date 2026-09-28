@@ -3759,6 +3759,7 @@ dependencies = [
  "libc",
  "rustls 0.23.45",
  "secrecy",
+ "tempfile",
  "tokio",
  "tokio-rustls 0.26.5",
  "tracing",

@@ -102,6 +102,12 @@ pub struct ProxyCfg {
   #[config(layer_attr(arg(long = "ca-file", help = "CA PEM path (default <config-dir>/hodor/ca.pem)")))]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub ca_file: Option<PathBuf>,
+  /// Extra upstream CA bundles trusted on egress, additive to webpki roots.
+  /// Entries extend this further with their own `root_cert`. Config file
+  /// only: one path per bundle.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub root_certs: Vec<PathBuf>,
   /// Seconds the pre-auth or handshake reads may wait on a peer before the
   /// connection closes: the TLS `ClientHello`, the HTTP head, the Postgres
   /// greeting, and the upstream `SSLRequest` answer all share this budget.

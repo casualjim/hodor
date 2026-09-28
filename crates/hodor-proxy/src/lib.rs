@@ -80,17 +80,19 @@ impl std::fmt::Debug for ProxyState {
   }
 }
 
-/// One MITM relay on `ca`'s leaves: global egress trust (webpki roots plus
-/// the hodor CA) extended with `extra` bundle anchors. Additive only —
-/// entries gain trust, never shed the globals.
-fn https_relay(ca: &CertAuthority, anchor: CertificateDer<'static>, extra: &[CertificateDer<'static>]) -> eyre::Result<HttpsRelay> {
+/// One MITM relay on `ca`'s leaves: webpki egress trust extended with `extra`
+/// bundle anchors. The hodor CA signs guest-facing leaves only and is never
+/// an egress anchor. Additive only — entries gain trust, never shed webpki.
+fn https_relay(ca: &CertAuthority, extra: &[CertificateDer<'static>]) -> eyre::Result<HttpsRelay> {
   let (crt, key) = ca.boring_pair()?;
-  let anchors = std::iter::once(anchor).chain(extra.iter().cloned());
-  let egress = TlsMitmEgressServerAuth::new()
+  let mut egress = TlsMitmEgressServerAuth::new()
     .with_server_verify(ServerVerifyMode::Auto)
-    .with_webpki_roots()
-    .try_with_extra_server_trust_anchors(anchors)
-    .map_err(|err| eyre::eyre!("egress trust anchors: {err}"))?;
+    .with_webpki_roots();
+  if !extra.is_empty() {
+    egress = egress
+      .try_with_extra_server_trust_anchors(extra.iter().cloned())
+      .map_err(|err| eyre::eyre!("egress trust anchors: {err}"))?;
+  }
   Ok(TlsMitmRelay::new_cached_in_memory(crt, key).with_egress_server_auth(egress))
 }
 
@@ -101,9 +103,10 @@ fn entry_anchors(resolved: &ResolvedConfig) -> Vec<PathBuf> {
     let Grant::Token { allow, .. } = grant else { continue };
     for scope in allow {
       if let Some(path) = &scope.root_cert
-        && !seen.contains(path) {
-          seen.push(path.clone());
-        }
+        && !seen.contains(path)
+      {
+        seen.push(path.clone());
+      }
     }
   }
   seen
@@ -111,27 +114,30 @@ fn entry_anchors(resolved: &ResolvedConfig) -> Vec<PathBuf> {
 
 impl ProxyState {
   /// Build state from resolved config and the CA. The boring pair comes from
-  /// [`CertAuthority::boring_pair`]; egress trust is the system natives plus
-  /// the hodor CA itself, so loopback stubs presenting hodor-signed certs
-  /// verify on the production path. Entries naming `root_cert` extend that
-  /// trust with their bundle. Verification is always on: this proxy swaps
-  /// real secrets upstream, so a network attacker with an untrusted cert
-  /// must fail closed.
+  /// [`CertAuthority::boring_pair`]; egress trust is webpki, extended globally
+  /// by `root_certs` bundles and per entry by `root_cert` bundles. The hodor
+  /// CA signs guest-facing leaves only. Verification is always on: this proxy
+  /// swaps real secrets upstream, so a network attacker with an untrusted
+  /// cert must fail closed.
   ///
   /// # Errors
   ///
   /// Returns an error when the CA pair fails to convert to boring types,
-  /// when the egress trust policy rejects the hodor CA anchor, when an
-  /// entry's trust bundle cannot be read, when the CA cannot be read back
-  /// for leaf minting, or when a configured plugin cannot be loaded.
+  /// when the egress trust policy rejects its anchors, when a trust bundle
+  /// cannot be read, when the CA cannot be read back for leaf minting, or
+  /// when a configured plugin cannot be loaded.
   pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> eyre::Result<Self> {
     let plugins = Arc::new(hodor_plugin::Registry::load(&resolved.plugins)?);
-    let anchor = CertificateDer::from(ca.cert_der().to_vec());
-    let relay = https_relay(ca, anchor.clone(), &[])?;
+    let mut global = Vec::new();
+    for path in &resolved.proxy.root_certs {
+      global.extend(trust_anchors(path)?);
+    }
+    let relay = https_relay(ca, &global)?;
     let mut extra_relays = HashMap::new();
     for path in entry_anchors(&resolved) {
-      let extra = trust_anchors(&path)?;
-      let extra_relay = https_relay(ca, anchor.clone(), &extra).map_err(|err| eyre::eyre!("trust bundle `{}`: {err}", path.display()))?;
+      let mut anchors = global.clone();
+      anchors.extend(trust_anchors(&path)?);
+      let extra_relay = https_relay(ca, &anchors).map_err(|err| eyre::eyre!("trust bundle `{}`: {err}", path.display()))?;
       extra_relays.insert(path, extra_relay);
     }
     // Trust for the `mtls` guest leg: the same CA that mints the leaves.
@@ -771,6 +777,7 @@ mod tests {
           proxy: hodor_config::config::ProxyCfg {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
+            root_certs: Vec::new(),
             handshake_timeout_secs,
           },
           grants,
@@ -903,7 +910,20 @@ mod tests {
     let stub_acceptor = TlsAcceptor::from(Arc::new(stub_server_config(&stub_cert.server_config, alpn)));
     let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_port = local_addr(&stub).port();
-    let grants = make_grants(stub_port);
+    let mut grants = make_grants(stub_port);
+    // Egress trusts webpki plus per-entry bundles only: fixture scopes ride
+    // the hodor bundle explicitly, exactly like production rules must.
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let bundle = bundle_dir.path().join("hodor-ca.pem");
+    std::fs::write(&bundle, ca.cert_pem()).unwrap();
+    for grant in &mut grants {
+      let Grant::Token { allow, .. } = grant else { continue };
+      for scope in allow {
+        if scope.scheme == Scheme::Https && scope.root_cert.is_none() {
+          scope.root_cert = Some(bundle.clone());
+        }
+      }
+    }
     let plugins = make_plugins(stub_port);
     let (proxy_addr, proxy) = run_proxy_with(test_state_with_plugins(grants, plugins, &ca)).await;
     let mut roots = rustls::RootCertStore::empty();
@@ -1346,8 +1366,10 @@ mod tests {
     }
     let cert_path = dir.path().join("client.pem");
     let key_path = dir.path().join("client.key");
+    let bundle = dir.path().join("hodor-ca.pem");
     std::fs::write(&cert_path, &cert_pem).unwrap();
     std::fs::write(&key_path, client_key.to_pem()).unwrap();
+    std::fs::write(&bundle, ca.cert_pem()).unwrap();
 
     let (server_chain, server_key) = hodor_pki::ca::generate_domain_pair(&ca, "localhost").unwrap();
     let mut client_roots = rustls::RootCertStore::empty();
@@ -1383,7 +1405,7 @@ mod tests {
         port: stub_port,
         client_cert: Some(cert_path.clone()),
         client_key: Some(key_path.clone()),
-        root_cert: None,
+        root_cert: Some(bundle),
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
       pattern: None,
@@ -1469,6 +1491,100 @@ mod tests {
       oauth2: None,
     }];
     let state = test_state_with_plugins(grants, Vec::new(), &ca);
+    let (proxy_addr, _proxy) = run_proxy_with(state).await;
+
+    let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+    guest
+      .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    let mut ok = [0u8; 19];
+    guest.read_exact(&mut ok).await.unwrap();
+    assert_eq!(&ok, b"HTTP/1.1 200 OK\r\n\r\n");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.cert_der().clone()).unwrap();
+    let connector = TlsConnector::from(guest_client_config(roots, Alpn::Http1));
+    let mut tls = connector
+      .connect(ServerName::try_from("localhost".to_string()).unwrap(), guest)
+      .await
+      .unwrap();
+    tls
+      .write_all(format!("GET / HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {FAKE}\r\n\r\n").as_bytes())
+      .await
+      .unwrap();
+    let head = read_head_from(&mut tls).await;
+    assert!(head.starts_with(b"HTTP/1.1 200 OK"));
+
+    stub_task.await.unwrap();
+    let seen = seen.lock().await;
+    assert!(seen.windows(VALUE.len()).any(|w| w == VALUE.as_bytes()));
+  }
+
+  /// Global `root_certs`: the bundle in `[proxy]` trusts the private-CA stub
+  /// for entries naming no `root_cert` of their own.
+  #[tokio::test]
+  async fn https_global_root_certs_trust_private_upstream_ca() {
+    const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    install_crypto_provider();
+    let ca = CertAuthority::generate().unwrap();
+    let upstream_ca = CertAuthority::generate().unwrap();
+
+    let (server_chain, server_key) = hodor_pki::ca::generate_domain_pair(&upstream_ca, "localhost").unwrap();
+    let server_config = rustls::ServerConfig::builder()
+      .with_no_client_auth()
+      .with_single_cert(server_chain, server_key)
+      .unwrap();
+    let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub.local_addr().unwrap().port();
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let seen_later = Arc::clone(&seen);
+    let stub_task = tokio::spawn(async move {
+      let (stream, _) = stub.accept().await.unwrap();
+      let mut tls = TlsAcceptor::from(Arc::new(server_config)).accept(stream).await.unwrap();
+      let head = read_head_from(&mut tls).await;
+      seen_later.lock().await.extend_from_slice(&head);
+      tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("upstream-ca.pem");
+    std::fs::write(&bundle, upstream_ca.cert_pem()).unwrap();
+
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "t".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE.to_string()),
+      },
+      allow: vec![EndpointScope {
+        scheme: Scheme::Https,
+        host: "localhost".parse().unwrap(),
+        port: stub_port,
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls: hodor_config::grants::GuestTlsMode::Tls,
+      }],
+      pattern: None,
+      oauth2: None,
+    }];
+    let state = Arc::new(
+      ProxyState::new(
+        ResolvedConfig {
+          proxy: hodor_config::config::ProxyCfg {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ca_file: None,
+            root_certs: vec![bundle],
+            handshake_timeout_secs: 10,
+          },
+          grants,
+          plugins: Vec::new(),
+        },
+        &ca,
+      )
+      .unwrap(),
+    );
     let (proxy_addr, _proxy) = run_proxy_with(state).await;
 
     let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1627,6 +1743,9 @@ mod tests {
     const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     install_crypto_provider();
     let ca = CertAuthority::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("hodor-ca.pem");
+    std::fs::write(&bundle, ca.cert_pem()).unwrap();
 
     let (server_chain, server_key) = hodor_pki::ca::generate_domain_pair(&ca, "localhost").unwrap();
     let server_config = Arc::new(
@@ -1681,7 +1800,7 @@ mod tests {
         port: stub_port,
         client_cert: None,
         client_key: None,
-        root_cert: None,
+        root_cert: Some(bundle),
         guest_tls: hodor_config::grants::GuestTlsMode::Mtls,
       }],
       pattern: None,
@@ -1936,6 +2055,9 @@ mod tests {
     const SNI: &str = "testtun.invalid";
     install_crypto_provider();
     let ca = CertAuthority::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("hodor-ca.pem");
+    std::fs::write(&bundle, ca.cert_pem()).unwrap();
     let ca_der = ca.cert_der().clone();
     let stub_cert = ca.generate_domain_cert(SNI).unwrap();
     let stub_acceptor = TlsAcceptor::from(Arc::new(stub_server_config(&stub_cert.server_config, Alpn::Http1)));
@@ -1953,7 +2075,7 @@ mod tests {
         port: stub_port,
         client_cert: None,
         client_key: None,
-        root_cert: None,
+        root_cert: Some(bundle),
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
       pattern: None,

@@ -3716,9 +3716,13 @@ dependencies = [
  "hodor-pki",
  "libc",
  "pretty_assertions",
+ "secrecy",
+ "shellexpand",
  "tempfile",
+ "tokio",
  "toml_edit 0.25.15+spec-1.1.0",
  "tracing",
+ "xpanda",
 ]
 
 [[package]]
@@ -10167,6 +10171,12 @@ name = "xmlparser"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
+
+[[package]]
+name = "xpanda"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b466aaacda7bd72de169d2838690889307f37948f9f2929f1cfeb51f36af301"
 
 [[package]]
 name = "xx"

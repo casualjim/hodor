@@ -5,6 +5,7 @@
 //! in one go.
 
 mod confine;
+mod expand;
 mod paths;
 mod stack;
 
@@ -69,6 +70,8 @@ mod tests {
       guest: Vec::new(),
       init: None,
       ports: Vec::new(),
+      passthrough: Vec::new(),
+      file_mounts: Vec::new(),
     }
   }
 
@@ -1039,5 +1042,116 @@ mod tests {
         .map(OsString::from)
         .collect::<Vec<_>>()
     );
+  }
+
+  /// Passthrough renders doubled so compose leaves a literal `${NAME}` for
+  /// the agent; file mounts ride read-only right after workspace mounts.
+  #[test]
+  fn passthrough_renders_interpolated_and_file_mounts_follow_workspace_mounts() {
+    let yaml = Stack {
+      passthrough: vec!["WAYLAND_DISPLAY".to_string()],
+      mounts: vec![mount("/srv/ws", "/home/eng/ws", false)],
+      file_mounts: vec![mount("/state/files/00-npmrc", "/home/eng/.npmrc", true)],
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    assert!(yaml.contains("      WAYLAND_DISPLAY: \"${WAYLAND_DISPLAY}\"\n"), "{yaml}");
+    let agent = &yaml[yaml.find("\n  agent:\n").unwrap()..];
+    let workspace_at = agent.find("/srv/ws:/home/eng/ws:rw").unwrap();
+    let file_at = agent.find("/state/files/00-npmrc:/home/eng/.npmrc:ro").unwrap();
+    assert!(workspace_at < file_at, "rewrites overlay workspace mounts: {agent}");
+  }
+
+  /// Sources rewrite reals to decoys on disk and mount read-only at the
+  /// `{home}`-expanded dest; unknown names fail naming the name.
+  #[test]
+  fn file_rewrites_swap_reals_for_decoys_on_disk() {
+    use std::collections::HashMap;
+
+    use crate::expand::build_expander;
+    use crate::stack::write_rewrites;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("npmrc");
+    std::fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
+    let rewrite = hodor_config::config::FileRewrite {
+      source: source.clone(),
+      dest: "{home}/.npmrc".to_string(),
+      envs: vec!["NPM_TOKEN".to_string()],
+    };
+    let decoys = vec![Decoy {
+      env: "NPM_TOKEN".to_string(),
+      value: "decoy-9".to_string(),
+    }];
+    let env = HashMap::from([("NPM_TOKEN".to_string(), "real-secret-1".to_string())]);
+    let expander = build_expander(HashMap::new());
+    let files = dir.path().join("files");
+    let mounts = write_rewrites(crate::stack::RewriteInputs {
+      files_dir: &files,
+      root: dir.path(),
+      rewrites: std::slice::from_ref(&rewrite),
+      decoys: &decoys,
+      env: &env,
+      expander: &expander,
+      home: "/home/eng",
+      host_home: None,
+    })
+    .unwrap();
+    assert_eq!(mounts.len(), 1);
+    assert!(mounts[0].ro);
+    assert_eq!(mounts[0].container, PathBuf::from("/home/eng/.npmrc"));
+    let body = std::fs::read_to_string(&mounts[0].host).unwrap();
+    assert!(body.contains("decoy-9"), "{body}");
+    assert!(!body.contains("real-secret-1"), "{body}");
+    let error = write_rewrites(crate::stack::RewriteInputs {
+      files_dir: &files,
+      root: dir.path(),
+      rewrites: &[hodor_config::config::FileRewrite {
+        source: source.clone(),
+        dest: "{home}/.npmrc".to_string(),
+        envs: vec!["UNKNOWN_NAME".to_string()],
+      }],
+      decoys: &decoys,
+      env: &env,
+      expander: &expander,
+      home: "/home/eng",
+      host_home: None,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("UNKNOWN_NAME"), "{error}");
+  }
+
+  /// Home prefixes move to the container home; URLs, relative paths, and
+  /// off-home absolutes stay intact.
+  #[test]
+  fn mise_rewrite_translates_home_paths_only() {
+    let home = Path::new("/home/ivan");
+    let rewritten = rewrite_mise_toml(
+      "[tools]\nnode = \"22\"\n[env]\nTOKEN_FILE = \"/home/ivan/.npmrc\"\nURL = \"https://example.com/x\"\nREL = \"./bin/tool\"\nOTHER = \"/etc/hosts\"\nTILDE = \"~/.config/mise\"\nLIST = [\"/home/ivan/a\", \"b\"]\n",
+      Some(home),
+      "/home/eng",
+    )
+    .unwrap();
+    assert!(rewritten.contains("/home/eng/.npmrc"), "{rewritten}");
+    assert!(rewritten.contains("https://example.com/x"), "{rewritten}");
+    assert!(rewritten.contains("./bin/tool"), "{rewritten}");
+    assert!(rewritten.contains("/etc/hosts"), "{rewritten}");
+    assert!(rewritten.contains("/home/eng/.config/mise"), "{rewritten}");
+    assert!(rewritten.contains("/home/eng/a"), "{rewritten}");
+  }
+
+  /// The agent file is created once from the local file and never
+  /// overwritten; without the mise pair nothing happens.
+  #[test]
+  fn mise_agent_file_is_created_once_and_never_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!ensure_mise_agent(dir.path(), "/home/eng").unwrap());
+    std::fs::write(dir.path().join("mise.toml"), "[tools]\n").unwrap();
+    std::fs::write(dir.path().join("mise.local.toml"), "[env]\nA = \"1\"\n").unwrap();
+    assert!(ensure_mise_agent(dir.path(), "/home/eng").unwrap());
+    std::fs::write(dir.path().join("mise.agent.toml"), "edited").unwrap();
+    assert!(!ensure_mise_agent(dir.path(), "/home/eng").unwrap());
+    assert_eq!(std::fs::read_to_string(dir.path().join("mise.agent.toml")).unwrap(), "edited");
   }
 }

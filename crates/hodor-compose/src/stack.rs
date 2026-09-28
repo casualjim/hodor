@@ -1,6 +1,6 @@
 //! Compose stack generation: decoy selection, mount resolution, and YAML.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +9,9 @@ use hodor_config::cli::ProxyBackend;
 use hodor_config::config::{SHARED_PROFILE, ToolCfg};
 use hodor_config::grants::GuestTlsMode;
 
+use crate::expand::{
+  apply_rewrites, block_on, build_expander, collect_referenced_variables, expand_path, expand_value, resolution_env, rewrite_file_name,
+};
 use crate::paths::{Mount, covering, expand, translate};
 
 /// Revision of the generated stack's shape. Bump whenever what
@@ -18,7 +21,8 @@ use crate::paths::{Mount, covering, expand, translate};
 /// init` or `hodor agent`, exactly like one generated from an older config;
 /// the bundled command never leaves the old wiring behind. Shape 2 adds the
 /// `fwd` exposure sidecar, `[workspace] ports`, and `HODOR_LISTEN`. Shape 3
-/// mounts profiles instead of agent directories.
+/// mounts profiles instead of agent directories, and adds `[workspace]
+/// passthrough` interpolation and `file_rewrite` mounts.
 pub(crate) const STACK_SHAPE: u32 = 3;
 
 /// The shape revision a generated stack carries, from its `# stack shape:`
@@ -79,6 +83,56 @@ pub(crate) fn by_hosts(registry: &hodor_config::registry::Registry, decoys: Vec<
   decoys
     .into_iter()
     .partition(|decoy| registry.lookup(&decoy.env).is_some_and(|known| !known.hosts.is_empty()))
+}
+
+/// A passthrough name that is also a rule env or a selected decoy is a
+/// generation-time error: one name takes one path, never both.
+///
+/// # Errors
+///
+/// Returns an error naming the offending name when it overlaps.
+pub(crate) fn validate_passthrough(
+  rules: &BTreeMap<String, hodor_config::config::RuleCfg>,
+  decoys: &[Decoy],
+  passthrough: &[String],
+) -> eyre::Result<()> {
+  for name in passthrough {
+    eyre::ensure!(
+      !rules.values().any(|rule| &rule.env == name),
+      "[workspace] passthrough `{name}` is also a [rules.*] env: pick one path"
+    );
+    eyre::ensure!(
+      !decoys.iter().any(|decoy| &decoy.env == name),
+      "[workspace] passthrough `{name}` overlaps a selected decoy: pick one path"
+    );
+  }
+  Ok(())
+}
+
+/// fnox-declared names nothing covers, sorted: not registry-selected, not
+/// passthrough, and not fnox's own provider wiring (which the proxy forwards
+/// itself).
+pub(crate) fn uncovered_names(declared: &BTreeSet<String>, selected: &[String], passthrough: &[String]) -> Vec<String> {
+  declared
+    .iter()
+    .filter(|name| !selected.contains(name) && !passthrough.contains(name) && !hodor_fnox::FNOX_ENV.contains(&name.as_str()))
+    .cloned()
+    .collect()
+}
+
+/// One sorted warning naming uncovered names and the fix; `None` when every
+/// declared name is covered.
+pub(crate) fn uncovered_warning(names: &[String]) -> Option<String> {
+  if names.is_empty() {
+    return None;
+  }
+  let mut sorted = names.to_vec();
+  sorted.sort();
+  Some(format!(
+    "warning: fnox declares {} with no rule or passthrough ({}); add [rules.*] entries or [workspace] passthrough names, or remove them from fnox if unused",
+    if sorted.len() == 1 { "a secret" } else { "secrets" },
+    sorted.join(", ")
+  ))
 }
 
 /// `hodor rules`: env-only rules for the secrets this workspace can get, plus
@@ -261,13 +315,33 @@ pub(crate) fn include_entries(root: &Path, includes: &[PathBuf], host_home: Opti
 pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> eyre::Result<String> {
   let registry = generation_registry(Some(root))?;
   let config = workspace_config(root)?;
-  let home = config
+  let raw_home = config
     .workspace
     .home
     .clone()
     .ok_or_else(|| eyre::eyre!("[workspace] home is required for stack generation"))?;
+  let fnox = open_fnox()?;
+  let mut referenced = BTreeSet::new();
+  for entry in &config.workspace.include {
+    collect_referenced_variables(&entry.to_string_lossy(), &mut referenced);
+  }
+  for rewrite in &config.workspace.file_rewrite {
+    collect_referenced_variables(&rewrite.source.to_string_lossy(), &mut referenced);
+    collect_referenced_variables(&rewrite.dest, &mut referenced);
+    referenced.extend(rewrite.envs.iter().cloned());
+  }
+  collect_referenced_variables(&raw_home, &mut referenced);
+  let env = block_on(resolution_env(&registry, fnox.as_ref(), &referenced))??;
+  let expander = build_expander(env.clone());
+  let home = expand_value(&expander, &raw_home)?;
   let host_home = dirs::home_dir();
-  let entries = include_entries(root, &config.workspace.include, host_home.as_deref())?;
+  let includes: Vec<PathBuf> = config
+    .workspace
+    .include
+    .iter()
+    .map(|entry| expand_path(&expander, &entry.to_string_lossy()).map(PathBuf::from))
+    .collect::<eyre::Result<_>>()?;
+  let entries = include_entries(root, &includes, host_home.as_deref())?;
   let mounts = covering(
     entries
       .into_iter()
@@ -278,7 +352,18 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> eyre::Result
       })
       .collect(),
   );
-  let decoys = with_rule_patterns(select(open_fnox()?.as_ref(), &registry), &registry, &config.rules);
+  let decoys = with_rule_patterns(select(fnox.as_ref(), &registry), &registry, &config.rules);
+  validate_passthrough(&config.rules, &decoys, &config.workspace.passthrough)?;
+  let file_mounts = write_rewrites(RewriteInputs {
+    files_dir: &workspace_state_dir(root).join("files"),
+    root,
+    rewrites: &config.workspace.file_rewrite,
+    decoys: &decoys,
+    env: &env,
+    expander: &expander,
+    home: &home,
+    host_home: host_home.as_deref(),
+  })?;
   let global_profiles = hodor_config::config::config_dir().map(|dir| dir.join("profiles"));
   let project_profiles = hodor_config::config::project_profiles_dir(root);
   let roots = ProfileRoots {
@@ -324,9 +409,92 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend) -> eyre::Result
       guest,
       init: config.workspace.init.clone(),
       ports: config.workspace.ports.clone(),
+      passthrough: config.workspace.passthrough.clone(),
+      file_mounts,
     }
     .render(),
   )
+}
+
+/// Inputs for [`write_rewrites`]: the generation context the rewrite loop
+/// reads, as one value instead of eight positional arguments.
+pub(crate) struct RewriteInputs<'a> {
+  /// State directory the rewritten files land in.
+  pub(crate) files_dir: &'a Path,
+  /// Workspace root relative sources resolve against.
+  pub(crate) root: &'a Path,
+  /// Rewrite entries from `[workspace] file_rewrite`.
+  pub(crate) rewrites: &'a [hodor_config::config::FileRewrite],
+  /// Selected decoys supplying the replacement values.
+  pub(crate) decoys: &'a [Decoy],
+  /// Resolved real values keyed by env name.
+  pub(crate) env: &'a HashMap<String, String>,
+  /// Xpanda expander for sources and dests.
+  pub(crate) expander: &'a xpanda::Xpanda,
+  /// Container home expanding `{home}` in dests.
+  pub(crate) home: &'a str,
+  /// Host home relative sources and `~` expand against.
+  pub(crate) host_home: Option<&'a Path>,
+}
+
+/// Rewrite each `file_rewrite` source with decoys and write the outputs under
+/// `files_dir`, returning a read-only mount per entry at its `{home}`-expanded
+/// dest.
+///
+/// # Errors
+///
+/// Returns an error naming the variable when a path fails to expand, naming
+/// the env name when a rewrite names one with no known real value or no
+/// decoy, or when a source file cannot be read or an output written.
+pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> eyre::Result<Vec<Mount>> {
+  let RewriteInputs {
+    files_dir,
+    root,
+    rewrites,
+    decoys,
+    env,
+    expander,
+    home,
+    host_home,
+  } = inputs;
+  if rewrites.is_empty() {
+    return Ok(Vec::new());
+  }
+  let by_env: BTreeMap<&str, &str> = decoys.iter().map(|decoy| (decoy.env.as_str(), decoy.value.as_str())).collect();
+  std::fs::create_dir_all(files_dir).wrap_err_with(|| format!("create {}", files_dir.display()))?;
+  let mut mounts = Vec::new();
+  for (index, rewrite) in rewrites.iter().enumerate() {
+    let mut pairs = Vec::new();
+    for name in &rewrite.envs {
+      let real = env.get(name).filter(|value| !value.is_empty()).ok_or_else(|| {
+        eyre::eyre!(
+          "file rewrite `{}` names `{name}` with no known real value",
+          rewrite.source.display()
+        )
+      })?;
+      let decoy = by_env
+        .get(name.as_str())
+        .ok_or_else(|| eyre::eyre!("file rewrite `{}` names `{name}` with no decoy", rewrite.source.display()))?;
+      pairs.push((real.as_bytes().to_vec(), decoy.as_bytes().to_vec()));
+    }
+    let expanded_source = PathBuf::from(expand_path(expander, &rewrite.source.to_string_lossy())?);
+    let host = expand(&expanded_source, root, host_home);
+    let content = std::fs::read(&host).wrap_err_with(|| format!("read {}", host.display()))?;
+    let out_path = files_dir.join(rewrite_file_name(index, &host));
+    std::fs::write(&out_path, apply_rewrites(&content, &pairs)).wrap_err_with(|| format!("write {}", out_path.display()))?;
+    let container = expand_value(expander, &rewrite.dest)?.replace("{home}", home);
+    eyre::ensure!(
+      container.starts_with('/'),
+      "file rewrite dest `{}` does not expand to an absolute container path",
+      rewrite.dest
+    );
+    mounts.push(Mount {
+      host: out_path,
+      container: PathBuf::from(container),
+      ro: true,
+    });
+  }
+  Ok(mounts)
 }
 
 /// The process's user id, from the kernel: the same value `id -u` prints,
@@ -454,6 +622,12 @@ pub(crate) struct Stack<'a> {
   /// Ports the hodor service publishes as stable host `127.0.0.1` bindings,
   /// from `[workspace] ports`.
   pub(crate) ports: Vec<u16>,
+  /// Env names forwarded as `${NAME}` interpolation in the agent
+  /// environment, from `[workspace] passthrough`.
+  pub(crate) passthrough: Vec<String>,
+  /// Rewritten files mounted read-only at their dests, from
+  /// `[workspace] file_rewrite`; after workspace mounts so they win.
+  pub(crate) file_mounts: Vec<Mount>,
 }
 
 impl Stack<'_> {
@@ -583,8 +757,22 @@ impl Stack<'_> {
     for decoy in &self.decoys {
       let _ = writeln!(out, "      {}: \"{}\"", decoy.env, decoy.value);
     }
+    if !self.passthrough.is_empty() {
+      out.push_str("      # passthrough — compose interpolates these from the host at `up`, never baked\n");
+    }
+    for name in &self.passthrough {
+      // Single `$`: compose substitutes the host value when the stack starts,
+      // so the file holds no secret and values stay fresh without regenerating.
+      let _ = writeln!(out, "      {name}: \"${{{name}}}\"");
+    }
     out.push_str("    volumes:\n");
-    for mount in self.mounts.iter().chain(&self.tool_mounts).chain(&self.guest) {
+    for mount in self
+      .mounts
+      .iter()
+      .chain(&self.file_mounts)
+      .chain(&self.tool_mounts)
+      .chain(&self.guest)
+    {
       let mode = if mount.ro { "ro" } else { "rw" };
       let _ = writeln!(out, "      - {}:{}:{mode}", mount.host.display(), mount.container.display());
     }
@@ -841,9 +1029,9 @@ pub(crate) fn workspace_config(root: &Path) -> eyre::Result<hodor_config::config
 
 #[cfg(test)]
 mod tests {
-  use super::guest_identity_mounts;
+  use super::{guest_identity_mounts, uncovered_names, uncovered_warning, validate_passthrough};
   use hodor_config::grants::GuestTlsMode;
-  use std::collections::BTreeMap;
+  use std::collections::{BTreeMap, BTreeSet};
   use std::path::PathBuf;
 
   fn mtls_rule(guest_cert: Option<&str>, guest_key: Option<&str>) -> BTreeMap<String, hodor_config::config::RuleCfg> {
@@ -906,5 +1094,43 @@ mod tests {
     let mounts = guest_identity_mounts(&rules, &ca, &dir.path().join("guests"), "/root").unwrap();
     assert_eq!(mounts[0].container, PathBuf::from("/root/.config/hodor/guest/github.pem"));
     assert_eq!(mounts[1].container, PathBuf::from("/root/.config/hodor/guest/github.key"));
+  }
+
+  /// A passthrough name that is also a rule env or a decoy fails, naming
+  /// the name; disjoint names pass.
+  #[test]
+  fn passthrough_overlapping_a_rule_or_decoy_fails() {
+    let rules = mtls_rule(None, None);
+    let decoys = vec![super::Decoy {
+      env: "ANTHROPIC_API_KEY".to_string(),
+      value: "decoy".to_string(),
+    }];
+    let error = validate_passthrough(&rules, &[], &["GITHUB_TOKEN".to_string()])
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("GITHUB_TOKEN"), "{error}");
+    let error = validate_passthrough(&rules, &decoys, &["ANTHROPIC_API_KEY".to_string()])
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("ANTHROPIC_API_KEY"), "{error}");
+    validate_passthrough(&rules, &decoys, &["DISPLAY".to_string()]).unwrap();
+  }
+
+  /// Uncovered keeps declared names minus selection, passthrough, and
+  /// fnox's own wiring; the warning sorts and names them with a fix.
+  #[test]
+  fn uncovered_diff_excludes_selected_passthrough_and_fnox_wiring() {
+    let declared = BTreeSet::from([
+      "GITHUB_TOKEN".to_string(),
+      "WAYLAND_DISPLAY".to_string(),
+      "DISPLAY".to_string(),
+      "FNOX_PROFILE".to_string(),
+    ]);
+    let uncovered = uncovered_names(&declared, &["GITHUB_TOKEN".to_string()], &["WAYLAND_DISPLAY".to_string()]);
+    assert_eq!(uncovered, vec!["DISPLAY".to_string()]);
+    let warning = uncovered_warning(&["B".to_string(), "A".to_string()]).unwrap();
+    assert!(warning.contains("A, B"), "{warning}");
+    assert!(warning.contains("[workspace] passthrough"), "{warning}");
+    assert_eq!(uncovered_warning(&[]), None);
   }
 }

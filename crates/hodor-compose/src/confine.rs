@@ -11,7 +11,8 @@ use hodor_config::cli::{LogsArgs, ProxyBackend};
 
 use crate::paths::translate;
 use crate::stack::{
-  STACK_SHAPE, current_uid, generate_stack, rules_command, stack_shape_in, workspace_config, workspace_file, workspace_state_dir,
+  STACK_SHAPE, current_uid, generate_stack, rules_command, stack_shape_in, uncovered_names, uncovered_warning, workspace_config,
+  workspace_file, workspace_state_dir,
 };
 
 /// The entrypoint the generated agent service runs: it makes hodor's CA trusted
@@ -179,6 +180,101 @@ fn ensure_workspace_config(root: &Path) -> eyre::Result<(PathBuf, bool)> {
   Ok((path, written))
 }
 
+/// Write `mise.agent.toml` from `mise.local.toml` when the workspace uses
+/// mise for local tasks and has no agent file yet: host-home path prefixes
+/// become the container home so the agent's tasks find the same files.
+/// Never overwrites; `true` means it was written now.
+///
+/// # Errors
+///
+/// Returns an error when the local file cannot be read, rewritten, or
+/// written.
+pub(crate) fn ensure_mise_agent(root: &Path, home: &str) -> eyre::Result<bool> {
+  if !root.join("mise.toml").is_file() || !root.join("mise.local.toml").is_file() || root.join("mise.agent.toml").exists() {
+    return Ok(false);
+  }
+  let local = root.join("mise.local.toml");
+  let content = std::fs::read_to_string(&local).wrap_err_with(|| format!("read {}", local.display()))?;
+  let rewritten = rewrite_mise_toml(&content, dirs::home_dir().as_deref(), home)?;
+  write_if_absent(&root.join("mise.agent.toml"), &rewritten)
+}
+
+/// Copy `mise.local.toml` with host-home prefixes rewritten to the container
+/// home, reusing [`translate`] semantics on path-looking string values.
+/// URLs and non-paths stay intact.
+///
+/// # Errors
+///
+/// Returns an error when the content is not valid TOML.
+pub(crate) fn rewrite_mise_toml(content: &str, host_home: Option<&Path>, home: &str) -> eyre::Result<String> {
+  let mut document: toml_edit::DocumentMut = content.parse().wrap_err("parse mise.local.toml")?;
+  rewrite_mise_item(document.as_item_mut(), host_home, home);
+  Ok(document.to_string())
+}
+
+/// Rewrite one TOML value tree in place: every string under a home prefix
+/// moves to the container home.
+fn rewrite_mise_item(item: &mut toml_edit::Item, host_home: Option<&Path>, home: &str) {
+  match item {
+    toml_edit::Item::Value(value) => rewrite_mise_value(value, host_home, home),
+    toml_edit::Item::Table(table) => {
+      for (_, item) in table.iter_mut() {
+        rewrite_mise_item(item, host_home, home);
+      }
+    }
+    toml_edit::Item::ArrayOfTables(tables) => {
+      for table in tables.iter_mut() {
+        for (_, item) in table.iter_mut() {
+          rewrite_mise_item(item, host_home, home);
+        }
+      }
+    }
+    toml_edit::Item::None => {}
+  }
+}
+
+/// Rewrite one TOML value: arrays recurse, strings under the host home move
+/// to the container home, everything else stays.
+fn rewrite_mise_value(value: &mut toml_edit::Value, host_home: Option<&Path>, home: &str) {
+  match value {
+    toml_edit::Value::String(text) => {
+      let rewritten = rewrite_mise_string(text.value(), host_home, home);
+      *text = toml_edit::Formatted::new(rewritten);
+    }
+    toml_edit::Value::Array(items) => {
+      for item in items.iter_mut() {
+        rewrite_mise_value(item, host_home, home);
+      }
+    }
+    toml_edit::Value::InlineTable(table) => {
+      for (_, value) in table.iter_mut() {
+        rewrite_mise_value(value, host_home, home);
+      }
+    }
+    _ => {}
+  }
+}
+
+/// One mise string: URLs and non-paths stay intact; a value under the host
+/// home (after `~` expansion) moves to the container home prefix.
+fn rewrite_mise_string(value: &str, host_home: Option<&Path>, home: &str) -> String {
+  if value.contains("://") {
+    return value.to_string();
+  }
+  let expanded = if value == "~" || value.starts_with("~/") {
+    match host_home {
+      Some(host_home) => format!("{}{}", host_home.display(), &value[1..]),
+      None => return value.to_string(),
+    }
+  } else {
+    value.to_string()
+  };
+  match host_home.and_then(|host_home| Path::new(&expanded).strip_prefix(host_home).ok()) {
+    Some(rest) => Path::new(home).join(rest).to_string_lossy().into_owned(),
+    None => value.to_string(),
+  }
+}
+
 /// A warning when no rule is in play, since then nothing would be substituted
 /// and every credential the agent holds stays a decoy; `None` when at least
 /// one rule is in effect.
@@ -281,10 +377,16 @@ fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) ->
   if written {
     println!("wrote {}", config_file.display());
   }
-  if let Some(warning) = rules_warning(&workspace_config(root)?.rules, &config_file) {
+  let workspace = workspace_config(root)?;
+  if let Some(warning) = rules_warning(&workspace.rules, &config_file) {
     println!("{warning}");
   }
   report_created(&prepare_support_files(root)?);
+  if let Some(home) = workspace.workspace.home.as_deref()
+    && ensure_mise_agent(root, home)?
+  {
+    println!("wrote {}", root.join("mise.agent.toml").display());
+  }
   let existing = std::fs::read_to_string(&ws_compose).ok();
   if existing.is_some() {
     if !stack_is_stale(&state_ws, root) {
@@ -403,6 +505,7 @@ fn exec_agent(root: &Path, command: &[OsString]) -> eyre::Result<()> {
     .clone()
     .ok_or_else(|| eyre::eyre!("[workspace] home is required for the agent workdir"))?;
   let workdir = translate(root, dirs::home_dir().as_deref(), &home);
+  warn_uncovered(&config);
   let uid = current_uid();
   let argv: Vec<OsString> = if command.is_empty() {
     vec![config.workspace.shell.clone().unwrap_or_else(|| "sh".to_string()).into()]
@@ -420,6 +523,25 @@ fn exec_agent(root: &Path, command: &[OsString]) -> eyre::Result<()> {
     .arg("agent")
     .args(argv);
   compose_status_interruptible(&mut compose)
+}
+
+/// Print one sorted warning for fnox-declared names no rule, passthrough, or
+/// provider wiring covers, every time the agent is entered. Never prints
+/// values. A missing fnox setup means nothing to cover, so it stays silent.
+fn warn_uncovered(config: &hodor_config::config::AppConfig) {
+  let Ok(fnox) = crate::stack::open_fnox() else {
+    return;
+  };
+  let Some(fnox) = fnox else {
+    return;
+  };
+  let Ok(registry) = crate::stack::generation_registry() else {
+    return;
+  };
+  let selected = hodor_fnox::selected_envs(Some(&fnox), &registry);
+  if let Some(warning) = uncovered_warning(&uncovered_names(fnox.declared(), &selected, &config.workspace.passthrough)) {
+    println!("{warning}");
+  }
 }
 
 /// `hodor init [--backend <backend>] [workspace]`: write the support files, the

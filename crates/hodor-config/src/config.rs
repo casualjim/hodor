@@ -95,14 +95,44 @@ pub struct WorkspaceCfg {
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub ports: Vec<u16>,
+  /// Env names forwarded into the agent environment as `${NAME}` compose
+  /// interpolation: compose substitutes the host value when the stack starts,
+  /// so the generated file holds no secret and values stay fresh without
+  /// regenerating. A name that is also a `[rules.*]` env or a selected decoy
+  /// is a generation-time error — boundary discipline, one name one path.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub passthrough: Vec<String>,
+  /// Host files rewritten with decoys and mounted read-only into the agent:
+  /// each listed env name's real value is byte-replaced by its decoy and the
+  /// result lands under the workspace state directory, mounted at `dest`
+  /// (`{home}` expands to `home` above). A name with no known real value or
+  /// no decoy fails generation, naming the name.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub file_rewrite: Vec<FileRewrite>,
 }
-
 impl WorkspaceCfg {
   /// Selected profile name, or the shared base when unset.
   #[must_use]
   pub fn profile_name(&self) -> &str {
     self.profile.as_deref().unwrap_or(SHARED_PROFILE)
   }
+}
+
+/// One host file to rewrite with decoys before the agent sees it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRewrite {
+  /// Host file to read: `~` and `$VAR` expand, relative paths resolve
+  /// against the workspace root.
+  pub source: PathBuf,
+  /// Container path the rewritten file mounts at, read-only; `{home}`
+  /// expands to `[workspace] home` and `$VAR` expands first.
+  pub dest: String,
+  /// Env names whose real values are replaced by their decoys in the file.
+  #[serde(default)]
+  pub envs: Vec<String>,
 }
 /// Proxy listener settings (CLI/env/file overlay).
 #[derive(confique::Config, Clone, Debug, Serialize)]

@@ -1,8 +1,15 @@
+## [0.3.0] - 2026-09-28
+
+### 🚀 Features
+
+- *(config)* Mount tool configs from inheritable profiles (#39)
 ## [0.2.2] - 2026-09-27
 
 ### ⚙️ Miscellaneous Tasks
 
 - Refresh mise tool lock, add jj bookmark cleanup to worktrunk
+- Update changelog for v0.2.2 [ci skip]
+- Release
 ## [0.2.1] - 2026-09-26
 
 ### 🚀 Features

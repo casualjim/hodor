@@ -214,6 +214,7 @@ async fn ebpf_live_tcp_mitm_substitutes() {
         port: stub_port,
         client_cert: None,
         client_key: None,
+        root_cert: None,
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
       pattern: None,

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -15,18 +15,24 @@ use rama::io::BridgeIo;
 use rama::net::address::{Host, HostWithPort};
 use rama::net::client::ConnectorTarget;
 use rama::net::socket::SocketOptions;
+use rama::service::service_fn;
 use rama::tcp::client::TcpStreamConnector;
 use rama::tls::boring::TlsStream;
-use rama::tls::client::{ClientAuth, ClientAuthData, NegotiatedTlsParameters, TlsClientAuth};
+use rama::tls::boring::client::ConnectorConfigClientAuth;
+use rama::tls::boring::core::ssl::SslCredential;
+use rama::tls::boring::core::x509::store::X509Store;
+use rama::tls::boring::proxy::client_auth::{TlsMitmClientAuthInput, TlsMitmClientAuthPlan, TlsMitmClientAuthPolicy};
+use rama::tls::client::{ClientAuth, ClientAuthData, NegotiatedTlsParameters};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::Error as PemError};
 use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use hodor_config::grants::{DatabaseScope, GuestTlsMode, ResolvedConfig, RootCert, SslMode, SslNegotiation};
+use hodor_config::grants::{DatabaseScope, EndpointScope, GuestTlsMode, ResolvedConfig, RootCert, SslMode, SslNegotiation};
 use hodor_pki::ca::CertAuthority;
 
 use crate::into_box_error;
@@ -56,9 +62,9 @@ impl<S> GuestIo<S> {
     }
   }
 
-  /// Record the upstream client identity (mTLS) the relay presents on egress.
-  pub(crate) fn with_egress_client_auth(self, auth: TlsClientAuth) -> Self {
-    self.extensions.insert(auth);
+  /// Record the MITM client-auth policy the relay enforces on both legs.
+  pub(crate) fn with_client_auth_policy(self, policy: TlsMitmClientAuthPolicy) -> Self {
+    self.extensions.insert(policy);
     self
   }
 }
@@ -91,7 +97,7 @@ impl<S> ExtensionsRef for GuestIo<S> {
 /// Load an upstream client identity (mTLS) from the entry's PEM paths: the
 /// certificate chain and its key, ready for the relay's egress. Only the
 /// entry names this identity; nothing invents one.
-pub(crate) fn client_identity(cert: &Path, key: &Path) -> eyre::Result<TlsClientAuth> {
+pub(crate) fn client_identity(cert: &Path, key: &Path) -> eyre::Result<ClientAuth> {
   let cert_bytes = std::fs::read(cert).map_err(|err| eyre::eyre!("read `{}`: {err}", cert.display()))?;
   let key_bytes = std::fs::read(key).map_err(|err| eyre::eyre!("read `{}`: {err}", key.display()))?;
   let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_bytes)
@@ -99,10 +105,89 @@ pub(crate) fn client_identity(cert: &Path, key: &Path) -> eyre::Result<TlsClient
     .map_err(|err| eyre::eyre!("certificate `{}`: {err}", cert.display()))?;
   eyre::ensure!(!chain.is_empty(), "`{}` holds no certificates", cert.display());
   let private = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|err| eyre::eyre!("key `{}`: {err}", key.display()))?;
-  Ok(TlsClientAuth(ClientAuth::Single(ClientAuthData {
+  Ok(ClientAuth::Single(ClientAuthData {
     cert_chain: chain,
     private_key: private,
+  }))
+}
+
+/// Per-connection MITM client-auth policy for one https scope: the entry's
+/// upstream identity when upstream requests one, plus a guest-certificate
+/// demand in `Mtls` mode. `None` keeps the relay default (anonymous ingress,
+/// no egress identity).
+pub(crate) fn client_auth_policy(scope: &EndpointScope, trust: &X509Store) -> eyre::Result<Option<TlsMitmClientAuthPolicy>> {
+  let auth = match (&scope.client_cert, &scope.client_key) {
+    (Some(cert), Some(key)) => Some(client_identity(cert, key)?),
+    (Some(_) | None, None) | (None, Some(_)) => None,
+  };
+  match (scope.guest_tls, auth) {
+    (GuestTlsMode::Tls, None) => Ok(None),
+    (GuestTlsMode::Tls, Some(auth)) => TlsMitmClientAuthPolicy::try_from(auth)
+      .map(Some)
+      .map_err(|err| eyre::eyre!("client identity: {err}")),
+    (GuestTlsMode::Mtls, auth) => mtls_policy(trust, auth).map(Some),
+  }
+}
+
+/// Policy demanding a guest certificate trusted by `store`, offering the
+/// entry's upstream identity only when upstream requests one (`None` admits
+/// the guest without an egress identity).
+fn mtls_policy(store: &X509Store, auth: Option<ClientAuth>) -> eyre::Result<TlsMitmClientAuthPolicy> {
+  let credential: Option<SslCredential> = auth
+    .map(|auth| {
+      let configured = ConnectorConfigClientAuth::try_from(auth).map_err(|err| eyre::eyre!("client identity: {err}"))?;
+      SslCredential::try_from(configured).map_err(|err| eyre::eyre!("client identity: {err}"))
+    })
+    .transpose()?;
+  let store = store.clone();
+  Ok(TlsMitmClientAuthPolicy::new(service_fn(move |input: TlsMitmClientAuthInput| {
+    let credential = if input.request.is_some() { credential.clone() } else { None };
+    let store = store.clone();
+    async move { Ok::<_, std::convert::Infallible>(TlsMitmClientAuthPlan::fixed(credential).with_ingress_trust(store)) }
   })))
+}
+
+/// Failure loading an upstream CA bundle for one entry's extra egress trust.
+#[derive(Debug, Error)]
+pub(crate) enum TrustAnchorsError {
+  /// The bundle file could not be read.
+  #[error("read `{path}`: {source}")]
+  Read {
+    /// Bundle path that failed to read.
+    path: PathBuf,
+    /// The read failure.
+    #[source]
+    source: std::io::Error,
+  },
+  /// The bundle file holds no parseable PEM certificates.
+  #[error("certificate `{path}`: {source}")]
+  Parse {
+    /// Bundle path that failed to parse.
+    path: PathBuf,
+    /// The parse failure.
+    #[source]
+    source: PemError,
+  },
+  /// The bundle file holds zero certificates.
+  #[error("`{path}` holds no certificates")]
+  Empty {
+    /// Empty bundle path.
+    path: PathBuf,
+  },
+}
+
+/// Load an upstream CA bundle for one entry's extra egress trust: the PEM
+/// certificates at `path`, additive to the global egress trust. Only the
+/// entry names this bundle; nothing invents one.
+pub(crate) fn trust_anchors(path: &Path) -> Result<Vec<CertificateDer<'static>>, TrustAnchorsError> {
+  let bytes = std::fs::read(path).map_err(|source| TrustAnchorsError::Read { path: path.into(), source })?;
+  let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&bytes)
+    .collect::<Result<_, _>>()
+    .map_err(|source| TrustAnchorsError::Parse { path: path.into(), source })?;
+  if chain.is_empty() {
+    return Err(TrustAnchorsError::Empty { path: path.into() });
+  }
+  Ok(chain)
 }
 
 /// Byte-pump service: the relay hands paired TLS streams here, and the
@@ -314,7 +399,7 @@ impl PgTransport {
       Some(root) => Some(self.roots_for(root)?),
       None => None,
     };
-    let verifier = PgCertVerifier {
+    let verifier = EgressCertVerifier {
       roots,
       check_name: scope.ssl == SslMode::VerifyFull,
       provider: Arc::clone(&self.provider),
@@ -326,7 +411,7 @@ impl PgTransport {
       // The entry names the proxy's client identity, so the upstream leg
       // presents it; nothing else invents one.
       (Some(cert), Some(key)) => {
-        let TlsClientAuth(ClientAuth::Single(data)) = client_identity(cert, key)? else {
+        let ClientAuth::Single(data) = client_identity(cert, key)? else {
           eyre::bail!("client identity `{}` is empty", cert.display());
         };
         builder
@@ -444,20 +529,22 @@ impl PgTransport {
 /// ALPN identifier for direct Postgres TLS.
 const POSTGRESQL_ALPN: &[u8] = b"postgresql";
 
-/// Server verification shaped by the entry URL rather than by this proxy.
+/// Egress server verification shaped by the entry rather than by this proxy.
+/// The postgres leg builds it from the entry URL; the name stays neutral so
+/// other rustls egress legs can share it.
 ///
 /// libpq verifies nothing when no trust anchor is named, which is what makes
 /// `require` usable against a private server; it verifies the chain once one
 /// is; and it checks the host name only for `verify-full`. Inventing an anchor
 /// here would fail the servers those modes exist to reach.
 #[derive(Debug)]
-struct PgCertVerifier {
+struct EgressCertVerifier {
   roots: Option<Arc<RootCertStore>>,
   check_name: bool,
   provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
-impl ServerCertVerifier for PgCertVerifier {
+impl ServerCertVerifier for EgressCertVerifier {
   fn verify_server_cert(
     &self,
     end_entity: &CertificateDer<'_>,

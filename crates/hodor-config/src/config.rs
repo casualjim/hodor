@@ -166,7 +166,7 @@ impl RuleCfg {
 }
 
 /// Per-entry TLS configuration, keyed by the rule's own `allow` entry string.
-/// The proxy reads `client_cert`, `client_key` and `guest_tls_mode`;
+/// The proxy reads `client_cert`, `client_key`, `root_cert` and `guest_tls_mode`;
 /// `guest_cert` and `guest_key` are compose-only mount targets inside the
 /// guest container and no proxy behavior reads them.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -178,6 +178,10 @@ pub struct HostTlsCfg {
   /// Upstream client key, paired with `client_cert`.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub client_key: Option<PathBuf>,
+  /// Upstream CA bundle trusting this entry's host, additive to the global
+  /// egress trust (webpki roots plus the hodor CA).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub root_cert: Option<PathBuf>,
   /// How the guest leg treats client certificates.
   #[serde(default)]
   pub guest_tls_mode: crate::grants::GuestTlsMode,

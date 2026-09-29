@@ -1,18 +1,21 @@
-## [0.4.0] - 2026-09-29
-
-### 🚀 Features
-
-- Upstream rama plus per-entry egress trust bump:minor (#40)
-## [0.3.0] - 2026-09-28
+## [0.2.4] - 2026-09-29
 
 ### 🚀 Features
 
 - *(config)* Mount tool configs from inheritable profiles (#39)
+- Upstream rama plus per-entry egress trust bump:minor (#40)
+
+### 🐛 Bug Fixes
+
+- Sync Cargo.lock with 0.2.3 manifest
 
 ### ⚙️ Miscellaneous Tasks
 
 - Update changelog for v0.3.0 [ci skip]
 - Release
+- Update changelog for v0.4.0 [ci skip]
+- Release
+- Release hodor version 0.2.3
 ## [0.2.2] - 2026-09-27
 
 ### ⚙️ Miscellaneous Tasks

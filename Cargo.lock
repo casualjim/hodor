@@ -3709,6 +3709,8 @@ dependencies = [
 name = "hodor-compose"
 version = "0.1.16"
 dependencies = [
+ "base64 0.22.1",
+ "clap",
  "dirs",
  "hodor-config",
  "hodor-fnox",
@@ -3716,6 +3718,8 @@ dependencies = [
  "libc",
  "pretty_assertions",
  "secrecy",
+ "serde",
+ "serde_yaml",
  "shellexpand",
  "tempfile",
  "thiserror 2.0.20",

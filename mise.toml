@@ -24,6 +24,7 @@ node = "lts"
 cmake = "latest"
 cargo-dist = "latest"
 mold = "latest"
+k3d = "latest"
 
 [[tools.rust]]
 version = "stable"

@@ -8,12 +8,16 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
 dirs = "6"
 hodor-config = { path = "../hodor-config" }
 hodor-fnox = { path = "../hodor-fnox" }
 hodor-pki = { path = "../hodor-pki" }
 libc = "0.2"
 secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 shellexpand = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time"] }

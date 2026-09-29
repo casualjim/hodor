@@ -3,6 +3,7 @@
 use std::io::Error as IoError;
 use std::path::PathBuf;
 
+use serde_yaml::Error as YamlError;
 use toml_edit::TomlError;
 
 /// Every way stack generation and workspace commands can fail.
@@ -60,6 +61,15 @@ pub enum Error {
   #[error("write {}: {source}", path.display())]
   WriteFile {
     /// File that could not be written.
+    path: PathBuf,
+    /// Underlying I/O failure.
+    #[source]
+    source: IoError,
+  },
+  /// A stale generated file cannot be pruned.
+  #[error("remove {}: {source}", path.display())]
+  RemoveFile {
+    /// File that could not be removed.
     path: PathBuf,
     /// Underlying I/O failure.
     #[source]
@@ -126,6 +136,29 @@ pub enum Error {
   RewriteDestNotAbsolute {
     /// Offending dest.
     dest: String,
+  },
+  /// A kubeconfig rewrite names envs: the file is the source, drop `envs`.
+  #[error("file rewrite `{}` is a kubeconfig: the file is the source, drop `envs`", file.display())]
+  KubeWithEnvs {
+    /// Rewrite source.
+    file: PathBuf,
+  },
+  /// A kubeconfig rewrite is not valid YAML.
+  #[error("file rewrite `{}`: does not parse as YAML: {source}", file.display())]
+  KubeYaml {
+    /// Rewrite source.
+    file: PathBuf,
+    /// Underlying parse failure.
+    #[source]
+    source: YamlError,
+  },
+  /// A kubeconfig rewrite does not map onto a grant.
+  #[error("file rewrite `{}`: invalid kubeconfig: {detail}", file.display())]
+  KubeInvalid {
+    /// Rewrite source.
+    file: PathBuf,
+    /// What fails to map.
+    detail: String,
   },
   /// A mise file does not parse.
   #[error("parse mise.local.toml: {source}")]

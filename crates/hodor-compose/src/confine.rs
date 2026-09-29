@@ -15,8 +15,9 @@ use crate::stack::{
   STACK_SHAPE, current_uid, generate_stack, generation_registry, open_fnox, rules_command, stack_shape_in, uncovered_names,
   uncovered_warning, workspace_config, workspace_file, workspace_state_dir,
 };
+use clap::Args;
 use dirs::home_dir;
-use hodor_config::cli::{LogsArgs, ProxyBackend};
+use hodor_config::cli::{Cli, CliCommand, ProxyBackend};
 use hodor_config::config::{AppConfig, config_dir};
 use hodor_fnox::selected_envs;
 use hodor_pki::ca::load_or_generate;
@@ -390,7 +391,7 @@ pub(crate) fn generated_backend(compose: &str) -> Option<ProxyBackend> {
 /// Generate the workspace stack when it is absent, and regenerate it when the
 /// workspace config changed since it was generated; a stack whose config is
 /// unchanged is left alone, so hand edits survive until then.
-fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) -> Result<(), Error> {
+fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool, hodor_version: &str) -> Result<(), Error> {
   let state_ws = workspace_state_dir(root);
   let ws_compose = state_ws.join("compose.yml");
   fs::create_dir_all(&state_ws).map_err(|source| Error::CreateDir {
@@ -427,7 +428,7 @@ fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool) ->
     (false, Some(existing)) => existing,
     _ => backend,
   };
-  let stack = generate_stack(root, backend)?;
+  let stack = generate_stack(root, backend, hodor_version)?;
   fs::write(&ws_compose, stack).map_err(|source| Error::WriteFile {
     path: ws_compose.clone(),
     source,
@@ -576,6 +577,72 @@ fn warn_uncovered(root: &Path, config: &AppConfig) {
     println!("{warning}");
   }
 }
+/// Arguments for the `up` command.
+#[derive(Args, Debug, Clone)]
+pub struct UpArgs {
+  /// Workspace directory; defaults to the current directory.
+  pub workspace: Option<PathBuf>,
+}
+
+/// Arguments for the `down` command.
+#[derive(Args, Debug, Clone)]
+pub struct DownArgs {
+  /// Workspace directory; defaults to the current directory.
+  pub workspace: Option<PathBuf>,
+}
+
+/// Arguments for the `logs` command.
+#[derive(Args, Debug, Clone)]
+pub struct LogsArgs {
+  /// Workspace directory; defaults to the current directory. A flag rather
+  /// than a positional because the service names already take that slot.
+  #[arg(long)]
+  pub workspace: Option<PathBuf>,
+  /// Keep the output open and follow new lines.
+  #[arg(long, short = 'f')]
+  pub follow: bool,
+  /// Print bare log lines, without the service name in front of each one.
+  #[arg(long)]
+  pub no_log_prefix: bool,
+  /// How many lines to show from the end of each service's log; `all` for
+  /// everything.
+  #[arg(long, default_value = "all")]
+  pub tail: String,
+  /// Services to read; every service in the stack when none are named.
+  #[arg(value_name = "SERVICE")]
+  pub services: Vec<String>,
+}
+
+/// Arguments for the `init` command.
+#[derive(Args, Debug, Clone)]
+pub struct InitArgs {
+  /// Workspace directory; defaults to the current directory.
+  pub workspace: Option<PathBuf>,
+  /// Capture backend the generated stack runs. Linux only: the backend is
+  /// chosen at generation time and defaults to `ebpf`.
+  #[arg(long, value_enum)]
+  pub backend: Option<ProxyBackend>,
+}
+
+/// Arguments for the `agent` command.
+#[derive(Args, Debug, Clone)]
+pub struct AgentArgs {
+  /// Workspace directory; defaults to the current directory.
+  pub workspace: Option<PathBuf>,
+  /// Stop the workspace stack when the shell or command exits; without it the
+  /// stack keeps running.
+  #[arg(long)]
+  pub rm: bool,
+  /// Command to run in the agent instead of the configured shell; the
+  /// arguments after `--`.
+  #[arg(last = true)]
+  pub command: Vec<OsString>,
+}
+
+/// The workspace a command names, or the current directory.
+fn workspace_arg(workspace: Option<&Path>) -> PathBuf {
+  workspace.unwrap_or(Path::new(".")).to_path_buf()
+}
 
 /// `hodor init [--backend <backend>] [workspace]`: write the support files, the
 /// workspace config when it has none (`[rules.*]` for every fnox-declared name
@@ -583,15 +650,19 @@ fn warn_uncovered(root: &Path, config: &AppConfig) {
 /// stack into `<state-dir>/hodor/ws/<slug>/compose.yml` — the one editable file
 /// where generated services and secret mounts live. An existing stack is
 /// regenerated only when the workspace config changed since it was generated.
-///
-/// # Errors
-///
-/// Returns an error when the host is not Linux, when the workspace cannot be
-/// resolved or its stack generated, when `hodor rules` cannot be computed, or
-/// when a file cannot be written.
-pub fn init_command(workspace: &Path, backend: Option<ProxyBackend>) -> Result<(), Error> {
-  let root = resolve_root(workspace)?;
-  init_workspace(&root, resolve_backend(backend)?, backend.is_some())
+impl CliCommand for InitArgs {
+  type Error = Error;
+  /// Runs the init generation.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the host is not Linux, when the workspace cannot be
+  /// resolved or its stack generated, when `hodor rules` cannot be computed, or
+  /// when a file cannot be written.
+  async fn run(self, _cli: &Cli, hodor_version: &str) -> Result<(), Self::Error> {
+    let root = resolve_root(&workspace_arg(self.workspace.as_deref()))?;
+    init_workspace(&root, resolve_backend(self.backend)?, self.backend.is_some(), hodor_version)
+  }
 }
 
 /// `hodor agent [workspace] [-- <command>...]`: the whole workspace lifecycle
@@ -599,26 +670,30 @@ pub fn init_command(workspace: &Path, backend: Option<ProxyBackend>) -> Result<(
 /// enter the agent with the configured shell or `<command>`. The stack keeps
 /// running when that exits, unless `rm` stops it, so the next call starts at
 /// the exec.
-///
-/// # Errors
-///
-/// Returns an error under the same conditions as [`init_command`], plus when
-/// the compose command fails. A failed `rm` teardown is reported too, because
-/// the stack the caller asked to stop is still up.
-pub fn agent_command(workspace: &Path, command: &[OsString], rm: bool) -> Result<(), Error> {
-  let root = resolve_root(workspace)?;
-  init_workspace(&root, resolve_backend(None)?, false)?;
-  up_workspace(&root)?;
-  if !rm {
-    return exec_agent(&root, command);
+impl CliCommand for AgentArgs {
+  type Error = Error;
+  /// Runs the agent lifecycle.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the workspace cannot be resolved, generated, or
+  /// started, plus when the compose command fails. A failed `rm` teardown is
+  /// reported too, because the stack the caller asked to stop is still up.
+  async fn run(self, _cli: &Cli, hodor_version: &str) -> Result<(), Self::Error> {
+    let root = resolve_root(&workspace_arg(self.workspace.as_deref()))?;
+    init_workspace(&root, resolve_backend(None)?, false, hodor_version)?;
+    up_workspace(&root)?;
+    if !self.rm {
+      return exec_agent(&root, &self.command);
+    }
+    let exec = {
+      let _survive_interrupt = SurviveInterrupt::new();
+      exec_agent(&root, &self.command)
+    };
+    let down = down_workspace(&root);
+    exec?;
+    down
   }
-  let exec = {
-    let _survive_interrupt = SurviveInterrupt::new();
-    exec_agent(&root, command)
-  };
-  let down = down_workspace(&root);
-  exec?;
-  down
 }
 
 /// Ignore the terminal's interrupt for as long as it lives, so hodor reaches
@@ -648,31 +723,43 @@ extern "C" fn swallow_interrupt(_: c_int) {}
 
 /// `hodor up [workspace]`: start the layered compose project `hodor init`
 /// generated, making sure what it mounts exists first.
-///
-/// # Errors
-///
-/// Returns an error when the workspace cannot be resolved, when the support
-/// files cannot be written, or when the compose command fails.
-pub fn up_command(workspace: &Path) -> Result<(), Error> {
-  up_workspace(&resolve_root(workspace)?)
+impl CliCommand for UpArgs {
+  type Error = Error;
+  /// Starts the stack.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the workspace cannot be resolved, when the support
+  /// files cannot be written, or when the compose command fails.
+  async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
+    up_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?)
+  }
 }
 
 /// `hodor down [workspace]`: stop the layered compose project.
-///
-/// # Errors
-///
-/// Returns an error when the workspace cannot be resolved or when the compose
-/// command fails.
-pub fn down_command(workspace: &Path) -> Result<(), Error> {
-  down_workspace(&resolve_root(workspace)?)
+impl CliCommand for DownArgs {
+  type Error = Error;
+  /// Stops the stack.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the workspace cannot be resolved or when the compose
+  /// command fails.
+  async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
+    down_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?)
+  }
 }
 
 /// `hodor logs [workspace]`: read the stack's logs.
-///
-/// # Errors
-///
-/// Returns an error when the workspace cannot be resolved or when the compose
-/// command fails.
-pub fn logs_command(workspace: &Path, args: &LogsArgs) -> Result<(), Error> {
-  logs_workspace(&resolve_root(workspace)?, args)
+impl CliCommand for LogsArgs {
+  type Error = Error;
+  /// Reads the stack's logs.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the workspace cannot be resolved or when the compose
+  /// command fails.
+  async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
+    logs_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?, &self)
+  }
 }

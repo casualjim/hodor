@@ -113,6 +113,11 @@ pub(crate) async fn read_client_hello<G: AsyncRead + Unpin>(
     if let Some((sni, hello)) = hello_sni(&buf) {
       return Ok(Some(Hello::Named { buf, sni, hello }));
     }
+    // A complete hello without SNI is final: IP-literal clients never send
+    // one, so waiting out the budget would stall every such handshake.
+    if hello_complete(&buf).is_some() {
+      return Ok(buf.first().is_some_and(|byte| *byte == 0x16).then_some(Hello::Unnamed { buf }));
+    }
     let over_cap = buf.len() > MAX_HELLO;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if over_cap || remaining.is_zero() {
@@ -171,17 +176,24 @@ pub(crate) async fn read_http_head<G: AsyncRead + Unpin>(
   }
 }
 
+/// A complete `ClientHello` in `buf`, via rama's parser. None while the
+/// hello is still incomplete or invalid. Carries no SNI verdict: an
+/// IP-literal client sends a complete hello with none, and its ALPN and
+/// fingerprint are still worth mirroring upstream.
+pub(crate) fn hello_complete(buf: &[u8]) -> Option<ClientHello> {
+  match parse_client_hello_handshake_prefix(buf) {
+    ClientHelloHandshakePrefix::Complete(hello) => Some(hello),
+    _ => None,
+  }
+}
+
 /// SNI plus hello of a complete `ClientHello` in `buf`, via rama's parser.
 /// None while the hello is still incomplete, invalid, or carries no SNI, so
 /// the caller keeps accumulating.
 pub(crate) fn hello_sni(buf: &[u8]) -> Option<(String, ClientHello)> {
-  match parse_client_hello_handshake_prefix(buf) {
-    ClientHelloHandshakePrefix::Complete(hello) => {
-      let sni = hello.ext_server_name().map(ToString::to_string)?;
-      Some((sni, hello))
-    }
-    _ => None,
-  }
+  let hello = hello_complete(buf)?;
+  let sni = hello.ext_server_name().map(ToString::to_string)?;
+  Some((sni, hello))
 }
 
 /// Host header of a complete HTTP request head, port-defaulted to the dialed
@@ -245,6 +257,7 @@ mod tests {
   use super::*;
   use hodor_config::grants::{Credential, SslMode};
   use secrecy::SecretString;
+  use std::time::Instant;
 
   fn token_grant(entries: &[&str]) -> Vec<Grant> {
     vec![Grant::Token {
@@ -324,5 +337,21 @@ mod tests {
     // inspected to reach this answer, and the entry that comes back is the
     // same one, so its sslmode and trust anchor travel with it.
     assert!(matches!(expect(&grants, None, 5432), Expect::Postgres(other) if std::ptr::eq(other, scope)));
+  }
+  #[tokio::test]
+  async fn a_complete_hello_without_sni_returns_unnamed_at_once() {
+    // Minimal TLS 1.3 ClientHello with no SNI extension, as an IP-literal
+    // client (kubectl against 127.0.0.1) sends: holding out for an SNI
+    // that never comes burns the whole pre-auth budget and stalls the
+    // handshake past the client's own timeout.
+    let mut hello = vec![0x16, 0x03, 0x01, 0x00, 0x36, 0x01, 0x00, 0x00, 0x32, 0x03, 0x03];
+    hello.extend_from_slice(&[0xAA; 32]);
+    hello.extend_from_slice(&[
+      0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00, 0x00, 0x07, 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04,
+    ]);
+    let start = Instant::now();
+    let read = read_client_hello(&mut &*hello, &[], Duration::from_secs(30)).await.unwrap();
+    assert!(matches!(read, Some(Hello::Unnamed { .. })), "an SNI-less hello resolves unnamed");
+    assert!(start.elapsed() < Duration::from_secs(5), "no budget burn: {:?}", start.elapsed());
   }
 }

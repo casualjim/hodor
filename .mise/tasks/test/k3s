@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer + cert auth)"
+#MISE depends=["build:debug"]
+
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+set -euo pipefail
+
+cluster="hodor-k3s-test"
+scratch=$proj_dir/target/k3s-e2e
+hodor=$proj_dir/target/debug/hodor
+serve_pid=""
+
+cleanup() {
+  if [ -n "$serve_pid" ]; then
+    kill "$serve_pid" 2>/dev/null || true
+  fi
+  k3d cluster delete "$cluster" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+rm -rf "$scratch"
+mkdir -p "$scratch" "$scratch/config/hodor"
+# Stack generation needs `[workspace] home`, which normally arrives via the
+# user's global config; the hermetic XDG_CONFIG_HOME hides that file, so the
+# task seeds the one value generation requires.
+printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/hodor/config.toml"
+
+# Fresh cluster every run: leftover state from a killed run must not leak in.
+k3d cluster delete "$cluster" >/dev/null 2>&1 || true
+k3d cluster create "$cluster" --wait
+
+# k3d writes the server as 0.0.0.0, which is not a usable TLS identity or dial
+# address everywhere a grant travels; loopback is the same listener.
+k3d kubeconfig get "$cluster" | sed 's|https://0.0.0.0:|https://127.0.0.1:|' >"$scratch/cert-kubeconfig"
+
+# Bearer-leg source: token-only copy of the same kubeconfig.
+cp "$scratch/cert-kubeconfig" "$scratch/token-kubeconfig"
+export KUBECONFIG="$scratch/cert-kubeconfig"
+kubectl create serviceaccount hodor-test >/dev/null
+kubectl create clusterrolebinding hodor-test --clusterrole=cluster-admin --serviceaccount=default:hodor-test >/dev/null
+token=$(kubectl create token hodor-test --duration=3600s)
+user=$(kubectl config view -o 'jsonpath={.users[0].name}')
+export KUBECONFIG="$scratch/token-kubeconfig"
+kubectl config set-credentials "$user" --token="$token" >/dev/null
+kubectl config unset "users.$user.client-certificate-data" >/dev/null
+kubectl config unset "users.$user.client-key-data" >/dev/null
+
+# One leg: init a workspace against a kubeconfig source, serve host-side, and
+# prove the three states — real works direct, decoy fails direct, decoy works
+# through the proxy. Host-side serve cannot resolve the /hodor/kube container
+# mount, so the layer runs as a copy with host paths; substitution behavior
+# is unaffected by the prefix.
+run_leg() {
+  local name=$1 source=$2 port=$3
+  local ws=$scratch/ws-$name
+  mkdir -p "$ws/.config/hodor"
+  printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$source\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$ws/.config/hodor/config.toml"
+  # Redirects stay on the hodor invocations only: XDG_CONFIG_HOME breaks the
+  # mise shims kubectl and k3d run through, so those keep the real environment.
+  local statedir=$scratch/state-$name
+  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$hodor" init --backend tproxy "$ws"
+  shopt -s nullglob
+  kubedirs=()
+  for d in "$statedir"/hodor/ws/*/kube; do kubedirs+=("$d"); done
+  decoys=()
+  for d in "$statedir"/hodor/ws/*/files/00-*; do decoys+=("$d"); done
+  shopt -u nullglob
+  if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
+    echo "init generated no kube state under $XDG_STATE_HOME" >&2
+    exit 1
+  fi
+  local kubedir=${kubedirs[0]} decoy=${decoys[0]}
+  sed "s|/hodor/kube|$kubedir|" "$kubedir/hodor.toml" >"$scratch/host-layer-$name.toml"
+  cp "$decoy" "$scratch/proxy-$name.yaml"
+  local context
+  context=$(KUBECONFIG="$source" kubectl config current-context)
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster "$context" --proxy-url="http://127.0.0.1:$port" >/dev/null
+
+  XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox HODOR_CONFIG="$scratch/host-layer-$name.toml" HODOR_CA_FILE="$scratch/config/hodor/ca.pem" HODOR_LISTEN="127.0.0.1:$port" "$hodor" serve &
+  serve_pid=$!
+  sleep 2
+
+  echo "--- $name: real credential works direct"
+  KUBECONFIG="$source" kubectl get nodes --request-timeout=30s
+  echo "--- $name: decoy fails direct"
+  if env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy KUBECONFIG="$decoy" kubectl get nodes --request-timeout=30s; then
+    echo "decoy kubeconfig worked without the proxy; substitution unproven" >&2
+    exit 1
+  fi
+  echo "--- $name: decoy works through the proxy"
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get nodes --request-timeout=30s
+
+  kill "$serve_pid" 2>/dev/null || true
+  serve_pid=""
+}
+
+run_leg cert "$scratch/cert-kubeconfig" 18099
+run_leg bearer "$scratch/token-kubeconfig" 18100
+
+echo "k3s substitution proven: bearer + cert auth"

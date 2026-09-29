@@ -6,13 +6,13 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use confique::{Config as _, Layer as _};
+use confique::{Config, Layer as _};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use validator::{Validate, ValidationError};
 
-use crate::cli::{Cli, Command};
+use crate::cli::Cli;
 use crate::error::Error;
 use crate::grants::{EndpointScope, GuestTlsMode, HostPat};
 use crate::plugins::PluginCfg;
@@ -111,7 +111,9 @@ pub struct WorkspaceCfg {
   /// each listed env name's real value is byte-replaced by its decoy and the
   /// result lands under the workspace state directory, mounted at `dest`
   /// (`{home}` expands to `home` above). A name with no known real value or
-  /// no decoy fails generation, naming the name.
+  /// no decoy fails generation, naming the name. Kubeconfig sources take a
+  /// structural adapter instead of the byte-swap (detected, not declared)
+  /// and state no `envs`: the file is the secret source.
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub file_rewrite: Vec<FileRewrite>,
@@ -135,9 +137,23 @@ pub struct FileRewrite {
   /// expands to `[workspace] home` and `$VAR` expands first.
   pub dest: String,
   /// Env names whose real values are replaced by their decoys in the file.
+  /// Empty for kubeconfig sources: the adapter knows where the secrets live.
   #[serde(default)]
   pub envs: Vec<String>,
+  /// Declared format, skipping detection. More formats later; unknown files
+  /// keep the raw byte-swap when this is absent.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub format: Option<RewriteFormat>,
 }
+
+/// Declared `file_rewrite` format: the named adapter handles the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RewriteFormat {
+  /// Kubectl config: structural grant derivation plus decoy twin.
+  Kubeconfig,
+}
+
 /// Proxy listener settings (CLI/env/file overlay).
 #[derive(confique::Config, Clone, Debug, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone, Debug, Default)))]
@@ -294,11 +310,11 @@ pub enum IfMissing {
 ///
 /// Returns an error when the working directory is unreadable, when a config
 /// layer is malformed, or when an `allow` entry fails to resolve.
-pub fn load(cli: &Cli) -> Result<(AppConfig, Option<Workspace>), Error> {
+pub fn load(cli: &Cli, proxy: Option<&<ProxyCfg as Config>::Layer>) -> Result<(AppConfig, Option<Workspace>), Error> {
   let cwd = env::current_dir().map_err(Error::CurrentDir)?;
   let mut cli_layer = <AppConfig as confique::Config>::Layer::empty();
-  if let Some(Command::Serve(args)) = &cli.command {
-    cli_layer.proxy = args.proxy.clone();
+  if let Some(proxy) = proxy {
+    cli_layer.proxy = proxy.clone();
   }
 
   let mut builder = AppConfig::builder().preloaded(cli_layer).env();
@@ -773,6 +789,98 @@ fn fill_encoding(seed: &str, encoding: Encoding, count: usize) -> String {
   out
 }
 
+/// One sample entry per map-valued table, serialized for the reference
+/// `hodor config` appends to the schema template. Drift is compile-checked:
+/// every literal below names all fields of its struct, so a new field fails
+/// the build until the sample states it, and
+/// `reference_samples_name_every_setting` fails when the serializer then
+/// hides one. No production type carries reference-only baggage.
+///
+/// # Panics
+///
+/// Only on serialization of in-repo literals, which the suite catches.
+#[must_use]
+pub fn reference_samples() -> String {
+  #[derive(Serialize)]
+  struct Samples<'a> {
+    rules: BTreeMap<&'a str, RuleCfg>,
+    plugins: BTreeMap<&'a str, crate::plugins::PluginCfg>,
+    tools: BTreeMap<&'a str, ToolCfg>,
+    workspace: WorkspaceSamples,
+  }
+  #[derive(Serialize)]
+  struct WorkspaceSamples {
+    file_rewrite: Vec<FileRewrite>,
+  }
+  let mut rule_tls = BTreeMap::new();
+  rule_tls.insert(
+    "https://api.example".to_string(),
+    HostTlsCfg {
+      client_cert: Some("/certs/client.pem".into()),
+      client_key: Some("/certs/client.key".into()),
+      root_cert: Some("/certs/bundle.pem".into()),
+      guest_tls_mode: GuestTlsMode::Mtls,
+      guest_cert: Some("{home}/.certs/client.pem".into()),
+      guest_key: Some("{home}/.certs/client.key".into()),
+    },
+  );
+  let rule = RuleCfg {
+    env: "EXAMPLE_TOKEN".to_string(),
+    value: None,
+    real: None,
+    fnox_key: Some("EXAMPLE_FNOX_KEY".to_string()),
+    allow: vec![
+      "https://api.example".to_string(),
+      "postgres://db.example:5432/app?sslmode=verify-full&sslrootcert=/certs/bundle.pem".to_string(),
+    ],
+    pattern: Some("example_{hex:32}".to_string()),
+    oauth2: Some(OAuthFlow {
+      flow: crate::registry::FlowKind::ClientCredentials,
+      token_url: "https://auth.example/token".to_string(),
+      authorize_url: Some("https://auth.example/authorize".to_string()),
+      refresh_url: Some("https://auth.example/refresh".to_string()),
+      rotates_refresh: true,
+      token_fields: vec!["access_token".to_string()],
+    }),
+    registry: Some(true),
+    if_missing: IfMissing::Warn,
+    tls: rule_tls,
+  };
+  let samples = Samples {
+    rules: [("example", rule)].into_iter().collect(),
+    plugins: [(
+      "example",
+      crate::plugins::PluginCfg {
+        path: "target/plugins/example.wasm".into(),
+        allow: vec!["https://api.example".to_string()],
+        direction: crate::plugins::PluginDirection::Both,
+      },
+    )]
+    .into_iter()
+    .collect(),
+    tools: [(
+      "example",
+      ToolCfg {
+        config_dir: "{home}/.example".to_string(),
+      },
+    )]
+    .into_iter()
+    .collect(),
+    workspace: WorkspaceSamples {
+      file_rewrite: vec![FileRewrite {
+        source: "~/.example/settings".into(),
+        dest: "{home}/.example/settings".to_string(),
+        envs: vec!["EXAMPLE_TOKEN".to_string()],
+        format: Some(RewriteFormat::Kubeconfig),
+      }],
+    },
+  };
+  let mut out = String::from("\n# ── Map-valued tables: one sample entry each; copy and rename the key ──\n\n");
+  out.push_str("# `value` and `real` never serialize (secrets): `value` is the inline\n# real secret (or the database rule's FAKE postgres:// URL), `real` is the\n# database rule's REAL string, resolved from the secret source.\n\n");
+  out.push_str(&toml::to_string_pretty(&samples).expect("in-repo literals always serialize"));
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -809,8 +917,14 @@ mod tests {
     file.write_all(body.as_bytes()).unwrap();
   }
 
+  #[derive(clap::Parser)]
+  struct TestCli {
+    #[command(flatten)]
+    cli: Cli,
+  }
+
   fn cli_for(argv: &[&str]) -> Cli {
-    Cli::try_parse_from(argv).unwrap()
+    TestCli::try_parse_from(argv).unwrap().cli
   }
 
   /// Enter `dir` as the process cwd, restoring the previous one on drop.
@@ -873,8 +987,8 @@ allow = ["https://c.example"]
     write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
     fs::create_dir_all(&nested).unwrap();
     let _cwd = CwdGuard::enter(&nested);
-    let cli = cli_for(&["hodor", "serve"]);
-    let (config, _ws) = load(&cli).unwrap();
+    let cli = cli_for(&["hodor"]);
+    let (config, _ws) = load(&cli, None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:2222");
     assert_eq!(config.rules["a"].value.as_ref().unwrap().expose_secret(), "global-a");
     assert_eq!(config.rules["b"].value.as_ref().unwrap().expose_secret(), "project-b");
@@ -904,7 +1018,7 @@ allow = ["https://c.example"]
       discover_project_config(&nested),
       Some(project_root.join(".config").join("hodor").join("config.toml"))
     );
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:3333");
     assert_eq!(WorkspaceCfg::default().profile_name(), SHARED_PROFILE);
     scrub_env();
@@ -928,7 +1042,7 @@ allow = ["https://c.example"]
     write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
     set_env("HODOR_CONFIG", &global);
     let _cwd = CwdGuard::enter(&project_root);
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.tools["pi"].config_dir, "{home}/.pi-proj");
     assert_eq!(config.tools["gh"].config_dir, "{home}/.config/gh");
     assert_eq!(config.workspace.profile_name(), "work");
@@ -975,21 +1089,25 @@ allow = ["https://c.example"]
     fs::create_dir_all(&nested).unwrap();
     let _cwd = CwdGuard::enter(&nested);
     // project beats global
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:2222");
     // env beats project
     set_env("HODOR_LISTEN", "127.0.0.1:3333");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:3333");
     // CLI beats env
-    let (config, _) = load(&cli_for(&["hodor", "serve", "--listen", "127.0.0.1:4444"])).unwrap();
+    let mut proxy = <ProxyCfg as Config>::Layer::empty();
+    proxy.listen = Some("127.0.0.1:4444".parse().unwrap());
+    let (config, _) = load(&cli_for(&["hodor"]), Some(&proxy)).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:4444");
     // the handshake budget defaults to 10 and layers like everything else
     assert_eq!(config.proxy.handshake_timeout_secs, 10);
     set_env("HODOR_HANDSHAKE_TIMEOUT_SECS", "3");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.handshake_timeout_secs, 3);
-    let (config, _) = load(&cli_for(&["hodor", "serve", "--handshake-timeout", "5"])).unwrap();
+    let mut proxy = <ProxyCfg as Config>::Layer::empty();
+    proxy.handshake_timeout_secs = Some(5);
+    let (config, _) = load(&cli_for(&["hodor"]), Some(&proxy)).unwrap();
     assert_eq!(config.proxy.handshake_timeout_secs, 5);
     scrub_env();
   }
@@ -1007,8 +1125,8 @@ allow = ["https://c.example"]
     let markerless = dir.path().join("markerless");
     fs::create_dir_all(&markerless).unwrap();
     let _cwd = CwdGuard::enter(&markerless);
-    let cli = cli_for(&["hodor", "--config", override_file.to_str().unwrap(), "serve"]);
-    let (config, _) = load(&cli).unwrap();
+    let cli = cli_for(&["hodor", "--config", override_file.to_str().unwrap()]);
+    let (config, _) = load(&cli, None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:5555");
     scrub_env();
   }
@@ -1049,7 +1167,7 @@ env = "GITHUB_TOKEN"
 "#,
     );
     set_env("HODOR_CONFIG", &global);
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     let rule = &config.rules["gh"];
     assert!(rule.value.is_none());
     assert!(rule.allow.is_empty());
@@ -1079,7 +1197,7 @@ if_missing = "warn"
 "#,
     );
     set_env("HODOR_CONFIG", &global);
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     let rule = &config.rules["gh"];
     assert_eq!(rule.fnox_key.as_deref(), Some("GH_PAT"));
     assert_eq!(rule.registry, Some(false));
@@ -1124,7 +1242,7 @@ if_missing = "warn"
     let global = dir.path().join("global.toml");
     write_file(&global, "[rules.bad]\nenv = \"B\"\nvalue = \"v\"\nallow = [\"gopher://h\"]\n");
     set_env("HODOR_CONFIG", &global);
-    let err = load(&cli_for(&["hodor", "serve"])).unwrap_err();
+    let err = load(&cli_for(&["hodor"]), None).unwrap_err();
     assert!(err.to_string().contains("gopher://h"), "{err:?}");
     scrub_env();
   }
@@ -1158,7 +1276,7 @@ allow = ["https://b.example"]
 "#,
     );
     set_env("HODOR_CONFIG", &global);
-    let err = load(&cli_for(&["hodor", "serve"])).unwrap_err();
+    let err = load(&cli_for(&["hodor"]), None).unwrap_err();
     assert!(err.to_string().contains("share env name"), "{err:?}");
     scrub_env();
   }
@@ -1187,15 +1305,83 @@ allow = ["https://b.example"]
       ("[3000, 0]", "port 0"),
     ] {
       write_file(&global, format!("[workspace]\nports = {ports}\n").as_str());
-      let err = load(&cli_for(&["hodor", "serve"])).unwrap_err();
+      let err = load(&cli_for(&["hodor"]), None).unwrap_err();
       assert!(err.to_string().contains(expected), "ports {ports}: {err:?}");
     }
     write_file(&global, "[workspace]\nports = [3000, 8080, 5432]\n");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.workspace.ports, vec![3000, 8080, 5432]);
     write_file(&global, "[proxy]\n");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert!(config.workspace.ports.is_empty(), "absent ports stay empty");
     scrub_env();
+  }
+
+  /// `hodor config` prints this: every setting, its default, and the doc
+  /// comment explaining it, so undiscovered settings surface here first.
+  #[test]
+  fn config_template_lists_every_setting_with_its_default() {
+    let template = confique::toml::template::<AppConfig>(confique::toml::FormatOptions::default());
+    // Defaults render even though no config file names them.
+    assert!(template.contains("handshake_timeout_secs = 10"), "{template}");
+    assert!(template.contains("listen = \"127.0.0.1:8080\""), "{template}");
+    // Every configurable table appears, including the maps.
+    for section in ["[proxy]", "[workspace]", "#rules", "#plugins", "#tools", "#file_rewrite"] {
+      assert!(template.contains(section), "missing `{section}` in:\n{template}");
+    }
+    // Doc comments travel with the settings they explain.
+    assert!(template.contains("Default value"), "{template}");
+    // Derived from the schema, never from values, and every line is
+    // commented out: the template is a reference, never live config.
+    assert!(!template.contains("\nvalue ="), "{template}");
+  }
+
+  /// Every field the sample literals name must survive serialization into
+  /// the reference. The literals in [`reference_samples`] are exhaustive
+  /// over their structs, so a new field fails to compile until sampled
+  /// there; this test then fails if a skip attribute hides it anyway.
+  #[test]
+  fn reference_samples_name_every_setting() {
+    let samples = reference_samples();
+    for name in [
+      "[rules.example]",
+      "env",
+      "fnox_key",
+      "allow",
+      "pattern",
+      "oauth2",
+      "flow",
+      "token_url",
+      "authorize_url",
+      "refresh_url",
+      "rotates_refresh",
+      "token_fields",
+      "registry",
+      "if_missing",
+      "[rules.example.tls.\"https://api.example\"]",
+      "client_cert",
+      "client_key",
+      "root_cert",
+      "guest_tls_mode",
+      "guest_cert",
+      "guest_key",
+      "[plugins.example]",
+      "path",
+      "direction",
+      "[tools.example]",
+      "config_dir",
+      "[[workspace.file_rewrite]]",
+      "source",
+      "dest",
+      "envs",
+      "format",
+    ] {
+      assert!(samples.contains(name), "samples miss `{name}`:\n{samples}");
+    }
+    // The two secret fields never serialize; the sample explains them in
+    // its own comment instead.
+    assert!(samples.contains("`value` and `real` never serialize"), "{samples}");
+    assert!(!samples.contains("\nvalue ="), "{samples}");
+    assert!(!samples.contains("\nreal ="), "{samples}");
   }
 }

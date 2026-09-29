@@ -71,6 +71,9 @@ unnecessary_safety_doc = "warn"
 unneeded_field_pattern = "warn"
 unused_result_ok = "warn"
 
+[workspace.dependencies]
+toml = "0.8"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 confique = { version = "0.4", features = ["toml"] }

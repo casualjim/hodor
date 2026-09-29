@@ -7,10 +7,11 @@
 mod confine;
 mod error;
 mod expand;
+mod kube;
 mod paths;
 mod stack;
 
-pub use confine::{agent_command, down_command, init_command, logs_command, up_command};
+pub use confine::{AgentArgs, DownArgs, InitArgs, LogsArgs, UpArgs};
 pub use error::Error;
 pub use stack::rules_command;
 
@@ -22,8 +23,8 @@ mod tests {
   use std::path::{Path, PathBuf};
   use std::slice::from_ref;
 
-  use hodor_config::cli::{LogsArgs, ProxyBackend};
-  use hodor_config::config::{FileRewrite, ToolCfg};
+  use hodor_config::cli::{Cli, ProxyBackend};
+  use hodor_config::config::{FileRewrite, RewriteFormat, ToolCfg};
   use tempfile::tempdir;
 
   use crate::confine::*;
@@ -63,6 +64,9 @@ mod tests {
     }
   }
 
+  /// Image tag the test stack renders: obviously fake, so a leaked `:latest`
+  /// or a hardcoded version fails the assertion instead of passing silently.
+  const TEST_VERSION: &str = "0.0.0-test";
   /// A default-ish stack to render in tests; override fields struct-update style.
   fn test_stack(backend: ProxyBackend) -> Stack<'static> {
     Stack {
@@ -78,6 +82,8 @@ mod tests {
       ports: Vec::new(),
       passthrough: Vec::new(),
       file_mounts: Vec::new(),
+      kube_mounts: Vec::new(),
+      hodor_version: TEST_VERSION,
     }
   }
 
@@ -530,11 +536,10 @@ mod tests {
   #[test]
   fn the_example_workspace_loads_and_inherits_registry_hosts() {
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/agentic-devenv/.config/hodor/config.toml");
-    let cli = hodor_config::cli::Cli {
+    let cli = Cli {
       config: Some(example.clone()),
-      command: None,
     };
-    let (config, _) = hodor_config::config::load(&cli).unwrap_or_else(|err| panic!("{} does not load: {err}", example.display()));
+    let (config, _) = hodor_config::config::load(&cli, None).unwrap_or_else(|err| panic!("{} does not load: {err}", example.display()));
     assert_eq!(config.workspace.home.as_deref(), Some("/home/eng"));
     assert_eq!(config.workspace.shell.as_deref(), Some("bash"));
     let registry = generation_registry(None).unwrap();
@@ -992,13 +997,19 @@ mod tests {
     );
     for expected in [
       "  fwd:\n",
-      "    image: ghcr.io/casualjim/hodor:latest\n",
       "    command: [\"fwd\"]\n",
       "    network_mode: \"service:hodor\"\n",
       "    pid: \"service:agent\"\n",
     ] {
       assert!(yaml.contains(expected), "missing {expected:?}:\n{yaml}");
     }
+    assert_eq!(
+      yaml
+        .matches(&format!("    image: ghcr.io/casualjim/hodor:{TEST_VERSION}\n"))
+        .count(),
+      2,
+      "hodor and fwd services both pin the threaded version:\n{yaml}"
+    );
     // One service key each: a duplicated key is a compose parse error, not a
     // cosmetic slip.
     for service in ["hodor", "agent", "fwd"] {
@@ -1081,6 +1092,7 @@ mod tests {
       source: source.clone(),
       dest: "{home}/.npmrc".to_string(),
       envs: vec!["NPM_TOKEN".to_string()],
+      format: None,
     };
     let decoys = vec![Decoy {
       env: "NPM_TOKEN".to_string(),
@@ -1089,7 +1101,7 @@ mod tests {
     let env = HashMap::from([("NPM_TOKEN".to_string(), "real-secret-1".to_string())]);
     let expander = build_expander(HashMap::new());
     let files = dir.path().join("files");
-    let mounts = write_rewrites(RewriteInputs {
+    let outputs = write_rewrites(RewriteInputs {
       files_dir: &files,
       root: dir.path(),
       rewrites: from_ref(&rewrite),
@@ -1098,12 +1110,14 @@ mod tests {
       expander: &expander,
       home: "/home/eng",
       host_home: None,
+      kube_ca: None,
+      guests_dir: dir.path(),
     })
     .unwrap();
-    assert_eq!(mounts.len(), 1);
-    assert!(mounts[0].ro);
-    assert_eq!(mounts[0].container, PathBuf::from("/home/eng/.npmrc"));
-    let body = fs::read_to_string(&mounts[0].host).unwrap();
+    assert_eq!(outputs.mounts.len(), 1);
+    assert!(outputs.mounts[0].ro);
+    assert_eq!(outputs.mounts[0].container, PathBuf::from("/home/eng/.npmrc"));
+    let body = fs::read_to_string(&outputs.mounts[0].host).unwrap();
     assert!(body.contains("decoy-9"), "{body}");
     assert!(!body.contains("real-secret-1"), "{body}");
     let error = write_rewrites(RewriteInputs {
@@ -1113,16 +1127,114 @@ mod tests {
         source: source.clone(),
         dest: "{home}/.npmrc".to_string(),
         envs: vec!["UNKNOWN_NAME".to_string()],
+        format: None,
       }],
       decoys: &decoys,
       env: &env,
       expander: &expander,
       home: "/home/eng",
       host_home: None,
+      kube_ca: None,
+      guests_dir: dir.path(),
     })
     .unwrap_err()
     .to_string();
     assert!(error.contains("UNKNOWN_NAME"), "{error}");
+  }
+
+  const KUBE_DOC: &str = r"apiVersion: v1
+kind: Config
+current-context: k3s-local
+contexts:
+- name: k3s-local
+  context: {cluster: k3s, user: admin}
+clusters:
+- name: k3s
+  cluster: {server: https://10.0.0.1:6443}
+users:
+- name: admin
+  user: {token: probe-token}
+";
+
+  /// Kubeconfig sources adapt with no `envs`, stated or sniffed.
+  #[test]
+  fn kube_rewrites_adapt_stated_or_sniffed() {
+    use std::collections::HashMap;
+
+    use hodor_pki::ca::CertAuthority;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("k3s.yaml");
+    fs::write(&source, KUBE_DOC).unwrap();
+    let ca = CertAuthority::generate().unwrap();
+    let expander = build_expander(HashMap::new());
+    let files = dir.path().join("files");
+    let guests = dir.path().join("guests");
+    for format in [None, Some(RewriteFormat::Kubeconfig)] {
+      let outputs = write_rewrites(RewriteInputs {
+        files_dir: &files,
+        root: dir.path(),
+        rewrites: &[FileRewrite {
+          source: source.clone(),
+          dest: "{home}/.kube/config".to_string(),
+          envs: Vec::new(),
+          format,
+        }],
+        decoys: &[],
+        env: &HashMap::new(),
+        expander: &expander,
+        home: "/home/eng",
+        host_home: None,
+        kube_ca: Some(&ca),
+        guests_dir: &guests,
+      })
+      .unwrap();
+      assert_eq!(outputs.mounts.len(), 1);
+      assert_eq!(outputs.kube.len(), 1);
+      assert!(
+        outputs.kube[0].fragment.contains("https://10.0.0.1:6443"),
+        "{}",
+        outputs.kube[0].fragment
+      );
+      let body = fs::read_to_string(&outputs.mounts[0].host).unwrap();
+      assert!(body.contains("current-context: k3s-local"), "{body}");
+      assert!(!body.contains("probe-token"), "no real credential survives: {body}");
+    }
+  }
+
+  /// A stated kubeconfig format on a foreign file fails closed.
+  #[test]
+  fn stated_kubeconfig_on_plain_text_is_an_error() {
+    use std::collections::HashMap;
+
+    use hodor_pki::ca::CertAuthority;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("npmrc");
+    fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
+    let ca = CertAuthority::generate().unwrap();
+    let guests = dir.path().join("guests");
+    let expander = build_expander(HashMap::new());
+    let error = write_rewrites(RewriteInputs {
+      files_dir: &dir.path().join("files"),
+      root: dir.path(),
+      rewrites: &[FileRewrite {
+        source,
+        dest: "{home}/.npmrc".to_string(),
+        envs: Vec::new(),
+        format: Some(RewriteFormat::Kubeconfig),
+      }],
+      decoys: &[],
+      env: &HashMap::new(),
+      expander: &expander,
+      home: "/home/eng",
+      host_home: None,
+      kube_ca: Some(&ca),
+      guests_dir: &guests,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("but does not parse as YAML"), "{error}");
   }
 
   /// Home prefixes move to the container home; URLs, relative paths, and

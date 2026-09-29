@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use crate::connection::{GuestIo, PgTransport, Prefixed, PumpService, client_auth_policy, dial_marked, trust_anchors};
-use crate::identity::{Expect, Hello, MintBucket, expect, read_client_hello, read_http_head};
+use crate::identity::{Expect, Hello, MintBucket, expect, hello_complete, read_client_hello, read_http_head};
 use crate::mint::{MintHandle, MintStore};
 use crate::protocol::{MAX_HEAD, PairCtx, http_pair, postgres_pair, raw_tcp_pair};
 use crate::wire::{GuestOpening, read_guest_opening, request_upstream_tls};
@@ -450,7 +450,13 @@ where
       };
       let (buf, sni, parsed) = match read {
         Hello::Named { buf, sni, hello } => (buf, Some(sni), Some(hello)),
-        Hello::Unnamed { buf } => (buf, None, None),
+        // A complete hello without SNI still carries the client's ALPN and
+        // fingerprint: mirror it instead of falling back to boring defaults,
+        // which negotiate no ALPN and drop framed substitution.
+        Hello::Unnamed { buf } => {
+          let parsed = hello_complete(&buf);
+          (buf, None, parsed)
+        }
       };
       if let (Some(authority), Some(sni)) = (host, sni.as_deref())
         && !sni.eq_ignore_ascii_case(authority)

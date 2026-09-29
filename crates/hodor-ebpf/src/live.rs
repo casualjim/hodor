@@ -122,6 +122,7 @@ fn state_with(grants: Vec<Grant>, ca: &hodor_pki::ca::CertAuthority) -> Arc<Prox
         proxy: ProxyCfg {
           listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
           ca_file: None,
+          root_certs: Vec::new(),
           handshake_timeout_secs: 10,
         },
         grants,
@@ -193,6 +194,9 @@ async fn ebpf_live_tcp_mitm_substitutes() {
 
   hodor_pki::ca::install_crypto_provider();
   let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("hodor-ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
   let ca_der = ca.cert_der().clone();
   let stub_cert = hodor_pki::ca::generate_domain_cert(SNI, &ca).unwrap();
   let stub_acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&stub_cert.server_config));
@@ -214,6 +218,7 @@ async fn ebpf_live_tcp_mitm_substitutes() {
         port: stub_port,
         client_cert: None,
         client_key: None,
+        root_cert: Some(bundle),
         guest_tls: hodor_config::grants::GuestTlsMode::Tls,
       }],
       pattern: None,

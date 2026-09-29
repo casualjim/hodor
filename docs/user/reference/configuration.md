@@ -19,6 +19,7 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 | --- | --- | --- | --- |
 | `listen` | `127.0.0.1:8080` | `HODOR_LISTEN` | Address the explicit proxy listens on. |
 | `ca_file` | `<config-dir>/hodor/ca.pem` | `HODOR_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `hodor ca` also writes `ca.crt` and `ca.key` beside it. |
+| `root_certs` | `[]` | — | Extra upstream CA bundles trusted on egress, additive to webpki roots. Config file only, one path per bundle. Entries extend this further with their own `root_cert`. |
 
 ## `[rules.<label>]`
 
@@ -55,6 +56,16 @@ allow = ["tcp://10.0.0.8:5432"]
 ```
 
 A `tcp://` entry has no framing to rewrite, so the substitution is equal-length only, and hodor satisfies that by construction: the decoy for a rule with a `tcp://` entry is generated at the real value's length, falling back from the registry shape only when the shape renders another length. See [capture traffic transparently](../how-to/capture-traffic-transparently.md) for the capture side.
+
+## `[rules.<label>.tls."<entry>"]`
+
+Per-entry TLS, keyed by the exact `allow` entry string. All keys optional.
+
+| Key | Purpose |
+| --- | --- |
+| `client_cert` / `client_key` | Upstream client identity the proxy presents to this entry. Come together. |
+| `root_cert` | Upstream CA bundle trusting this entry's host, additive to webpki roots plus global `root_certs`. |
+| `guest_tls_mode` | `tls` (default) or `mtls`: demand a guest client certificate signed by the hodor CA. |
 
 ## `[workspace]`
 

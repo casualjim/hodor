@@ -117,6 +117,12 @@ pub struct ProxyCfg {
   #[config(layer_attr(arg(long = "ca-file", help = "CA PEM path (default <config-dir>/hodor/ca.pem)")))]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub ca_file: Option<PathBuf>,
+  /// Extra upstream CA bundles trusted on egress, additive to webpki roots.
+  /// Entries extend this further with their own `root_cert`. Config file
+  /// only: one path per bundle.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub root_certs: Vec<PathBuf>,
   /// Seconds the pre-auth or handshake reads may wait on a peer before the
   /// connection closes: the TLS `ClientHello`, the HTTP head, the Postgres
   /// greeting, and the upstream `SSLRequest` answer all share this budget.
@@ -181,7 +187,7 @@ impl RuleCfg {
 }
 
 /// Per-entry TLS configuration, keyed by the rule's own `allow` entry string.
-/// The proxy reads `client_cert`, `client_key` and `guest_tls_mode`;
+/// The proxy reads `client_cert`, `client_key`, `root_cert` and `guest_tls_mode`;
 /// `guest_cert` and `guest_key` are compose-only mount targets inside the
 /// guest container and no proxy behavior reads them.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -193,6 +199,10 @@ pub struct HostTlsCfg {
   /// Upstream client key, paired with `client_cert`.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub client_key: Option<PathBuf>,
+  /// Upstream CA bundle trusting this entry's host, additive to the global
+  /// egress trust (webpki roots plus the hodor CA).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub root_cert: Option<PathBuf>,
   /// How the guest leg treats client certificates.
   #[serde(default)]
   pub guest_tls_mode: crate::grants::GuestTlsMode,

@@ -93,6 +93,11 @@ env = "GH_TOKEN"
 value = "$REAL"
 registry = false
 allow = ["https://api:8443", "tcp://$API_IP:9000"]
+
+# The api leaf is signed by the loaded CA itself: egress trusts it per
+# entry, since the hodor CA is no egress anchor.
+[rules.demo.tls."https://api:8443"]
+root_cert = "$certs/ca.crt"
 EOF
 
 # API server (validates only the real token) inside the namespace.

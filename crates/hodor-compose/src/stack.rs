@@ -853,6 +853,7 @@ mod tests {
       hodor_config::config::HostTlsCfg {
         client_cert: None,
         client_key: None,
+        root_cert: None,
         guest_tls_mode: GuestTlsMode::Mtls,
         guest_cert: guest_cert.map(PathBuf::from),
         guest_key: guest_key.map(PathBuf::from),

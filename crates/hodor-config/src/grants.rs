@@ -302,6 +302,9 @@ pub struct EndpointScope {
   pub client_cert: Option<PathBuf>,
   /// PEM client key for upstream mTLS, when the entry names one.
   pub client_key: Option<PathBuf>,
+  /// Upstream CA bundle trusting this entry's host, additive to the global
+  /// egress trust (rule table, not the URL).
+  pub root_cert: Option<PathBuf>,
   /// How the guest leg treats client certificates (rule table, not the URL).
   pub guest_tls: GuestTlsMode,
 }
@@ -432,6 +435,7 @@ impl FromStr for EndpointScope {
       port,
       client_cert: None,
       client_key: None,
+      root_cert: None,
       guest_tls: GuestTlsMode::default(),
     })
   }
@@ -649,6 +653,9 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
             "rule `{label}`: postgres states the upstream identity in its libpq URL (`sslcert`/`sslkey`), never in the rule table"
           );
         }
+        if tls.root_cert.is_some() {
+          eyre::bail!("rule `{label}`: postgres states upstream trust in its libpq URL (`sslrootcert`), never in the rule table");
+        }
         scope.guest_tls = tls.guest_tls_mode;
       }
       // The wire needles are the credentials: fake password in, real
@@ -685,6 +692,7 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
         }
         scope.client_cert.clone_from(&tls.client_cert);
         scope.client_key.clone_from(&tls.client_key);
+        scope.root_cert.clone_from(&tls.root_cert);
         scope.guest_tls = tls.guest_tls_mode;
       }
       parsed.push((entry, scope));
@@ -792,6 +800,7 @@ mod tests {
       proxy: crate::config::ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
       workspace: crate::config::WorkspaceCfg::default(),
@@ -842,6 +851,7 @@ mod tests {
       proxy: crate::config::ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
       workspace: crate::config::WorkspaceCfg::default(),
@@ -872,6 +882,7 @@ mod tests {
       proxy: crate::config::ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
       workspace: crate::config::WorkspaceCfg::default(),
@@ -1001,6 +1012,7 @@ mod tests {
       crate::config::HostTlsCfg {
         client_cert: Some(PathBuf::from("/c.pem")),
         client_key: Some(PathBuf::from("/c.key")),
+        root_cert: None,
         guest_tls_mode: GuestTlsMode::Mtls,
         guest_cert: Some(PathBuf::from("/in/cert.pem")),
         guest_key: Some(PathBuf::from("/in/key.pem")),
@@ -1025,6 +1037,7 @@ mod tests {
     let entry = || crate::config::HostTlsCfg {
       client_cert: None,
       client_key: None,
+      root_cert: None,
       guest_tls_mode: GuestTlsMode::Mtls,
       guest_cert: Some(PathBuf::from("/in/cert.pem")),
       guest_key: Some(PathBuf::from("/in/key.pem")),
@@ -1064,6 +1077,7 @@ mod tests {
       crate::config::HostTlsCfg {
         client_cert: None,
         client_key: None,
+        root_cert: None,
         guest_tls_mode: GuestTlsMode::default(),
         guest_cert: None,
         guest_key: None,

@@ -105,6 +105,7 @@ mod tests {
       proxy: crate::config::ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
       workspace: crate::config::WorkspaceCfg::default(),

@@ -19,6 +19,14 @@ ca_file = "/certs/ca.pem"
 env = "GH_TOKEN"
 allow = ["https://api:8443", "http://api:8000", "tcp://10.202.0.20:9000", "https://api:9443"]
 
+# The api leaf is signed by the loaded CA itself: egress trusts it per
+# entry, since the hodor CA is no egress anchor.
+[rules.demo.tls."https://api:8443"]
+root_cert = "/certs/ca.crt"
+
+[rules.demo.tls."https://api:9443"]
+root_cert = "/certs/ca.crt"
+
 # Real PostgreSQL on the server net, as a connection-string rule: the rule
 # states only the fake — a proper `postgres://` URL, so the env var the
 # guest reads holds a URL — and the real connection string lives in the

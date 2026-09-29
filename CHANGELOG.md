@@ -1,8 +1,18 @@
+## [0.4.0] - 2026-09-29
+
+### 🚀 Features
+
+- Upstream rama plus per-entry egress trust bump:minor (#40)
 ## [0.3.0] - 2026-09-28
 
 ### 🚀 Features
 
 - *(config)* Mount tool configs from inheritable profiles (#39)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.0 [ci skip]
+- Release
 ## [0.2.2] - 2026-09-27
 
 ### ⚙️ Miscellaneous Tasks

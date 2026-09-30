@@ -49,7 +49,7 @@ kubectl config unset "users.$user.client-key-data" >/dev/null
 
 # One leg: init a workspace against a kubeconfig source, serve host-side, and
 # prove the three states — real works direct, decoy fails direct, decoy works
-# through the proxy. Host-side serve cannot resolve the /hodor/kube container
+# through the proxy. Host-side serve cannot resolve the /hodor/grants container
 # mount, so the layer runs as a copy with host paths; substitution behavior
 # is unaffected by the prefix.
 run_leg() {
@@ -63,7 +63,7 @@ run_leg() {
   XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$hodor" init --backend tproxy "$ws"
   shopt -s nullglob
   kubedirs=()
-  for d in "$statedir"/hodor/ws/*/kube; do kubedirs+=("$d"); done
+  for d in "$statedir"/hodor/ws/*/grants; do kubedirs+=("$d"); done
   decoys=()
   for d in "$statedir"/hodor/ws/*/files/00-*; do decoys+=("$d"); done
   shopt -u nullglob
@@ -72,7 +72,7 @@ run_leg() {
     exit 1
   fi
   local kubedir=${kubedirs[0]} decoy=${decoys[0]}
-  sed "s|/hodor/kube|$kubedir|" "$kubedir/hodor.toml" >"$scratch/host-layer-$name.toml"
+  sed "s|/hodor/grants|$kubedir|" "$kubedir/hodor.toml" >"$scratch/host-layer-$name.toml"
   cp "$decoy" "$scratch/proxy-$name.yaml"
   local context
   context=$(KUBECONFIG="$source" kubectl config current-context)

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -15,8 +16,8 @@ use validator::{Validate, ValidationError};
 use crate::cli::Cli;
 use crate::error::Error;
 use crate::grants::{EndpointScope, GuestTlsMode, HostPat};
-use crate::plugins::PluginCfg;
-use crate::registry::{OAuthFlow, validate_flow};
+use crate::plugins::{PluginCfg, PluginDirection};
+use crate::registry::{FlowKind, OAuthFlow, validate_flow};
 use code_workspace::{Workspace, resolve_root};
 
 /// Pattern used when neither the rule nor the registry supplies one.
@@ -137,11 +138,13 @@ pub struct FileRewrite {
   /// expands to `[workspace] home` and `$VAR` expands first.
   pub dest: String,
   /// Env names whose real values are replaced by their decoys in the file.
-  /// Empty for kubeconfig sources: the adapter knows where the secrets live.
+  /// Empty for the known config formats (`kubeconfig`, `talos`): the
+  /// adapter knows where the secrets live.
   #[serde(default)]
   pub envs: Vec<String>,
-  /// Declared format, skipping detection. More formats later; unknown files
-  /// keep the raw byte-swap when this is absent.
+  /// Declared format, skipping detection. Known formats: `kubeconfig`
+  /// (kubectl), `talos` (talosctl). More formats later; unknown files keep
+  /// the raw byte-swap when this is absent.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub format: Option<RewriteFormat>,
 }
@@ -152,6 +155,17 @@ pub struct FileRewrite {
 pub enum RewriteFormat {
   /// Kubectl config: structural grant derivation plus decoy twin.
   Kubeconfig,
+  /// Talos client config: structural grant derivation plus decoy twin.
+  Talos,
+}
+
+impl fmt::Display for RewriteFormat {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Kubeconfig => "kubeconfig",
+      Self::Talos => "talos",
+    })
+  }
 }
 
 /// Proxy listener settings (CLI/env/file overlay).
@@ -804,7 +818,7 @@ pub fn reference_samples() -> String {
   #[derive(Serialize)]
   struct Samples<'a> {
     rules: BTreeMap<&'a str, RuleCfg>,
-    plugins: BTreeMap<&'a str, crate::plugins::PluginCfg>,
+    plugins: BTreeMap<&'a str, PluginCfg>,
     tools: BTreeMap<&'a str, ToolCfg>,
     workspace: WorkspaceSamples,
   }
@@ -835,7 +849,7 @@ pub fn reference_samples() -> String {
     ],
     pattern: Some("example_{hex:32}".to_string()),
     oauth2: Some(OAuthFlow {
-      flow: crate::registry::FlowKind::ClientCredentials,
+      flow: FlowKind::ClientCredentials,
       token_url: "https://auth.example/token".to_string(),
       authorize_url: Some("https://auth.example/authorize".to_string()),
       refresh_url: Some("https://auth.example/refresh".to_string()),
@@ -850,10 +864,10 @@ pub fn reference_samples() -> String {
     rules: [("example", rule)].into_iter().collect(),
     plugins: [(
       "example",
-      crate::plugins::PluginCfg {
+      PluginCfg {
         path: "target/plugins/example.wasm".into(),
         allow: vec!["https://api.example".to_string()],
-        direction: crate::plugins::PluginDirection::Both,
+        direction: PluginDirection::Both,
       },
     )]
     .into_iter()

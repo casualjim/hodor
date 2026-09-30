@@ -20,12 +20,14 @@ use hodor_pki::ca::{CertAuthority, load_or_generate, load_or_generate_client_pai
 use libc::getuid;
 use xpanda::Xpanda;
 
+use crate::adapt::{self, GRANTS_STATE_DIR, RewriteAdapted, sniff};
 use crate::error::Error;
 use crate::expand::{
   apply_rewrites, block_on, build_expander, collect_referenced_variables, expand_path, expand_value, resolution_env, rewrite_file_name,
 };
-use crate::kube::{self, KubeAdapted};
+use crate::kube;
 use crate::paths::{Mount, covering, expand, translate};
+use crate::talos;
 
 /// Revision of the generated stack's shape. Bump whenever what
 /// [`Stack::render`] emits changes in a way an existing stack must pick up —
@@ -35,8 +37,9 @@ use crate::paths::{Mount, covering, expand, translate};
 /// the bundled command never leaves the old wiring behind. Shape 2 adds the
 /// `fwd` exposure sidecar, `[workspace] ports`, and `HODOR_LISTEN`. Shape 3
 /// mounts profiles instead of agent directories, and adds `[workspace]
-/// passthrough` interpolation and `file_rewrite` mounts.
-pub(crate) const STACK_SHAPE: u32 = 3;
+/// passthrough` interpolation and `file_rewrite` mounts. Shape 4 mounts the
+/// tool-config grant layer at `/hodor/grants` instead of `/hodor/kube`.
+pub(crate) const STACK_SHAPE: u32 = 4;
 
 /// The shape revision a generated stack carries, from its `# stack shape:`
 /// marker line; `None` for a file without a readable one, which is a stack
@@ -379,14 +382,14 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
     kube_ca: kube_ca.as_ref(),
     guests_dir: &guests_dir,
   })?;
-  let kube_state = workspace_state_dir(root).join("kube");
-  kube::write_state(&kube_state, &rewritten.kube)?;
-  let kube_mounts = if rewritten.kube.is_empty() {
+  let grants_state = workspace_state_dir(root).join("grants");
+  adapt::write_state(&grants_state, &rewritten.grants)?;
+  let grants_mounts = if rewritten.grants.is_empty() {
     Vec::new()
   } else {
     vec![Mount {
-      host: kube_state,
-      container: PathBuf::from(kube::KUBE_STATE_DIR),
+      host: grants_state,
+      container: PathBuf::from(GRANTS_STATE_DIR),
       ro: true,
     }]
   };
@@ -439,7 +442,7 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
       ports: config.workspace.ports.clone(),
       passthrough: config.workspace.passthrough.clone(),
       file_mounts: rewritten.mounts,
-      kube_mounts,
+      grants_mounts,
       hodor_version,
     }
     .render(),
@@ -472,14 +475,14 @@ pub(crate) struct RewriteInputs<'a> {
   pub(crate) guests_dir: &'a Path,
 }
 
-/// What `write_rewrites` produces: the agent mounts plus the kube grants
-/// whose fragments land in the state grant layer.
+/// What `write_rewrites` produces: the agent mounts plus the tool-config
+/// grants whose fragments land in the state grant layer.
 #[derive(Debug)]
 pub(crate) struct RewriteOutputs {
   /// Read-only mounts of the rewritten files at their dests.
   pub(crate) mounts: Vec<Mount>,
-  /// Kube grants adapted from kubeconfig sources.
-  pub(crate) kube: Vec<KubeAdapted>,
+  /// Grants adapted from kubeconfig and talosconfig sources.
+  pub(crate) grants: Vec<RewriteAdapted>,
 }
 
 /// Rewrite each `file_rewrite` source with decoys and write the outputs under
@@ -510,7 +513,7 @@ pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> Result<RewriteOutputs
   if rewrites.is_empty() {
     return Ok(RewriteOutputs {
       mounts: Vec::new(),
-      kube: Vec::new(),
+      grants: Vec::new(),
     });
   }
   let by_env: BTreeMap<&str, &str> = decoys.iter().map(|decoy| (decoy.env.as_str(), decoy.value.as_str())).collect();
@@ -519,7 +522,7 @@ pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> Result<RewriteOutputs
     source,
   })?;
   let mut mounts = Vec::new();
-  let mut kube = Vec::new();
+  let mut grants = Vec::new();
   let mut owned_ca: Option<CertAuthority> = None;
   for (index, rewrite) in rewrites.iter().enumerate() {
     let mut pairs = Vec::new();
@@ -543,49 +546,49 @@ pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> Result<RewriteOutputs
       path: host.clone(),
       source,
     })?;
-    let stated_kube = matches!(rewrite.format, Some(RewriteFormat::Kubeconfig));
-    let out_bytes = if stated_kube || kube::sniff(&content) {
-      if !rewrite.envs.is_empty() {
-        return Err(Error::KubeWithEnvs {
-          file: rewrite.source.clone(),
-        });
-      }
-      let ca: &CertAuthority = if let Some(ca) = preloaded_ca {
-        ca
-      } else {
-        let ca_path = config_dir()
-          .ok_or_else(|| Error::ConfigDir {
-            detail: "a kubeconfig rewrite needs the hodor config directory to load the CA from".to_string(),
-          })?
-          .join("ca.pem");
-        owned_ca.insert(load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
-          path: ca_path.clone(),
-          source,
-        })?)
-      };
-      let adapted = kube::adapt(&host, &content, ca, guests_dir).map_err(|err| match err {
-        Error::KubeYaml { file, source } if stated_kube => Error::KubeInvalid {
-          file,
-          detail: format!("states `format = \"kubeconfig\"` but does not parse as YAML: {source}"),
-        },
-        err => err,
-      })?;
-      match adapted {
-        Some(adapted) => {
-          let bytes = adapted.decoy.clone().into_bytes();
-          kube.push(adapted);
-          bytes
-        }
-        None if stated_kube => {
-          return Err(Error::KubeInvalid {
-            file: host.clone(),
-            detail: "states `format = \"kubeconfig\"` but the document is not a kubeconfig".to_string(),
+    let format = rewrite.format.or_else(|| sniff(&content));
+    let out_bytes = match format {
+      Some(format) => {
+        if !rewrite.envs.is_empty() {
+          return Err(Error::RewriteWithEnvs {
+            file: rewrite.source.clone(),
+            format,
           });
         }
-        None => apply_rewrites(&content, &pairs),
+        let ca: &CertAuthority = if let Some(ca) = preloaded_ca {
+          ca
+        } else {
+          let ca_path = config_dir()
+            .ok_or_else(|| Error::ConfigDir {
+              detail: "an adapted rewrite needs the hodor config directory to load the CA from".to_string(),
+            })?
+            .join("ca.pem");
+          owned_ca.insert(load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
+            path: ca_path.clone(),
+            source,
+          })?)
+        };
+        let adapted = match format {
+          RewriteFormat::Kubeconfig => kube::adapt(&host, &content, ca, guests_dir)?,
+          RewriteFormat::Talos => Some(talos::adapt(&host, &content, ca, guests_dir)?),
+        };
+        match adapted {
+          Some(adapted) => {
+            let bytes = adapted.decoy.clone().into_bytes();
+            grants.push(adapted);
+            bytes
+          }
+          None if rewrite.format.is_some() => {
+            return Err(Error::RewriteInvalid {
+              file: host.clone(),
+              format,
+              detail: "the document does not carry the format's markers".to_string(),
+            });
+          }
+          None => apply_rewrites(&content, &pairs),
+        }
       }
-    } else {
-      apply_rewrites(&content, &pairs)
+      None => apply_rewrites(&content, &pairs),
     };
     let out_path = files_dir.join(rewrite_file_name(index, &host));
     fs::write(&out_path, out_bytes).map_err(|source| Error::WriteFile {
@@ -604,7 +607,7 @@ pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> Result<RewriteOutputs
       ro: true,
     });
   }
-  Ok(RewriteOutputs { mounts, kube })
+  Ok(RewriteOutputs { mounts, grants })
 }
 
 /// The process's user id, from the kernel: the same value `id -u` prints,
@@ -738,10 +741,11 @@ pub(crate) struct Stack<'a> {
   /// Rewritten files mounted read-only at their dests, from
   /// `[workspace] file_rewrite`; after workspace mounts so they win.
   pub(crate) file_mounts: Vec<Mount>,
-  /// Upstream identity files kube grants materialize: mounted into the hodor
-  /// service at their absolute paths, so host and container serve resolve
-  /// the same fragment entries. Never into the agent: real secrets stay out.
-  pub(crate) kube_mounts: Vec<Mount>,
+  /// Upstream identity files adapter grants materialize: mounted into the
+  /// hodor service at their absolute paths, so host and container serve
+  /// resolve the same fragment entries. Never into the agent: real secrets
+  /// stay out.
+  pub(crate) grants_mounts: Vec<Mount>,
   /// Hodor image tag: the binary's version, threaded from the binary crate.
   /// Library crates version independently, so `env!` here would lie.
   pub(crate) hodor_version: &'a str,
@@ -752,10 +756,10 @@ impl Stack<'_> {
   pub(crate) fn render(&self) -> String {
     let (serve, extra_caps, service_extra) = backend_service(self.backend, &self.project);
     let mut out = String::new();
-    let kube_env = if self.kube_mounts.is_empty() {
+    let grants_env = if self.grants_mounts.is_empty() {
       String::new()
     } else {
-      format!("      HODOR_CONFIG: {}/hodor.toml\n", kube::KUBE_STATE_DIR)
+      format!("      HODOR_CONFIG: {GRANTS_STATE_DIR}/hodor.toml\n")
     };
     let _ = write!(
       out,
@@ -764,8 +768,8 @@ impl Stack<'_> {
        # workspace config or the shape above changed since it was generated.\n\
        # hodor merges config like always\n\
        # (global layer plus this workspace's .config/hodor/config.toml, discovered
-       # from its working directory, plus the generated kube grant layer when a
-       # rewrite adapts one); the agent holds decoys only.\n\
+       # from its working directory, plus the generated tool-config grant layer
+       # when a rewrite adapts one); the agent holds decoys only.\n\
        name: {project}\n\
        services:\n\
        \x20 hodor:\n\
@@ -779,7 +783,7 @@ impl Stack<'_> {
        \x20     # 8080 must stay free on loopback: agent dev servers default\n\
        \x20     # to it, and the explicit proxy's default bind would squat on\n\
        \x20     # 127.0.0.1:8080, leaving the fwd sidecar nothing to expose.\n\
-       \x20     HODOR_LISTEN: {listen}\n{kube_env}",
+       \x20     HODOR_LISTEN: {listen}\n{grants_env}",
       root = self.agent.root.display(),
       project = self.project,
       listen = EXPLICIT_LISTEN,
@@ -822,7 +826,7 @@ impl Stack<'_> {
     for mount in &self.fnox.mounts {
       let _ = writeln!(out, "      - {}:{}:ro", mount.host.display(), mount.container.display());
     }
-    for mount in &self.kube_mounts {
+    for mount in &self.grants_mounts {
       let _ = writeln!(out, "      - {}:{}:ro", mount.host.display(), mount.container.display());
     }
     out.push_str(&self.agent_service());

@@ -11,33 +11,19 @@
 //! destination the identity) and swaps the trust and identity: hodor's CA,
 //! the minted guest pair, and the decoy token.
 
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
+use std::collections::BTreeMap;
 use std::fs;
-#[cfg(unix)]
-use std::fs::Permissions;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hodor_config::grants::{EndpointScope, Scheme, decoy_for_rule};
+use hodor_config::config::{HostTlsCfg, RewriteFormat};
+use hodor_config::grants::{EndpointScope, GuestTlsMode, Scheme, decoy_for_rule};
 use hodor_pki::ca::{CertAuthority, load_or_generate_client_pair};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, from_str};
 
+use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment, rewrite_label};
 use crate::error::Error;
-
-/// A kubeconfig rewrite mapped onto its grant fragment and decoy twin.
-#[derive(Debug)]
-pub(crate) struct KubeAdapted {
-  /// Grant fragment TOML, holding the real credential.
-  pub(crate) fragment: String,
-  /// Decoy kubeconfig for the agent: same server, hodor CA, guest pair.
-  pub(crate) decoy: String,
-  /// Blobs to write beside the fragment: `(file name, bytes)`.
-  pub(crate) materialized: Vec<(String, Vec<u8>)>,
-}
 
 /// A kubeconfig document; unknown fields ignored.
 #[derive(Debug, Deserialize, Default)]
@@ -159,15 +145,6 @@ struct KubeProviderConfig {
   access_token: Option<String>,
 }
 
-/// Whether a rewrite source takes the adapter path without a stated format:
-/// both markers are kubectl-specific, so anything carrying them is probed as
-/// a kubeconfig. A stated `format` skips this probe.
-#[must_use]
-pub(crate) fn sniff(content: &[u8]) -> bool {
-  let text = String::from_utf8_lossy(content);
-  text.contains("current-context:") && text.contains("clusters:")
-}
-
 /// Map a kubeconfig onto its grant fragment and decoy twin. Returns `None`
 /// when the document is not a kubeconfig after all, leaving the caller on
 /// the raw path.
@@ -177,9 +154,9 @@ pub(crate) fn sniff(content: &[u8]) -> bool {
 /// Returns an error when the document does not parse, names no usable
 /// current context, states a non-HTTPS server, or carries no substitutable
 /// credential.
-pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<Option<KubeAdapted>, Error> {
+pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
   let text = String::from_utf8_lossy(content);
-  let doc: KubeDoc = from_str(&text).map_err(|err| Error::KubeYaml {
+  let doc: KubeDoc = from_str(&text).map_err(|err| Error::RewriteYaml {
     file: source.to_path_buf(),
     source: err,
   })?;
@@ -187,7 +164,11 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     return Ok(None);
   }
   let file = || source.to_path_buf();
-  let invalid = |detail: String| Error::KubeInvalid { file: file(), detail };
+  let invalid = |detail: String| Error::RewriteInvalid {
+    file: file(),
+    format: RewriteFormat::Kubeconfig,
+    detail,
+  };
   if doc.current_context.is_empty() {
     return Err(invalid("missing `current-context`".to_string()));
   }
@@ -243,8 +224,13 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
   if user.user.exec.is_some() && token.is_none() && user.user.cert_data.is_none() && user.user.key_data.is_none() {
     return Err(invalid("exec credential plugins are not supported".to_string()));
   }
-  let cert = decode(source, user.user.cert_data.as_deref(), "client-certificate-data")?;
-  let key = decode(source, user.user.key_data.as_deref(), "client-key-data")?;
+  let cert = decode(
+    source,
+    RewriteFormat::Kubeconfig,
+    user.user.cert_data.as_deref(),
+    "client-certificate-data",
+  )?;
+  let key = decode(source, RewriteFormat::Kubeconfig, user.user.key_data.as_deref(), "client-key-data")?;
   if cert.is_some() != key.is_some() {
     return Err(invalid(format!("user `{}` carries half of the client pair", user.name)));
   }
@@ -254,8 +240,13 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       user.name
     )));
   }
-  let ca_bundle = decode(source, cluster.cluster.ca_data.as_deref(), "certificate-authority-data")?;
-  let label = kube_label(source, &doc.current_context)?;
+  let ca_bundle = decode(
+    source,
+    RewriteFormat::Kubeconfig,
+    cluster.cluster.ca_data.as_deref(),
+    "certificate-authority-data",
+  )?;
+  let label = rewrite_label(source, RewriteFormat::Kubeconfig, &doc.current_context)?;
   let env = label.to_uppercase().replace('-', "_");
   // Identity-only grants (cert auth, no bearer) still need a value to
   // resolve; the certificate never reaches the wire as application data, so
@@ -275,209 +266,135 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     source,
   })?;
   let mut materialized = Vec::new();
-  let mut tls = String::new();
-  let _ = writeln!(tls, "[rules.{label}.tls.\"{}\"]", escaped(&cluster.cluster.server));
+  let mut tls = HostTlsCfg {
+    client_cert: None,
+    client_key: None,
+    root_cert: None,
+    guest_tls_mode: GuestTlsMode::Mtls,
+    guest_cert: None,
+    guest_key: None,
+  };
   if let (Some(cert), Some(key)) = (cert, key) {
     let cert_name = format!("{label}.client.crt");
     let key_name = format!("{label}.client.key");
-    let _ = writeln!(
-      tls,
-      "client_cert = \"{KUBE_STATE_DIR}/rules.d/{cert_name}\"\nclient_key = \"{KUBE_STATE_DIR}/rules.d/{key_name}\"",
-    );
+    tls.client_cert = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}")));
+    tls.client_key = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}")));
     materialized.push((cert_name, cert));
     materialized.push((key_name, key));
   }
   if let Some(ca_bundle) = ca_bundle {
     let ca_name = format!("{label}.ca.crt");
-    let _ = writeln!(tls, "root_cert = \"{KUBE_STATE_DIR}/rules.d/{ca_name}\"");
+    tls.root_cert = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{ca_name}")));
     materialized.push((ca_name, ca_bundle));
   }
-  tls.push_str("guest_tls_mode = \"mtls\"\n");
-  let fragment = format!(
-    "# generated by `hodor init` from {} — do not edit or commit: it holds the REAL credential.\n# Regenerated when the workspace config changes.\n[rules.{label}]\nenv = \"{env}\"\nregistry = false\nallow = [\"{}\"]\nvalue = \"{}\"\n{tls}",
-    source.display(),
-    escaped(&cluster.cluster.server),
-    escaped(&value),
+  let fragment = render_fragment(
+    source,
+    &label,
+    &GrantFragment {
+      env,
+      registry: false,
+      allow: vec![cluster.cluster.server.clone()],
+      value,
+      tls: BTreeMap::from([(cluster.cluster.server.clone(), tls)]),
+    },
   );
-  let decoy = render_decoy(
-    &doc.current_context,
-    &cluster.name,
-    &user.name,
-    &cluster.cluster.server,
-    &STANDARD.encode(ca.cert_pem()),
-    token.map(|_| decoy_token.as_str()),
-    &STANDARD.encode(&guest_cert),
-    &STANDARD.encode(&guest_key),
-  );
-  Ok(Some(KubeAdapted {
+  let decoy = render_decoy(&DecoyDoc {
+    api_version: "v1".to_string(),
+    kind: "Config".to_string(),
+    current_context: doc.current_context.clone(),
+    contexts: vec![DecoyContextEntry {
+      name: doc.current_context.clone(),
+      context: DecoyContextRef {
+        cluster: cluster.name.clone(),
+        user: user.name.clone(),
+      },
+    }],
+    clusters: vec![DecoyClusterEntry {
+      name: cluster.name.clone(),
+      cluster: DecoyCluster {
+        server: cluster.cluster.server.clone(),
+        certificate_authority_data: STANDARD.encode(ca.cert_pem()),
+      },
+    }],
+    users: vec![DecoyUserEntry {
+      name: user.name.clone(),
+      user: DecoyUser {
+        token: token.map(|_| decoy_token.clone()),
+        client_certificate_data: STANDARD.encode(&guest_cert),
+        client_key_data: STANDARD.encode(&guest_key),
+      },
+    }],
+  });
+  Ok(Some(RewriteAdapted {
     fragment,
     decoy,
     materialized,
   }))
 }
 
-/// Decode an optional base64 blob, erroring on invalid input.
-fn decode(source: &Path, data: Option<&str>, field: &str) -> Result<Option<Vec<u8>>, Error> {
-  data
-    .filter(|data| !data.is_empty())
-    .map(|data| {
-      STANDARD.decode(data.trim()).map_err(|_| Error::KubeInvalid {
-        file: source.to_path_buf(),
-        detail: format!("field `{field}` is not valid base64"),
-      })
-    })
-    .transpose()
+/// The agent's decoy kubeconfig: same server, hodor CA, guest pair, and the
+/// decoy token when the real user carries one. Field order matches what
+/// kubectl emits for familiarity; unknown fields are absent.
+#[derive(Serialize)]
+struct DecoyDoc {
+  #[serde(rename = "apiVersion")]
+  api_version: String,
+  kind: String,
+  #[serde(rename = "current-context")]
+  current_context: String,
+  contexts: Vec<DecoyContextEntry>,
+  clusters: Vec<DecoyClusterEntry>,
+  users: Vec<DecoyUserEntry>,
 }
 
-/// Grant label from the source path and context: `{path-slug}-{context}`.
-fn kube_label(source: &Path, context: &str) -> Result<String, Error> {
-  let invalid = |detail: String| Error::KubeInvalid {
-    file: source.to_path_buf(),
-    detail,
-  };
-  let parent = source.parent().ok_or_else(|| invalid("has no parent directory".to_string()))?;
-  let stem = source
-    .file_stem()
-    .map(|stem| stem.to_string_lossy())
-    .ok_or_else(|| invalid("has no file name".to_string()))?;
-  let path_slug = crate::stack::workspace_slug(parent);
-  let slug = |text: &str| {
-    let cleaned: String = text
-      .to_lowercase()
-      .chars()
-      .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-      .collect();
-    cleaned.trim_matches('-').to_string()
-  };
-  if path_slug.is_empty() || slug(&stem).is_empty() || slug(context).is_empty() {
-    return Err(invalid("path or context sluggifies to nothing".to_string()));
-  }
-  Ok(format!("{}-{}-{}", path_slug, slug(&stem), slug(context)))
+#[derive(Serialize)]
+struct DecoyContextEntry {
+  name: String,
+  context: DecoyContextRef,
 }
 
-/// Render the agent's decoy kubeconfig: same server, hodor CA, guest pair,
-/// and the decoy token when the real user carries one.
-#[allow(clippy::too_many_arguments, reason = "one scalar per kubeconfig field the decoy renders")]
-fn render_decoy(
-  context: &str,
-  cluster: &str,
-  user: &str,
-  server: &str,
-  ca_b64: &str,
-  token: Option<&str>,
-  cert_b64: &str,
-  key_b64: &str,
-) -> String {
-  let mut out = String::new();
-  out.push_str("# generated by `hodor init` — decoys only, safe to inspect.\n");
-  out.push_str(&format!(
-    "apiVersion: v1\nkind: Config\ncurrent-context: {context}\ncontexts:\n- name: {context}\n  context: {{cluster: {cluster}, user: {user}}}\nclusters:\n- name: {cluster}\n  cluster: {{server: \"{}\", certificate-authority-data: {ca_b64}}}\nusers:\n- name: {user}\n  user: {{",
-    escaped(server),
-  ));
-  if let Some(token) = token {
-    out.push_str(&format!("token: \"{}\", ", escaped(token)));
-  }
-  out.push_str(&format!("client-certificate-data: {cert_b64}, client-key-data: {key_b64}}}\n"));
-  out
+#[derive(Serialize)]
+struct DecoyContextRef {
+  cluster: String,
+  user: String,
 }
 
-/// Escape a string for a TOML basic string or a YAML double-quoted scalar.
-fn escaped(text: &str) -> String {
-  let mut out = String::with_capacity(text.len());
-  for c in text.chars() {
-    match c {
-      '\\' => out.push_str("\\\\"),
-      '"' => out.push_str("\\\""),
-      '\n' => out.push_str("\\n"),
-      '\r' => out.push_str("\\r"),
-      '\t' => out.push_str("\\t"),
-      c => out.push(c),
-    }
-  }
-  out
+#[derive(Serialize)]
+struct DecoyClusterEntry {
+  name: String,
+  cluster: DecoyCluster,
 }
 
-/// Container path the kube grant layer mounts at in the hodor service. The
-/// fragment names blobs under it; host and container serve resolve the same
-/// entries because the state dir mounts there.
-pub(crate) const KUBE_STATE_DIR: &str = "/hodor/kube";
-
-/// Write the kube grant layer: the grant fragments concatenated into the
-/// marker global config, plus the blobs under `rules.d`, pruning stale
-/// `kube-*` files so a removed rewrite stops granting. The hodor service
-/// points `HODOR_CONFIG` at the marker, adding this layer without touching
-/// user config.
-///
-/// # Errors
-///
-/// Returns an error when the directory, the marker, or a blob cannot be
-/// written, or when a stale file cannot be pruned.
-pub(crate) fn write_state(state_dir: &Path, adapted: &[KubeAdapted]) -> Result<(), Error> {
-  let marker = state_dir.join("hodor.toml");
-  let rules_dir = state_dir.join("rules.d");
-  if adapted.is_empty() && !marker.is_file() {
-    return Ok(());
-  }
-  fs::create_dir_all(&rules_dir).map_err(|source| Error::CreateDir {
-    path: rules_dir.clone(),
-    source,
-  })?;
-  let mut toml = String::from("# generated by `hodor init`: kubeconfig grant layer. `HODOR_CONFIG` points here in the hodor service.\n");
-  let mut current = BTreeSet::new();
-  for grant in adapted {
-    toml.push_str(&grant.fragment);
-    for (name, bytes) in &grant.materialized {
-      write_secret(&rules_dir.join(name), bytes)?;
-      current.insert(name.clone());
-    }
-  }
-  write_secret(&marker, toml.as_bytes())?;
-  for entry in fs::read_dir(&rules_dir).map_err(|source| Error::ReadFile {
-    path: rules_dir.clone(),
-    source,
-  })? {
-    let path = entry
-      .map_err(|source| Error::ReadFile {
-        path: rules_dir.clone(),
-        source,
-      })?
-      .path();
-    if path.is_file()
-      && path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("kube-"))
-      && !current.contains(&path.file_name().expect("checked above").to_string_lossy().into_owned())
-    {
-      fs::remove_file(&path).map_err(|source| Error::RemoveFile {
-        path: path.clone(),
-        source,
-      })?;
-    }
-  }
-  Ok(())
+#[derive(Serialize)]
+struct DecoyCluster {
+  server: String,
+  #[serde(rename = "certificate-authority-data")]
+  certificate_authority_data: String,
 }
 
-/// Write a secret file the agent must never see: owner-only on unix.
-fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-  fs::write(path, bytes).map_err(|source| Error::WriteFile {
-    path: path.to_path_buf(),
-    source,
-  })?;
-  #[cfg(unix)]
-  fs::set_permissions(path, Permissions::from_mode(0o600)).map_err(|source| Error::WriteFile {
-    path: path.to_path_buf(),
-    source,
-  })?;
-  Ok(())
+#[derive(Serialize)]
+struct DecoyUserEntry {
+  name: String,
+  user: DecoyUser,
+}
+
+#[derive(Serialize)]
+struct DecoyUser {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  token: Option<String>,
+  #[serde(rename = "client-certificate-data")]
+  client_certificate_data: String,
+  #[serde(rename = "client-key-data")]
+  client_key_data: String,
 }
 
 #[cfg(test)]
 mod tests {
-  use std::collections::BTreeMap;
-
   use hodor_config::config::RuleCfg;
-  use hodor_config::grants::GuestTlsMode;
   use serde::Deserialize;
 
   use super::*;
+  use crate::adapt::write_state;
 
   const BEARER_DOC: &str = r"apiVersion: v1
 kind: Config
@@ -499,7 +416,7 @@ users:
     CertAuthority::generate().unwrap()
   }
 
-  fn adapt_doc(doc: &str) -> KubeAdapted {
+  fn adapt_doc(doc: &str) -> RewriteAdapted {
     let dir = tempfile::tempdir().unwrap();
     adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path())
       .expect("adapt parses")
@@ -516,23 +433,17 @@ users:
   }
 
   #[test]
-  fn sniffing_spots_kubeconfigs() {
-    let npmrc = "//registry.npmjs.org/:_authToken=real-secret-1\n";
-    assert!(!sniff(npmrc.as_bytes()));
-    assert!(sniff(BEARER_DOC.as_bytes()));
-  }
-
-  #[test]
   fn foreign_content_is_not_a_kubeconfig() {
+    let npmrc = "//registry.npmjs.org/:_authToken=secret";
     let dir = tempfile::tempdir().unwrap();
-    let npmrc = "//registry.npmjs.org/:_authToken=real-secret-1\n";
     let err = adapt(Path::new(SOURCE), npmrc.as_bytes(), &test_ca(), dir.path()).expect_err("plain text fails closed");
     assert!(err.to_string().contains("does not parse as YAML"), "{err}");
   }
 
   #[test]
   fn label_slugs_the_source_path_and_context() {
-    assert_eq!(kube_label(Path::new(SOURCE), "k3s-local").unwrap(), "home-ivan-kube-k3s-k3s-local");
+    let label = rewrite_label(Path::new(SOURCE), RewriteFormat::Kubeconfig, "k3s-local").expect("path slugs");
+    assert_eq!(label, "home-ivan-kube-k3s-k3s-local");
     let adapted = adapt_doc(BEARER_DOC);
     assert!(
       adapted.fragment.contains("[rules.home-ivan-kube-k3s-k3s-local]"),
@@ -570,7 +481,7 @@ users:
   #[test]
   fn decoy_keeps_the_server_and_swaps_trust_identity_and_token() {
     let adapted = adapt_doc(BEARER_DOC);
-    assert!(adapted.decoy.contains("server: \"https://10.0.0.1:6443\""), "{}", adapted.decoy);
+    assert!(adapted.decoy.contains("server: https://10.0.0.1:6443"), "{}", adapted.decoy);
     assert!(
       !adapted.decoy.contains("k3s-token"),
       "no real credential survives: {}",
@@ -578,7 +489,7 @@ users:
     );
     assert!(!adapted.decoy.contains("Q0E="), "no real CA survives: {}", adapted.decoy);
     assert!(!adapted.decoy.contains("Q0VSVA=="), "no real pair survives: {}", adapted.decoy);
-    assert!(adapted.decoy.contains("token: \""), "decoy token present: {}", adapted.decoy);
+    assert!(adapted.decoy.contains("token: "), "decoy token present: {}", adapted.decoy);
     assert!(
       adapted.decoy.contains("client-certificate-data: "),
       "guest pair present: {}",
@@ -662,14 +573,14 @@ users:
   fn state_writes_and_stale_ones_prune() {
     let adapted = adapt_doc(BEARER_DOC);
     let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("kube");
+    let state = dir.path().join("grants");
     write_state(&state, &[adapted]).unwrap();
     let rules = state.join("rules.d");
-    let marker = std::fs::read_to_string(state.join("hodor.toml")).unwrap();
+    let marker = fs::read_to_string(state.join("hodor.toml")).unwrap();
     assert!(marker.contains("[rules.home-ivan-kube-k3s-k3s-local]"), "{marker}");
     assert!(rules.join("home-ivan-kube-k3s-k3s-local.client.crt").is_file());
     let stale = rules.join("kube-gone.crt");
-    std::fs::write(&stale, "stale").unwrap();
+    fs::write(&stale, "stale").unwrap();
     write_state(&state, &[]).unwrap();
     assert!(!stale.exists(), "removed rewrites stop granting");
   }

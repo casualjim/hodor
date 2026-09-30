@@ -121,10 +121,10 @@ Host files rewritten with decoys and mounted read-only into the agent. Each list
 | --- | --- | --- |
 | `source` | yes | Host file to read. `~` and `$VAR` expand; relative paths resolve against the workspace root. |
 | `dest` | yes | Container path the rewritten file mounts at, read-only. `{home}` expands to `[workspace] home` and `$VAR` expands first. |
-| `envs` | no | Env names whose real values are replaced by their decoys in the file. Empty for kubeconfig sources: the adapter knows where the secrets live. |
-| `format` | no | Declared format, skipping detection. `format = "kubeconfig"` fails closed when the file does not parse as one. Absent, kubeconfigs are detected by content and other files keep the raw byte-swap. |
+| `envs` | no | Env names whose real values are replaced by their decoys in the file. Empty for the known config formats — `kubeconfig` (kubectl) and `talos` (talosctl): the adapter knows where the secrets live. |
+| `format` | no | Declared format, skipping detection. Known: `format = "kubeconfig"` and `format = "talos"`, each failing closed when the file does not parse as one. Absent, both are detected by content and other files keep the raw byte-swap. |
 
-A kubeconfig source is adapted rather than byte-swapped: the API server URL becomes an `https://` allow entry, the client certificate and key materialize into a per-entry TLS identity, the cluster CA becomes that entry's `root_cert`, and the generated decoy kubeconfig points at the same server but carries the hodor CA plus a minted guest pair. Grant labels derive from the source path and context.
+A kubeconfig source is adapted rather than byte-swapped: the API server URL becomes an `https://` allow entry, the client certificate and key materialize into a per-entry TLS identity, the cluster CA becomes that entry's `root_cert`, and the generated decoy kubeconfig points at the same server but carries the hodor CA plus a minted guest pair. Grant labels derive from the source path and context. A talosconfig source adapts the same way: each endpoint becomes an `https://` allow entry (bare endpoints gain the Talos API port 50000), the client pair and cluster CA materialize into the TLS identity, and the decoy keeps the endpoints and nodes but carries the hodor CA plus a minted guest pair. Omni `auth:` blocks carry no substitutable pair and fail closed.
 
 ```toml
 [[workspace.file_rewrite]]

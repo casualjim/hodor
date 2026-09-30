@@ -3,6 +3,7 @@
 use std::io::Error as IoError;
 use std::path::PathBuf;
 
+use hodor_config::config::RewriteFormat;
 use serde_yaml::Error as YamlError;
 use toml_edit::TomlError;
 
@@ -137,26 +138,30 @@ pub enum Error {
     /// Offending dest.
     dest: String,
   },
-  /// A kubeconfig rewrite names envs: the file is the source, drop `envs`.
-  #[error("file rewrite `{}` is a kubeconfig: the file is the source, drop `envs`", file.display())]
-  KubeWithEnvs {
+  /// An adapted rewrite names envs: the file is the source, drop `envs`.
+  #[error("file rewrite `{}` states format `{format}`: the file is the source, drop `envs`", file.display())]
+  RewriteWithEnvs {
     /// Rewrite source.
     file: PathBuf,
+    /// The format that took the adapter path.
+    format: RewriteFormat,
   },
-  /// A kubeconfig rewrite is not valid YAML.
+  /// An adapted rewrite is not valid YAML.
   #[error("file rewrite `{}`: does not parse as YAML: {source}", file.display())]
-  KubeYaml {
+  RewriteYaml {
     /// Rewrite source.
     file: PathBuf,
     /// Underlying parse failure.
     #[source]
     source: YamlError,
   },
-  /// A kubeconfig rewrite does not map onto a grant.
-  #[error("file rewrite `{}`: invalid kubeconfig: {detail}", file.display())]
-  KubeInvalid {
+  /// An adapted rewrite does not map onto a grant.
+  #[error("file rewrite `{}`: invalid {format}: {detail}", file.display())]
+  RewriteInvalid {
     /// Rewrite source.
     file: PathBuf,
+    /// The format that took the adapter path.
+    format: RewriteFormat,
     /// What fails to map.
     detail: String,
   },

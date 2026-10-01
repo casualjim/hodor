@@ -801,12 +801,9 @@ hosts = ["https://api.example/path"]
   fn missing_rules_dir_is_not_an_error() {
     let dir = tempdir().unwrap();
     let registry = Registry::load(Some(&dir.path().join("absent"))).unwrap();
-    assert!(
-      !registry
-        .lookup("GITHUB_TOKEN")
-        .expect("GITHUB_TOKEN in the bundled registry")
-        .hosts
-        .is_empty()
+    assert_ne!(
+      registry.lookup("GITHUB_TOKEN").expect("GITHUB_TOKEN in the bundled registry").hosts,
+      [] as [String; 0]
     );
   }
   #[test]

@@ -25,25 +25,8 @@ where
   M: Wire,
 {
   let eof: &[u8] = &[];
-  if !first.is_empty() {
-    let (rewritten, hits) = downstream.feed(first).await;
-    drain_reply(&mut guest, downstream).await?;
-    let pending = downstream.take_peer_note();
-    if pending > 0 {
-      upstream.apply_peer_note(pending);
-    }
-    log_hits(&hits);
-    match rewritten {
-      Rewritten::Close => return Ok(()),
-      Rewritten::Hold => {}
-      Rewritten::Emit(out) => {
-        server
-          .write_all(&out)
-          .await
-          .map_err(|err| Error::RequestHeadToUpstream { source: err })?;
-        server.flush().await.map_err(|err| Error::RequestHeadFlush { source: err })?;
-      }
-    }
+  if !first.is_empty() && !feed_first(&mut guest, &mut server, downstream, upstream, first).await? {
+    return Ok(());
   }
   let mut guest_buf = vec![0u8; 32 * 1024];
   let mut server_buf = vec![0u8; 32 * 1024];
@@ -131,6 +114,36 @@ where
   guest.flush().await.map_err(|err| Error::FinalGuestFlush { source: err })?;
   let _ = guest.shutdown().await;
   Ok(())
+}
+
+/// Feed the replayed first bytes downstream, flush the first protocol reply,
+/// and carry the first chunk upstream. Returns `false` when the downstream
+/// direction already ended the relay.
+async fn feed_first<G, S, M>(guest: &mut G, server: &mut S, downstream: &mut M, upstream: &mut M, first: &[u8]) -> Result<bool, Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+  S: AsyncRead + AsyncWrite + Unpin,
+  M: Wire,
+{
+  let (rewritten, hits) = downstream.feed(first).await;
+  drain_reply(guest, downstream).await?;
+  let pending = downstream.take_peer_note();
+  if pending > 0 {
+    upstream.apply_peer_note(pending);
+  }
+  log_hits(&hits);
+  match rewritten {
+    Rewritten::Close => return Ok(false),
+    Rewritten::Hold => {}
+    Rewritten::Emit(out) => {
+      server
+        .write_all(&out)
+        .await
+        .map_err(|err| Error::RequestHeadToUpstream { source: err })?;
+      server.flush().await.map_err(|err| Error::RequestHeadFlush { source: err })?;
+    }
+  }
+  Ok(true)
 }
 
 /// Flush one queued guest-bound protocol reply, if the last chunk queued

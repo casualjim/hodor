@@ -295,7 +295,7 @@ mod tests {
     match cli.command {
       Some(Command::Agent(args)) => {
         assert_eq!(args.workspace, Some(PathBuf::from("/srv/project")));
-        assert!(args.command.is_empty());
+        assert_eq!(args.command, [] as [std::ffi::OsString; 0]);
       }
       other => panic!("expected agent, got {other:?}"),
     }

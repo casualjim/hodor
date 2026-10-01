@@ -1184,7 +1184,7 @@ env = "GITHUB_TOKEN"
     let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     let rule = &config.rules["gh"];
     assert!(rule.value.is_none());
-    assert!(rule.allow.is_empty());
+    assert_eq!(rule.allow, [] as [String; 0]);
     assert_eq!(rule.if_missing, IfMissing::Error);
     assert_eq!(rule.registry, None);
     assert!(rule.fnox_key.is_none());

@@ -529,7 +529,7 @@ value = "other-real-token"
     let path = write_fnox(dir.path(), FNOX_PLAIN);
     let fnox = FnoxSource::open_at(&path).unwrap();
     assert_eq!(selected_envs(Some(&fnox), &registry), vec!["GITHUB_TOKEN".to_string()]);
-    assert!(selected_envs(None, &registry).is_empty());
+    assert_eq!(selected_envs(None, &registry), [] as [std::string::String; 0]);
   }
 
   /// Config whose only rule pulls its value from the temp fnox file.
@@ -573,7 +573,7 @@ value = "bws-from-fnox"
     assert_eq!(env::var(key).unwrap(), "bws-from-fnox");
 
     // The shell wins, and nothing is exported twice.
-    assert!(export_provider_env(&fnox).await.is_empty());
+    assert_eq!(export_provider_env(&fnox).await, [] as [std::string::String; 0]);
     // A name fnox does not declare is never touched.
     assert!(env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_none());
 

@@ -53,6 +53,9 @@ struct SchemeEntry {
   flow: Result<OAuthFlow, String>,
 }
 
+/// One curated scheme: its slug and its flow, or why the scheme was skipped.
+pub type FlowEntry = (String, Result<OAuthFlow, String>);
+
 /// Map an `OpenAPI` document's `components.securitySchemes` onto `oauth2`
 /// blocks, one per `type: oauth2` scheme. `type: openIdConnect` schemes are
 /// reported and skipped: that leg is user-login authorization-code, which
@@ -61,7 +64,7 @@ struct SchemeEntry {
 /// # Errors
 ///
 /// Returns an error when the document is not valid JSON.
-pub fn flows_from_openapi(doc: &str) -> Result<Vec<(String, Result<OAuthFlow, String>)>, Error> {
+pub fn flows_from_openapi(doc: &str) -> Result<Vec<FlowEntry>, Error> {
   let value: Value = serde_json::from_str(doc).map_err(|source| Error::ParseOpenapi { source })?;
   let schemes = value
     .pointer("/components/securitySchemes")

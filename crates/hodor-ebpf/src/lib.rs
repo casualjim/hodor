@@ -262,7 +262,7 @@ fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfE
     udp_port: u32::from(udp_port),
     netns_cookie,
   };
-  config.validate().map_err(|_| Error::ConfigInvalid)?;
+  config.validate().map_err(|detail| Error::ConfigInvalid { detail })?;
   let map = bpf.map_mut("CONFIG").ok_or(Error::MapMissing { name: "CONFIG" })?;
   let mut map: Array<&mut MapData, Config> = map.try_into().map_err(|err| Error::UnexpectedMapType {
     name: "CONFIG",

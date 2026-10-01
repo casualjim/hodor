@@ -145,6 +145,81 @@ struct KubeProviderConfig {
   access_token: Option<String>,
 }
 
+/// The selection `current-context` resolves to, validated: its cluster and
+/// user, the server scope, and the bearer token if any.
+struct Selected<'a> {
+  cluster: &'a KubeClusterEntry,
+  user: &'a KubeUserEntry,
+  scope: EndpointScope,
+  token: Option<&'a str>,
+}
+
+impl KubeDoc {
+  /// Resolve and validate the `current-context` selection: known context,
+  /// known cluster with an HTTPS server, known user.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the context is missing or unknown, names no
+  /// cluster or user, the cluster states no server or a non-HTTPS one, or
+  /// the user is unknown.
+  fn selected(&self, invalid: impl Fn(String) -> Error) -> Result<Selected<'_>, Error> {
+    if self.current_context.is_empty() {
+      return Err(invalid("missing `current-context`".to_string()));
+    }
+    let context = self
+      .contexts
+      .iter()
+      .find(|entry| entry.name == self.current_context)
+      .ok_or_else(|| invalid(format!("unknown context `{}`", self.current_context)))?;
+    if context.context.cluster.is_empty() || context.context.user.is_empty() {
+      return Err(invalid(format!("context `{}` names no `cluster` or no `user`", context.name)));
+    }
+    let cluster = self
+      .clusters
+      .iter()
+      .find(|entry| entry.name == context.context.cluster)
+      .ok_or_else(|| invalid(format!("unknown cluster `{}`", context.context.cluster)))?;
+    if cluster.cluster.server.is_empty() {
+      return Err(invalid(format!("cluster `{}` states no `server`", cluster.name)));
+    }
+    let scope: EndpointScope = cluster
+      .cluster
+      .server
+      .parse()
+      .map_err(|detail| invalid(format!("server `{}` is not an allow entry: {detail}", cluster.cluster.server)))?;
+    if scope.scheme != Scheme::Https {
+      return Err(invalid(format!(
+        "server `{}` is plain HTTP: the API server is TLS-only",
+        cluster.cluster.server
+      )));
+    }
+    let user = self
+      .users
+      .iter()
+      .find(|entry| entry.name == context.context.user)
+      .ok_or_else(|| invalid(format!("unknown user `{}`", context.context.user)))?;
+    let token = user
+      .user
+      .token
+      .as_deref()
+      .or_else(|| {
+        user
+          .user
+          .auth_provider
+          .as_ref()
+          .and_then(|provider| provider.config.access_token.as_deref())
+      })
+      .filter(|token| !token.is_empty());
+    Ok(Selected {
+      cluster,
+      user,
+      scope,
+      token,
+    })
+  }
+}
+
 /// Map a kubeconfig onto its grant fragment and decoy twin. Returns `None`
 /// when the document is not a kubeconfig after all, leaving the caller on
 /// the raw path.
@@ -163,59 +238,17 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
   if doc.kind != "Config" {
     return Ok(None);
   }
-  let file = || source.to_path_buf();
   let invalid = |detail: String| Error::RewriteInvalid {
-    file: file(),
+    file: source.to_path_buf(),
     format: RewriteFormat::Kubeconfig,
     detail,
   };
-  if doc.current_context.is_empty() {
-    return Err(invalid("missing `current-context`".to_string()));
-  }
-  let context = doc
-    .contexts
-    .iter()
-    .find(|entry| entry.name == doc.current_context)
-    .ok_or_else(|| invalid(format!("unknown context `{}`", doc.current_context)))?;
-  if context.context.cluster.is_empty() || context.context.user.is_empty() {
-    return Err(invalid(format!("context `{}` names no `cluster` or no `user`", context.name)));
-  }
-  let cluster = doc
-    .clusters
-    .iter()
-    .find(|entry| entry.name == context.context.cluster)
-    .ok_or_else(|| invalid(format!("unknown cluster `{}`", context.context.cluster)))?;
-  if cluster.cluster.server.is_empty() {
-    return Err(invalid(format!("cluster `{}` states no `server`", cluster.name)));
-  }
-  let scope: EndpointScope = cluster
-    .cluster
-    .server
-    .parse()
-    .map_err(|detail| invalid(format!("server `{}` is not an allow entry: {detail}", cluster.cluster.server)))?;
-  if scope.scheme != Scheme::Https {
-    return Err(invalid(format!(
-      "server `{}` is plain HTTP: the API server is TLS-only",
-      cluster.cluster.server
-    )));
-  }
-  let user = doc
-    .users
-    .iter()
-    .find(|entry| entry.name == context.context.user)
-    .ok_or_else(|| invalid(format!("unknown user `{}`", context.context.user)))?;
-  let token = user
-    .user
-    .token
-    .as_deref()
-    .or_else(|| {
-      user
-        .user
-        .auth_provider
-        .as_ref()
-        .and_then(|provider| provider.config.access_token.as_deref())
-    })
-    .filter(|token| !token.is_empty());
+  let Selected {
+    cluster,
+    user,
+    scope,
+    token,
+  } = doc.selected(invalid)?;
   if user.user.cert_file.is_some() || user.user.key_file.is_some() || cluster.cluster.ca_file.is_some() {
     return Err(invalid(
       "uses file references; inline them first: `kubectl config view --flatten --minify`".to_string(),
@@ -256,7 +289,58 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     str::to_string,
   );
   let (decoy_token, _) = decoy_for_rule(&env, None, &[scope], value.len());
-  let (guest_cert_path, guest_key_path) = load_or_generate_client_pair(ca, guests_dir, &label)?;
+  let blobs = kube_blobs(&label, cert, key, ca_bundle, ca, guests_dir)?;
+  let fragment = render_fragment(
+    source,
+    &label,
+    &GrantFragment {
+      env,
+      registry: false,
+      allow: vec![cluster.cluster.server.clone()],
+      value,
+      tls: BTreeMap::from([(cluster.cluster.server.clone(), blobs.tls)]),
+    },
+  );
+  let decoy = render_decoy(&DecoyDoc::kube(
+    &doc.current_context,
+    cluster,
+    user,
+    ca,
+    token.map(|_| decoy_token.as_str()),
+    &blobs.guest_cert,
+    &blobs.guest_key,
+  ));
+  Ok(Some(RewriteAdapted {
+    fragment,
+    decoy,
+    materialized: blobs.materialized,
+  }))
+}
+
+/// The per-rule TLS identity and the blobs that back it, plus the guest pair
+/// the decoy embeds.
+struct KubeBlobs {
+  tls: HostTlsCfg,
+  materialized: Vec<(String, Vec<u8>)>,
+  guest_cert: Vec<u8>,
+  guest_key: Vec<u8>,
+}
+
+/// Mint the guest pair, materialize the identity blobs, and assemble the
+/// per-entry TLS identity for one derived rule.
+///
+/// # Errors
+///
+/// Returns an error when the guest pair cannot be minted or its files read.
+fn kube_blobs(
+  label: &str,
+  cert: Option<Vec<u8>>,
+  key: Option<Vec<u8>>,
+  ca_bundle: Option<Vec<u8>>,
+  ca: &CertAuthority,
+  guests_dir: &Path,
+) -> Result<KubeBlobs, Error> {
+  let (guest_cert_path, guest_key_path) = load_or_generate_client_pair(ca, guests_dir, label)?;
   let guest_cert = fs::read(&guest_cert_path).map_err(|source| Error::ReadFile {
     path: guest_cert_path.clone(),
     source,
@@ -287,54 +371,59 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     tls.root_cert = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{ca_name}")));
     materialized.push((ca_name, ca_bundle));
   }
-  let fragment = render_fragment(
-    source,
-    &label,
-    &GrantFragment {
-      env,
-      registry: false,
-      allow: vec![cluster.cluster.server.clone()],
-      value,
-      tls: BTreeMap::from([(cluster.cluster.server.clone(), tls)]),
-    },
-  );
-  let decoy = render_decoy(&DecoyDoc {
-    api_version: "v1".to_string(),
-    kind: "Config".to_string(),
-    current_context: doc.current_context.clone(),
-    contexts: vec![DecoyContextEntry {
-      name: doc.current_context.clone(),
-      context: DecoyContextRef {
-        cluster: cluster.name.clone(),
-        user: user.name.clone(),
-      },
-    }],
-    clusters: vec![DecoyClusterEntry {
-      name: cluster.name.clone(),
-      cluster: DecoyCluster {
-        server: cluster.cluster.server.clone(),
-        certificate_authority_data: STANDARD.encode(ca.cert_pem()),
-      },
-    }],
-    users: vec![DecoyUserEntry {
-      name: user.name.clone(),
-      user: DecoyUser {
-        token: token.map(|_| decoy_token.clone()),
-        client_certificate_data: STANDARD.encode(&guest_cert),
-        client_key_data: STANDARD.encode(&guest_key),
-      },
-    }],
-  });
-  Ok(Some(RewriteAdapted {
-    fragment,
-    decoy,
+  Ok(KubeBlobs {
+    tls,
     materialized,
-  }))
+    guest_cert,
+    guest_key,
+  })
 }
 
 /// The agent's decoy kubeconfig: same server, hodor CA, guest pair, and the
 /// decoy token when the real user carries one. Field order matches what
 /// kubectl emits for familiarity; unknown fields are absent.
+impl DecoyDoc {
+  /// The agent's decoy for one derived kube rule: same server, hodor CA,
+  /// guest pair, decoy token when the real user carries one.
+  fn kube(
+    context: &str,
+    cluster: &KubeClusterEntry,
+    user: &KubeUserEntry,
+    ca: &CertAuthority,
+    decoy_token: Option<&str>,
+    guest_cert: &[u8],
+    guest_key: &[u8],
+  ) -> Self {
+    Self {
+      api_version: "v1".to_string(),
+      kind: "Config".to_string(),
+      current_context: context.to_string(),
+      contexts: vec![DecoyContextEntry {
+        name: context.to_string(),
+        context: DecoyContextRef {
+          cluster: cluster.name.clone(),
+          user: user.name.clone(),
+        },
+      }],
+      clusters: vec![DecoyClusterEntry {
+        name: cluster.name.clone(),
+        cluster: DecoyCluster {
+          server: cluster.cluster.server.clone(),
+          certificate_authority_data: STANDARD.encode(ca.cert_pem()),
+        },
+      }],
+      users: vec![DecoyUserEntry {
+        name: user.name.clone(),
+        user: DecoyUser {
+          token: decoy_token.map(str::to_string),
+          client_certificate_data: STANDARD.encode(guest_cert),
+          client_key_data: STANDARD.encode(guest_key),
+        },
+      }],
+    }
+  }
+}
+
 #[derive(Serialize)]
 struct DecoyDoc {
   #[serde(rename = "apiVersion")]
@@ -573,15 +662,15 @@ users:
   fn state_writes_and_stale_ones_prune() {
     let adapted = adapt_doc(BEARER_DOC);
     let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("grants");
-    write_state(&state, &[adapted]).unwrap();
-    let rules = state.join("rules.d");
-    let marker = fs::read_to_string(state.join("hodor.toml")).unwrap();
+    let grants = dir.path().join("grants");
+    write_state(&grants, &[adapted]).unwrap();
+    let rules = grants.join("rules.d");
+    let marker = fs::read_to_string(grants.join("hodor.toml")).unwrap();
     assert!(marker.contains("[rules.home-ivan-kube-k3s-k3s-local]"), "{marker}");
     assert!(rules.join("home-ivan-kube-k3s-k3s-local.client.crt").is_file());
     let stale = rules.join("kube-gone.crt");
     fs::write(&stale, "stale").unwrap();
-    write_state(&state, &[]).unwrap();
+    write_state(&grants, &[]).unwrap();
     assert!(!stale.exists(), "removed rewrites stop granting");
   }
 }

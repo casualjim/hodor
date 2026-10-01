@@ -7,7 +7,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 
 use crate::error::Error;
 use crate::paths::translate;
@@ -391,10 +391,10 @@ pub(crate) fn generated_backend(compose: &str) -> Option<ProxyBackend> {
 /// Generate the workspace stack when it is absent, and regenerate it when the
 /// workspace config changed since it was generated; a stack whose config is
 /// unchanged is left alone, so hand edits survive until then.
-fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool, hodor_version: &str) -> Result<(), Error> {
+async fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool, hodor_version: &str) -> Result<(), Error> {
   let state_ws = workspace_state_dir(root);
   let ws_compose = state_ws.join("compose.yml");
-  fs::create_dir_all(&state_ws).map_err(|source| Error::CreateDir {
+  tokio::fs::create_dir_all(&state_ws).await.map_err(|source| Error::CreateDir {
     path: state_ws.clone(),
     source,
   })?;
@@ -412,7 +412,7 @@ fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool, ho
   {
     println!("wrote {}", root.join("mise.agent.toml").display());
   }
-  let existing = fs::read_to_string(&ws_compose).ok();
+  let existing = tokio::fs::read_to_string(&ws_compose).await.ok();
   if existing.is_some() {
     if !stack_is_stale(&state_ws, root) {
       println!("exists, left untouched: {}", ws_compose.display());
@@ -429,14 +429,16 @@ fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool, ho
     _ => backend,
   };
   let stack = generate_stack(root, backend, hodor_version)?;
-  fs::write(&ws_compose, stack).map_err(|source| Error::WriteFile {
+  tokio::fs::write(&ws_compose, stack).await.map_err(|source| Error::WriteFile {
     path: ws_compose.clone(),
     source,
   })?;
-  fs::write(state_ws.join("config.digest"), config_digest(root).to_string()).map_err(|source| Error::WriteFile {
-    path: state_ws.join("config.digest"),
-    source,
-  })?;
+  tokio::fs::write(state_ws.join("config.digest"), config_digest(root).to_string())
+    .await
+    .map_err(|source| Error::WriteFile {
+      path: state_ws.join("config.digest"),
+      source,
+    })?;
   println!("generated: {}", ws_compose.display());
   Ok(())
 }
@@ -469,8 +471,8 @@ fn compose_command(root: &Path) -> Result<Command, Error> {
 }
 
 /// Run a compose command and fail on a non-zero exit; its output is the user's.
-fn compose_status(command: &mut Command) -> Result<(), Error> {
-  let status = command.status().map_err(|source| Error::SpawnCompose { source })?;
+async fn compose_status(command: &mut Command) -> Result<(), Error> {
+  let status = command.status().await.map_err(|source| Error::SpawnCompose { source })?;
   if !status.success() {
     return Err(Error::ComposeFailed {
       status: status.to_string(),
@@ -482,8 +484,8 @@ fn compose_status(command: &mut Command) -> Result<(), Error> {
 /// The same, for a compose command the user is meant to interrupt — an exec
 /// session, a `--follow` log read. compose reports that interrupt as 130, and
 /// an interrupt is the user getting what they asked for, not a failure.
-fn compose_status_interruptible(command: &mut Command) -> Result<(), Error> {
-  let status = command.status().map_err(|source| Error::SpawnCompose { source })?;
+async fn compose_status_interruptible(command: &mut Command) -> Result<(), Error> {
+  let status = command.status().await.map_err(|source| Error::SpawnCompose { source })?;
   if !(status.success() || status.code() == Some(130)) {
     return Err(Error::ComposeFailed {
       status: status.to_string(),
@@ -493,18 +495,18 @@ fn compose_status_interruptible(command: &mut Command) -> Result<(), Error> {
 }
 
 /// Start the layered project, making sure what it mounts exists first.
-fn up_workspace(root: &Path) -> Result<(), Error> {
+async fn up_workspace(root: &Path) -> Result<(), Error> {
   report_created(&prepare_support_files(root)?);
   let mut command = compose_command(root)?;
   command.arg("up").arg("-d");
-  compose_status(&mut command)
+  compose_status(&mut command).await
 }
 
 /// Stop the layered project.
-fn down_workspace(root: &Path) -> Result<(), Error> {
+async fn down_workspace(root: &Path) -> Result<(), Error> {
   let mut command = compose_command(root)?;
   command.arg("down");
-  compose_status(&mut command)
+  compose_status(&mut command).await
 }
 
 /// The compose arguments `hodor logs` maps to: its flags only when they were
@@ -525,15 +527,15 @@ pub(crate) fn logs_argv(args: &LogsArgs) -> Vec<OsString> {
 }
 
 /// Read the stack's logs.
-fn logs_workspace(root: &Path, args: &LogsArgs) -> Result<(), Error> {
+async fn logs_workspace(root: &Path, args: &LogsArgs) -> Result<(), Error> {
   let mut command = compose_command(root)?;
   command.args(logs_argv(args));
-  compose_status_interruptible(&mut command)
+  compose_status_interruptible(&mut command).await
 }
 
 /// Enter the agent environment at the translated workspace directory: the
 /// configured shell, or `command` when the caller passed one.
-fn exec_agent(root: &Path, command: &[OsString]) -> Result<(), Error> {
+async fn exec_agent(root: &Path, command: &[OsString]) -> Result<(), Error> {
   let config = workspace_config(root)?;
   let home = config.workspace.home.clone().ok_or_else(|| Error::HomeRequired {
     detail: "for the agent workdir".to_string(),
@@ -556,7 +558,7 @@ fn exec_agent(root: &Path, command: &[OsString]) -> Result<(), Error> {
     .arg(uid.to_string())
     .arg("agent")
     .args(argv);
-  compose_status_interruptible(&mut compose)
+  compose_status_interruptible(&mut compose).await
 }
 
 /// Print one sorted warning for fnox-declared names no rule, passthrough, or
@@ -661,7 +663,7 @@ impl CliCommand for InitArgs {
   /// when a file cannot be written.
   async fn run(self, _cli: &Cli, hodor_version: &str) -> Result<(), Self::Error> {
     let root = resolve_root(&workspace_arg(self.workspace.as_deref()))?;
-    init_workspace(&root, resolve_backend(self.backend)?, self.backend.is_some(), hodor_version)
+    init_workspace(&root, resolve_backend(self.backend)?, self.backend.is_some(), hodor_version).await
   }
 }
 
@@ -681,16 +683,16 @@ impl CliCommand for AgentArgs {
   /// reported too, because the stack the caller asked to stop is still up.
   async fn run(self, _cli: &Cli, hodor_version: &str) -> Result<(), Self::Error> {
     let root = resolve_root(&workspace_arg(self.workspace.as_deref()))?;
-    init_workspace(&root, resolve_backend(None)?, false, hodor_version)?;
-    up_workspace(&root)?;
+    init_workspace(&root, resolve_backend(None)?, false, hodor_version).await?;
+    up_workspace(&root).await?;
     if !self.rm {
-      return exec_agent(&root, &self.command);
+      return exec_agent(&root, &self.command).await;
     }
     let exec = {
       let _survive_interrupt = SurviveInterrupt::new();
-      exec_agent(&root, &self.command)
+      exec_agent(&root, &self.command).await
     };
-    let down = down_workspace(&root);
+    let down = down_workspace(&root).await;
     exec?;
     down
   }
@@ -732,7 +734,7 @@ impl CliCommand for UpArgs {
   /// Returns an error when the workspace cannot be resolved, when the support
   /// files cannot be written, or when the compose command fails.
   async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
-    up_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?)
+    up_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?).await
   }
 }
 
@@ -746,7 +748,7 @@ impl CliCommand for DownArgs {
   /// Returns an error when the workspace cannot be resolved or when the compose
   /// command fails.
   async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
-    down_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?)
+    down_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?).await
   }
 }
 
@@ -760,6 +762,6 @@ impl CliCommand for LogsArgs {
   /// Returns an error when the workspace cannot be resolved or when the compose
   /// command fails.
   async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
-    logs_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?, &self)
+    logs_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?, &self).await
   }
 }

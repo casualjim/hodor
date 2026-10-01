@@ -19,8 +19,10 @@ pub struct Cli {
 }
 
 /// One subcommand: its args struct plus how it runs. The binary dispatches
-/// each parsed subcommand through this one method, so adding a command is a
-/// new args struct plus one impl — never another match arm with inline logic.
+/// each parsed subcommand through this one async method, so adding a command
+/// is a new args struct plus one impl — never another match arm with inline
+/// logic. The program boots on the tokio runtime, so every implementation is
+/// async and awaits its real work; none of them block.
 pub trait CliCommand {
   /// This command's failure; the binary renders it.
   type Error;

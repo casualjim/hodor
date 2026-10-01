@@ -18,36 +18,6 @@ use crate::error::Error;
 use hodor_config::config::{AppConfig, IfMissing, ProxyCfg, RuleCfg, WorkspaceCfg};
 use hodor_config::registry::Registry;
 use hodor_fnox::{FnoxSource, resolve};
-/// Collect every `${NAME}`, `${NAME:-default}` and `$NAME` reference in a
-/// value. Over-collection is harmless — a name that is not a declared fnox
-/// secret simply resolves from the process environment instead.
-pub(crate) fn collect_referenced_variables(value: &str, names: &mut BTreeSet<String>) {
-  for candidate in value.split('$').skip(1) {
-    let name = match candidate.strip_prefix('{') {
-      Some(braced) => match braced.split_once('}') {
-        Some((inside, _)) => inside.split_once(":-").map_or(inside, |(name, _)| name),
-        None => continue,
-      },
-      None => candidate
-        .split(|character: char| !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'))
-        .next()
-        .unwrap_or_default(),
-    };
-    if valid_env_name(name) {
-      names.insert(name.to_string());
-    }
-  }
-}
-
-/// Env names are `[_A-Za-z][_0-9A-Za-z]*`; anything else after a `$` is not a
-/// reference.
-fn valid_env_name(name: &str) -> bool {
-  let mut chars = name.chars();
-  let Some(first) = chars.next() else {
-    return false;
-  };
-  matches!(first, 'A'..='Z' | 'a'..='z' | '_') && chars.all(|character| matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'))
-}
 
 /// Build the expander over the process environment plus fnox-resolved values.
 pub(crate) fn build_expander(env: HashMap<String, String>) -> Xpanda {
@@ -186,28 +156,6 @@ pub(crate) fn rewrite_file_name(index: usize, source: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  /// `$VAR`, `${VAR}` and `${VAR:-default}` all collect; `$` alone and
-  /// non-names do not.
-  #[test]
-  fn collects_dollar_references_and_skips_noise() {
-    let mut names = BTreeSet::new();
-    collect_referenced_variables("$HOME/.cargo/${TOOL_BIN:-tool}/x ${UNBRACED} $1 $$HOME", &mut names);
-    assert!(names.contains("HOME"));
-    assert!(names.contains("TOOL_BIN"));
-    assert!(names.contains("UNBRACED"));
-    assert!(!names.contains("1"));
-    assert!(!names.contains(""));
-  }
-
-  /// Braced references collect the name before `:-`, and a missing closing
-  /// brace collects nothing.
-  #[test]
-  fn collects_inside_composed_values() {
-    let mut names = BTreeSet::new();
-    collect_referenced_variables("https://${REGISTRY_HOST}/v2/${MISSING", &mut names);
-    assert_eq!(names, BTreeSet::from(["REGISTRY_HOST".to_string()]));
-  }
 
   /// `${VAR}` expands from the env, `${VAR:-default}` falls back, and an
   /// unset var errors naming the var.

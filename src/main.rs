@@ -28,8 +28,9 @@ struct HodorCli {
   command: Option<Command>,
 }
 
-/// Available subcommands. Each variant's args implement [`CliCommand`], so
-/// dispatch is one method call per variant.
+/// Available subcommands. Each variant's args own a `run` method, so dispatch
+/// is one method call per variant — awaited for the genuinely asynchronous
+/// ones, plain for the rest.
 #[derive(Subcommand, Debug, Clone)]
 enum Command {
   /// Serve the proxy: the explicit listener, plus transparent capture when

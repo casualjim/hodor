@@ -1,6 +1,6 @@
 //! Config overlay: global + project files, env, CLI via confique.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -125,6 +125,55 @@ impl WorkspaceCfg {
   pub fn profile_name(&self) -> &str {
     self.profile.as_deref().unwrap_or(SHARED_PROFILE)
   }
+
+  /// Every `$VAR` this workspace's settings reference: `include` entries,
+  /// rewrite sources and dests with their envs, plus any extra strings the
+  /// caller layers on top (the home).
+  #[must_use]
+  pub fn referenced_variables(&self, extra: &[&str]) -> BTreeSet<String> {
+    let mut referenced = BTreeSet::new();
+    for entry in &self.include {
+      collect_referenced_variables(&entry.to_string_lossy(), &mut referenced);
+    }
+    for rewrite in &self.file_rewrite {
+      collect_referenced_variables(&rewrite.source.to_string_lossy(), &mut referenced);
+      collect_referenced_variables(&rewrite.dest, &mut referenced);
+      referenced.extend(rewrite.envs.iter().cloned());
+    }
+    for value in extra {
+      collect_referenced_variables(value, &mut referenced);
+    }
+    referenced
+  }
+}
+
+/// Collect every `$VAR` reference in one interpolated string.
+fn collect_referenced_variables(value: &str, names: &mut BTreeSet<String>) {
+  for candidate in value.split('$').skip(1) {
+    let name = match candidate.strip_prefix('{') {
+      Some(braced) => match braced.split_once('}') {
+        Some((inside, _)) => inside.split_once(":-").map_or(inside, |(name, _)| name),
+        None => continue,
+      },
+      None => candidate
+        .split(|character: char| !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'))
+        .next()
+        .unwrap_or_default(),
+    };
+    if valid_env_name(name) {
+      names.insert(name.to_string());
+    }
+  }
+}
+
+/// Env names are `[_A-Za-z][_0-9A-Za-z]*`; anything else after a `$` is not a
+/// reference.
+fn valid_env_name(name: &str) -> bool {
+  let mut chars = name.chars();
+  let Some(first) = chars.next() else {
+    return false;
+  };
+  matches!(first, 'A'..='Z' | 'a'..='z' | '_') && chars.all(|character| matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'))
 }
 
 /// One host file to rewrite with decoys before the agent sees it.
@@ -1329,6 +1378,40 @@ allow = ["https://b.example"]
     let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert!(config.workspace.ports.is_empty(), "absent ports stay empty");
     scrub_env();
+  }
+
+  /// `$VAR`, `${VAR}` and `${VAR:-default}` all collect from every setting
+  /// that interpolates, plus the extras; `$` alone and non-names do not.
+  #[test]
+  fn referenced_variables_collect_dollar_references_and_skip_noise() {
+    let workspace = WorkspaceCfg {
+      include: vec![PathBuf::from("$HOME/.cargo/${TOOL_BIN:-tool}/x")],
+      file_rewrite: vec![FileRewrite {
+        source: PathBuf::from("${UNBRACED}.npmrc"),
+        dest: "{home}/.npmrc".to_string(),
+        envs: vec!["NPM_TOKEN".to_string()],
+        format: None,
+      }],
+      ..WorkspaceCfg::default()
+    };
+    let names = workspace.referenced_variables(&["$HOME"]);
+    assert!(names.contains("HOME"));
+    assert!(names.contains("TOOL_BIN"));
+    assert!(names.contains("UNBRACED"));
+    assert!(names.contains("NPM_TOKEN"));
+    assert!(!names.contains("1"));
+    assert!(!names.contains(""));
+  }
+
+  /// Braced references collect the name before `:-`, and a missing closing
+  /// brace collects nothing.
+  #[test]
+  fn referenced_variables_collect_inside_composed_values() {
+    let workspace = WorkspaceCfg {
+      include: vec![PathBuf::from("https://${REGISTRY_HOST}/v2/${MISSING")],
+      ..WorkspaceCfg::default()
+    };
+    assert_eq!(workspace.referenced_variables(&[]), BTreeSet::from(["REGISTRY_HOST".to_string()]));
   }
 
   /// `hodor config` prints this: every setting, its default, and the doc

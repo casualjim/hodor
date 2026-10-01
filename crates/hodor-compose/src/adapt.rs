@@ -102,10 +102,10 @@ pub(crate) fn decode(file: &Path, format: RewriteFormat, data: Option<&str>, fie
   data
     .filter(|data| !data.is_empty())
     .map(|data| {
-      STANDARD.decode(data.trim()).map_err(|_| Error::RewriteInvalid {
+      STANDARD.decode(data.trim()).map_err(|source| Error::RewriteInvalid {
         file: file.to_path_buf(),
         format,
-        detail: format!("field `{field}` is not valid base64"),
+        detail: format!("field `{field}` is not valid base64: {source}"),
       })
     })
     .transpose()

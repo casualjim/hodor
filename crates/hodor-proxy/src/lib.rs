@@ -1095,7 +1095,7 @@ mod tests {
       .await
       .unwrap()
       .unwrap();
-    assert!(response.is_empty());
+    assert_eq!(response, [] as [u8; 0]);
     proxy.abort();
   }
 

@@ -984,7 +984,7 @@ mod h2_tests {
     let mut machine = req_machine();
     // Preface split across writes is held, not emitted.
     let (out1, _) = machine.substitute(&H2_PREFACE[..10]).await;
-    assert!(out1.into_owned().is_empty());
+    assert_eq!(out1.into_owned(), [] as [u8; 0]);
 
     let block = encode_headers(&[
       (":method", "GET"),
@@ -1127,7 +1127,7 @@ mod h2_tests {
     input.extend_from_slice(&promise);
     let (out, hits) = machine.substitute(&input).await;
     assert_eq!(out.into_owned(), input);
-    assert!(hits.is_empty());
+    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
   }
 
   #[tokio::test]

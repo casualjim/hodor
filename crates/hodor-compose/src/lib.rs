@@ -1103,7 +1103,7 @@ mod tests {
     let env = HashMap::from([("NPM_TOKEN".to_string(), "real-secret-1".to_string())]);
     let expander = build_expander(HashMap::new());
     let files = dir.path().join("files");
-    let outputs = write_rewrites(RewriteInputs {
+    let outputs = write_rewrites(&RewriteInputs {
       files_dir: &files,
       root: dir.path(),
       rewrites: from_ref(&rewrite),
@@ -1122,7 +1122,7 @@ mod tests {
     let body = fs::read_to_string(&outputs.mounts[0].host).unwrap();
     assert!(body.contains("decoy-9"), "{body}");
     assert!(!body.contains("real-secret-1"), "{body}");
-    let error = write_rewrites(RewriteInputs {
+    let error = write_rewrites(&RewriteInputs {
       files_dir: &files,
       root: dir.path(),
       rewrites: &[FileRewrite {
@@ -1173,7 +1173,7 @@ users:
     let files = dir.path().join("files");
     let guests = dir.path().join("guests");
     for format in [None, Some(RewriteFormat::Kubeconfig)] {
-      let outputs = write_rewrites(RewriteInputs {
+      let outputs = write_rewrites(&RewriteInputs {
         files_dir: &files,
         root: dir.path(),
         rewrites: &[FileRewrite {
@@ -1217,7 +1217,7 @@ users:
     let ca = CertAuthority::generate().unwrap();
     let guests = dir.path().join("guests");
     let expander = build_expander(HashMap::new());
-    let error = write_rewrites(RewriteInputs {
+    let error = write_rewrites(&RewriteInputs {
       files_dir: &dir.path().join("files"),
       root: dir.path(),
       rewrites: &[FileRewrite {
@@ -1262,7 +1262,7 @@ users:
     let files = dir.path().join("files");
     let guests = dir.path().join("guests");
     for format in [None, Some(RewriteFormat::Talos)] {
-      let outputs = write_rewrites(RewriteInputs {
+      let outputs = write_rewrites(&RewriteInputs {
         files_dir: &files,
         root: dir.path(),
         rewrites: &[FileRewrite {
@@ -1290,7 +1290,7 @@ users:
       assert!(body.contains("endpoints:\n    - 10.5.0.6"), "{body}");
       assert!(!body.contains(&STANDARD.encode(b"CRT")), "no real credential survives: {body}");
     }
-    let error = write_rewrites(RewriteInputs {
+    let error = write_rewrites(&RewriteInputs {
       files_dir: &files,
       root: dir.path(),
       rewrites: &[FileRewrite {

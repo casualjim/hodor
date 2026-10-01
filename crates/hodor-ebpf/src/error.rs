@@ -65,9 +65,12 @@ pub enum Error {
     #[source]
     origin: Box<Error>,
   },
-  /// The configuration refuses to write: a listen port is zero.
-  #[error("refusing to write an unusable CONFIG: listen ports must be non-zero")]
-  ConfigInvalid,
+  /// The configuration refuses to write: it fails validation.
+  #[error("refusing to write an unusable CONFIG: {detail}")]
+  ConfigInvalid {
+    /// Why the configuration is unusable.
+    detail: String,
+  },
   /// A map is missing from the eBPF object.
   #[error("{name} map missing from the eBPF object")]
   MapMissing {

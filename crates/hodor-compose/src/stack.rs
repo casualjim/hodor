@@ -22,9 +22,7 @@ use xpanda::Xpanda;
 
 use crate::adapt::{self, GRANTS_STATE_DIR, RewriteAdapted, sniff};
 use crate::error::Error;
-use crate::expand::{
-  apply_rewrites, block_on, build_expander, collect_referenced_variables, expand_path, expand_value, resolution_env, rewrite_file_name,
-};
+use crate::expand::{apply_rewrites, block_on, build_expander, expand_path, expand_value, resolution_env, rewrite_file_name};
 use crate::kube;
 use crate::paths::{Mount, covering, expand, translate};
 use crate::talos;
@@ -323,16 +321,7 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
     detail: "for stack generation".to_string(),
   })?;
   let fnox = open_fnox()?;
-  let mut referenced = BTreeSet::new();
-  for entry in &config.workspace.include {
-    collect_referenced_variables(&entry.to_string_lossy(), &mut referenced);
-  }
-  for rewrite in &config.workspace.file_rewrite {
-    collect_referenced_variables(&rewrite.source.to_string_lossy(), &mut referenced);
-    collect_referenced_variables(&rewrite.dest, &mut referenced);
-    referenced.extend(rewrite.envs.iter().cloned());
-  }
-  collect_referenced_variables(&raw_home, &mut referenced);
+  let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
   let env = block_on(resolution_env(&registry, fnox.as_ref(), &referenced))??;
   let expander = build_expander(env.clone());
   let home = expand_value(&expander, &raw_home)?;
@@ -356,21 +345,9 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
   );
   let decoys = with_rule_patterns(select(fnox.as_ref(), &registry), &registry, &config.rules);
   validate_passthrough(&config.rules, &decoys, &config.workspace.passthrough)?;
-  let kube_ca = if config.workspace.file_rewrite.is_empty() {
-    None
-  } else {
-    let ca_path = config_dir()
-      .ok_or_else(|| Error::ConfigDir {
-        detail: "file rewrites need the hodor config directory to load the CA from".to_string(),
-      })?
-      .join("ca.pem");
-    Some(load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
-      path: ca_path.clone(),
-      source,
-    })?)
-  };
+  let kube_ca = rewrite_ca(&config.workspace.file_rewrite)?;
   let guests_dir = workspace_state_dir(root).join("guests");
-  let rewritten = write_rewrites(RewriteInputs {
+  let rewritten = write_rewrites(&RewriteInputs {
     files_dir: &workspace_state_dir(root).join("files"),
     root,
     rewrites: &config.workspace.file_rewrite,
@@ -400,24 +377,7 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
     global: global_profiles.as_deref(),
   };
   let tool_mounts = profile_mounts(&roots, config.workspace.profile_name(), &config.tools, &home)?;
-  let guest = if config
-    .rules
-    .values()
-    .any(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls))
-  {
-    let ca_path = config_dir()
-      .ok_or_else(|| Error::ConfigDir {
-        detail: "a guest identity needs the hodor config directory to load the CA from".to_string(),
-      })?
-      .join("ca.pem");
-    let ca = load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
-      path: ca_path.clone(),
-      source,
-    })?;
-    guest_identity_mounts(&config.rules, &ca, &guests_dir, &home)?
-  } else {
-    Vec::new()
-  };
+  let guest = guest_mounts(&config, &guests_dir, &home)?;
   let fnox = fnox_binds(fnox_config_dir(host_home.as_deref()).as_deref(), config_dir().as_deref());
   let root_container = translate(root, host_home.as_deref(), &home);
   let project = config.workspace.name.clone().unwrap_or_else(|| workspace_slug(root));
@@ -447,6 +407,72 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
     }
     .render(),
   )
+}
+
+/// The guest-identity CA when the workspace declares file rewrites: their
+/// adapters mint guest pairs from it.
+fn rewrite_ca(rewrites: &[FileRewrite]) -> Result<Option<CertAuthority>, Error> {
+  if rewrites.is_empty() {
+    return Ok(None);
+  }
+  let ca_path = config_dir()
+    .ok_or_else(|| Error::ConfigDir {
+      detail: "file rewrites need the hodor config directory to load the CA from".to_string(),
+    })?
+    .join("ca.pem");
+  load_or_generate(&ca_path).map(Some).map_err(|source| Error::GuestCa {
+    path: ca_path.clone(),
+    source,
+  })
+}
+
+/// Mounts for minted guest identities when any rule requests mTLS, else none.
+fn guest_mounts(config: &AppConfig, guests_dir: &Path, home: &str) -> Result<Vec<Mount>, Error> {
+  if !config
+    .rules
+    .values()
+    .any(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls))
+  {
+    return Ok(Vec::new());
+  }
+  let ca_path = config_dir()
+    .ok_or_else(|| Error::ConfigDir {
+      detail: "a guest identity needs the hodor config directory to load the CA from".to_string(),
+    })?
+    .join("ca.pem");
+  let ca = load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
+    path: ca_path.clone(),
+    source,
+  })?;
+  guest_identity_mounts(&config.rules, &ca, guests_dir, home)
+}
+
+/// Real/decoy byte pairs for one rewrite's env names, in declared order.
+pub(crate) type RewritePairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Real/decoy byte pairs for one rewrite's env names, in declared order.
+///
+/// # Errors
+///
+/// Returns an error naming the env when a name has no known real value or
+/// no decoy.
+fn rewrite_pairs(rewrite: &FileRewrite, env: &HashMap<String, String>, by_env: &BTreeMap<&str, &str>) -> Result<RewritePairs, Error> {
+  let mut pairs = Vec::new();
+  for name in &rewrite.envs {
+    let real = env
+      .get(name)
+      .filter(|value| !value.is_empty())
+      .ok_or_else(|| Error::RewriteNoValue {
+        file: rewrite.source.clone(),
+        name: name.clone(),
+      })?;
+    let decoy = by_env.get(name.as_str()).ok_or_else(|| Error::RewriteNoDecoy {
+      file: rewrite.source.clone(),
+      name: name.clone(),
+    })?;
+    pairs.push((real.as_bytes().to_vec(), decoy.as_bytes().to_vec()));
+  }
+  Ok(pairs)
 }
 
 /// Inputs for [`write_rewrites`]: the generation context the rewrite loop
@@ -497,7 +523,7 @@ pub(crate) struct RewriteOutputs {
 /// the env name when a rewrite names one with no known real value or no
 /// decoy, when a kubeconfig source states `envs` or does not map, or when a
 /// source file cannot be read or an output written.
-pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> Result<RewriteOutputs, Error> {
+pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutputs, Error> {
   let RewriteInputs {
     files_dir,
     root,
@@ -509,7 +535,7 @@ pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> Result<RewriteOutputs
     host_home,
     kube_ca: preloaded_ca,
     guests_dir,
-  } = inputs;
+  } = *inputs;
   if rewrites.is_empty() {
     return Ok(RewriteOutputs {
       mounts: Vec::new(),
@@ -525,21 +551,7 @@ pub(crate) fn write_rewrites(inputs: RewriteInputs<'_>) -> Result<RewriteOutputs
   let mut grants = Vec::new();
   let mut owned_ca: Option<CertAuthority> = None;
   for (index, rewrite) in rewrites.iter().enumerate() {
-    let mut pairs = Vec::new();
-    for name in &rewrite.envs {
-      let real = env
-        .get(name)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::RewriteNoValue {
-          file: rewrite.source.clone(),
-          name: name.clone(),
-        })?;
-      let decoy = by_env.get(name.as_str()).ok_or_else(|| Error::RewriteNoDecoy {
-        file: rewrite.source.clone(),
-        name: name.clone(),
-      })?;
-      pairs.push((real.as_bytes().to_vec(), decoy.as_bytes().to_vec()));
-    }
+    let pairs = rewrite_pairs(rewrite, env, &by_env)?;
     let expanded_source = PathBuf::from(expand_path(expander, &rewrite.source.to_string_lossy())?);
     let host = expand(&expanded_source, root, host_home);
     let content = fs::read(&host).map_err(|source| Error::ReadFile {

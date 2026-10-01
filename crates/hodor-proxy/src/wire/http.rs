@@ -1688,7 +1688,7 @@ mod tests {
     let mid = head.len() - 10;
     let (out1, _) = req.substitute(&part1.as_bytes()[..mid]).await;
     let out1 = out1.into_owned();
-    assert!(out1.is_empty());
+    assert_eq!(out1, [] as [u8; 0]);
     let (out2, _) = req.substitute(&part1.as_bytes()[mid..]).await;
     let out2 = out2.into_owned();
     let (out3, hits) = req.substitute(part2.as_bytes()).await;
@@ -1731,7 +1731,7 @@ mod tests {
     let mut opaque = Http::opaque(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream);
     let (first, second) = FAKE.split_at(20);
     let (_, hits1) = opaque.substitute(first.as_bytes()).await;
-    assert!(hits1.is_empty());
+    assert_eq!(hits1, [] as [crate::wire::Hit; 0]);
     let (out2, hits2) = opaque.substitute(second.as_bytes()).await;
     assert_eq!(out2.as_ref(), second.as_bytes());
     assert_eq!(hits2.len(), 1);
@@ -1772,7 +1772,7 @@ mod tests {
     let input = b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n";
     let (out, hits) = req.substitute(input).await;
     assert!(matches!(out, Cow::Borrowed(_)));
-    assert!(hits.is_empty());
+    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
   }
 
   #[tokio::test]
@@ -1866,7 +1866,7 @@ mod tests {
     let (out, hits) = req.substitute(body).await;
     assert!(matches!(out, Cow::Borrowed(_)));
     assert!(matches!(req.state, State::Opaque));
-    assert!(hits.is_empty());
+    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
   }
 
   #[tokio::test]
@@ -1905,7 +1905,7 @@ mod tests {
     assert_eq!(hits.len(), 1);
     let (flush, flush_hits) = resp.substitute(&[]).await;
     assert!(flush.is_empty());
-    assert!(flush_hits.is_empty());
+    assert_eq!(flush_hits, [] as [crate::wire::Hit; 0]);
     assert!(!resp.must_close());
   }
 
@@ -1916,7 +1916,7 @@ mod tests {
     assert!(matches!(resp.state, State::Opaque), "{:?}", resp.state);
     let (out, hits) = resp.substitute(b"body-bytes").await;
     assert!(matches!(out, Cow::Borrowed(_)));
-    assert!(hits.is_empty());
+    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
   }
 
   #[tokio::test]
@@ -1930,7 +1930,7 @@ mod tests {
     let (out, hits) = resp.substitute(head.as_bytes()).await;
     let out = out.into_owned();
     assert!(out.ends_with(b"\r\n\r\n"));
-    assert!(hits.is_empty());
+    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
     let (_out, hits) = resp.substitute(body.as_bytes()).await;
     assert_eq!(hits.len(), 1);
     assert!(resp.must_close(), "compressed body hit must fail closed");
@@ -2252,7 +2252,7 @@ mod tests {
     let (out, hits) = resp.substitute(input.as_bytes()).await;
     let out = String::from_utf8(out.into_owned()).unwrap();
     assert_eq!(out, input, "unparseable body is untouched");
-    assert!(hits.is_empty());
+    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
     assert!(store.snapshot_pairs().is_empty());
   }
 

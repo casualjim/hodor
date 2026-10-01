@@ -1,10 +1,10 @@
-//! Binary-owned subcommands: each args struct plus its [`CliCommand`] run.
+//! Binary-owned subcommands: each args struct implements [`CliCommand`] and
+//! owns its `run`.
 //!
 //! Workspace commands (`init`, `agent`, `up`, `down`, `logs`) live in
 //! `hodor-compose` instead; [`serve`](crate::serve) keeps its backend
 //! machinery in the crate root and [`ServeArgs::run`] delegates to it.
 
-use std::fs;
 use std::path::PathBuf;
 
 use crate::{ca_path, fwd, generation_registry, serve};
@@ -134,7 +134,7 @@ impl CliCommand for FakeArgs {
 
 /// Arguments for [`Command::Ca`](crate::Command::Ca).
 #[derive(Args, Debug, Clone, Copy)]
-pub struct CaArgs {}
+pub struct CaArgs;
 
 impl CliCommand for CaArgs {
   type Error = Report;
@@ -144,7 +144,11 @@ impl CliCommand for CaArgs {
   ///
   /// Returns an error when the config or CA does not load.
   async fn run(self, cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
-    let (config, _) = load(cli, None)?;
+    let cli = cli.clone();
+    let (config, _) = tokio::task::spawn_blocking(move || load(&cli, None).map_err(Box::new))
+      .await
+      .map_err(|err| eyre!("config load task failed: {err}"))?
+      .map_err(|err| eyre!("config load: {err}"))?;
     let ca = load_or_generate(&ca_path(&config.proxy)?)?;
     print!("{}", String::from_utf8_lossy(&ca.cert_pem()));
     Ok(())
@@ -153,7 +157,7 @@ impl CliCommand for CaArgs {
 
 /// Arguments for [`Command::Rules`](crate::Command::Rules).
 #[derive(Args, Debug, Clone, Copy)]
-pub struct RulesArgs {}
+pub struct RulesArgs;
 
 impl CliCommand for RulesArgs {
   type Error = Report;
@@ -163,7 +167,10 @@ impl CliCommand for RulesArgs {
   ///
   /// Returns an error when the registry or fnox source does not open.
   async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
-    print!("{}", rules_command(cwd_project_rules_dir().as_deref())?);
+    let rendered = tokio::task::spawn_blocking(|| rules_command(cwd_project_rules_dir().as_deref()))
+      .await
+      .map_err(|err| eyre!("rules task failed: {err}"))??;
+    print!("{rendered}");
     Ok(())
   }
 }
@@ -210,7 +217,9 @@ impl CliCommand for RegistryArgs {
     let import = match &self.command {
       RegistryCommand::FromOidc(import) | RegistryCommand::FromOpenapi(import) => import,
     };
-    let doc = fs::read_to_string(&import.file).map_err(|err| eyre!("read {}: {err}", import.file.display()))?;
+    let doc = tokio::fs::read_to_string(&import.file)
+      .await
+      .map_err(|err| eyre!("read {}: {err}", import.file.display()))?;
     let flows = match &self.command {
       RegistryCommand::FromOidc(_) => {
         vec![(import.slug.clone(), flow_from_oidc(&doc).map_err(|err| err.to_string()))]
@@ -227,9 +236,9 @@ impl CliCommand for RegistryArgs {
   }
 }
 
-/// Arguments for [`Command::Fwd`](crate::Command::Fwd).
+/// Arguments for the `hodor config` reference dump.
 #[derive(Args, Debug, Clone, Copy)]
-pub struct ConfigArgs {}
+pub struct ConfigArgs;
 
 impl CliCommand for ConfigArgs {
   type Error = Report;
@@ -240,7 +249,11 @@ impl CliCommand for ConfigArgs {
   ///
   /// Returns an error when the config does not load.
   async fn run(self, cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
-    load(cli, None)?;
+    let cli = cli.clone();
+    tokio::task::spawn_blocking(move || load(&cli, None).map_err(Box::new))
+      .await
+      .map_err(|err| eyre!("config load task failed: {err}"))?
+      .map_err(|err| eyre!("config load: {err}"))?;
     print!(
       "{}{}",
       confique::toml::template::<AppConfig>(FormatOptions::default()),
@@ -251,7 +264,7 @@ impl CliCommand for ConfigArgs {
 }
 
 #[derive(Args, Debug, Clone, Copy)]
-pub struct FwdArgs {}
+pub struct FwdArgs;
 
 impl CliCommand for FwdArgs {
   type Error = Report;

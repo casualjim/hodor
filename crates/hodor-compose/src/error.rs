@@ -3,7 +3,9 @@
 use std::io::Error as IoError;
 use std::path::PathBuf;
 
+use hodor_config::Error as ConfigError;
 use hodor_config::config::RewriteFormat;
+use hodor_fnox::Error as FnoxError;
 use serde_yaml::Error as YamlError;
 use toml_edit::TomlError;
 
@@ -12,10 +14,10 @@ use toml_edit::TomlError;
 pub enum Error {
   /// A `hodor-config` error passes through.
   #[error(transparent)]
-  Config(#[from] hodor_config::Error),
+  Config(Box<ConfigError>),
   /// A `hodor-fnox` error passes through.
   #[error(transparent)]
-  Fnox(#[from] hodor_fnox::Error),
+  Fnox(Box<FnoxError>),
   /// A `hodor-pki` error passes through.
   #[error(transparent)]
   Pki(#[from] hodor_pki::Error),
@@ -236,4 +238,16 @@ pub enum Error {
     /// Offending template.
     template: String,
   },
+}
+
+impl From<ConfigError> for Error {
+  fn from(source: ConfigError) -> Self {
+    Self::Config(Box::new(source))
+  }
+}
+
+impl From<FnoxError> for Error {
+  fn from(source: FnoxError) -> Self {
+    Self::Fnox(Box::new(source))
+  }
 }

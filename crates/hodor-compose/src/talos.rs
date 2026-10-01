@@ -59,6 +59,78 @@ struct TalosContext {
   auth: Option<Mapping>,
 }
 
+/// The validated client identity of the active context.
+struct Identity {
+  crt: Vec<u8>,
+  key: Vec<u8>,
+  ca: Vec<u8>,
+}
+
+impl TalosDoc {
+  /// Resolve and validate the active context: known, with endpoints, no
+  /// alternative auth, and a full `ca`/`crt`/`key` identity.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the context is missing or unknown, states no
+  /// endpoints, carries no client pair, or uses Omni auth.
+  fn selected<'a>(&'a self, source: &Path, invalid: impl Fn(String) -> Error) -> Result<(&'a TalosContext, Identity), Error> {
+    if self.context.is_empty() {
+      return Err(invalid("missing `context`".to_string()));
+    }
+    let context = self
+      .contexts
+      .get(&self.context)
+      .ok_or_else(|| invalid(format!("unknown context `{}`", self.context)))?;
+    if context.endpoints.is_empty() {
+      return Err(invalid(format!("context `{}` states no `endpoints`", self.context)));
+    }
+    if context.auth.is_some() {
+      return Err(invalid(
+        "alternative `auth` (Omni/SideroV1) is not supported: it carries no substitutable client pair".to_string(),
+      ));
+    }
+    let crt = decode(source, RewriteFormat::Talos, Some(context.crt.as_str()), "crt")?;
+    let key = decode(source, RewriteFormat::Talos, Some(context.key.as_str()), "key")?;
+    let ca_bundle = decode(source, RewriteFormat::Talos, Some(context.ca.as_str()), "ca")?;
+    if crt.is_none() || key.is_none() || ca_bundle.is_none() {
+      return Err(invalid(format!(
+        "context `{}` misses `ca`, `crt`, or `key`: nothing to substitute",
+        self.context
+      )));
+    }
+    Ok((
+      context,
+      Identity {
+        crt: crt.unwrap_or_default(),
+        key: key.unwrap_or_default(),
+        ca: ca_bundle.unwrap_or_default(),
+      },
+    ))
+  }
+
+  /// One allow entry per endpoint, `https://`-normalized and validated.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when an endpoint does not map onto an allow entry or
+  /// is not TLS.
+  fn allows(context: &TalosContext, invalid: impl Fn(String) -> Error) -> Result<Vec<String>, Error> {
+    let mut allows = Vec::new();
+    for endpoint in &context.endpoints {
+      let entry = normalize_endpoint(endpoint);
+      let scope: EndpointScope = entry
+        .parse()
+        .map_err(|detail| invalid(format!("endpoint `{endpoint}` is not an allow entry: {detail}")))?;
+      if scope.scheme != Scheme::Https {
+        return Err(invalid(format!("endpoint `{endpoint}` is not TLS: the Talos API is TLS-only")));
+      }
+      allows.push(entry);
+    }
+    Ok(allows)
+  }
+}
+
 /// Map a talosconfig onto its grant fragment and decoy twin.
 ///
 /// # Errors
@@ -72,56 +144,19 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     file: source.to_path_buf(),
     source: err,
   })?;
-  let file = || source.to_path_buf();
   let invalid = |detail: String| Error::RewriteInvalid {
-    file: file(),
+    file: source.to_path_buf(),
     format: RewriteFormat::Talos,
     detail,
   };
-  if doc.context.is_empty() {
-    return Err(invalid("missing `context`".to_string()));
-  }
-  let context = doc
-    .contexts
-    .get(&doc.context)
-    .ok_or_else(|| invalid(format!("unknown context `{}`", doc.context)))?;
-  if context.endpoints.is_empty() {
-    return Err(invalid(format!("context `{}` states no `endpoints`", doc.context)));
-  }
-  if context.auth.is_some() {
-    return Err(invalid(
-      "alternative `auth` (Omni/SideroV1) is not supported: it carries no substitutable client pair".to_string(),
-    ));
-  }
-  let crt = decode(source, RewriteFormat::Talos, Some(context.crt.as_str()), "crt")?;
-  let key = decode(source, RewriteFormat::Talos, Some(context.key.as_str()), "key")?;
-  let ca_bundle = decode(source, RewriteFormat::Talos, Some(context.ca.as_str()), "ca")?;
-  if crt.is_none() || key.is_none() || ca_bundle.is_none() {
-    return Err(invalid(format!(
-      "context `{}` misses `ca`, `crt`, or `key`: nothing to substitute",
-      doc.context
-    )));
-  }
-  let crt = crt.unwrap_or_default();
-  let key = key.unwrap_or_default();
-  let ca_bundle = ca_bundle.unwrap_or_default();
-  let mut allows = Vec::new();
-  for endpoint in &context.endpoints {
-    let entry = normalize_endpoint(endpoint);
-    let scope: EndpointScope = entry
-      .parse()
-      .map_err(|detail| invalid(format!("endpoint `{endpoint}` is not an allow entry: {detail}")))?;
-    if scope.scheme != Scheme::Https {
-      return Err(invalid(format!("endpoint `{endpoint}` is not TLS: the Talos API is TLS-only")));
-    }
-    allows.push(entry);
-  }
+  let (active, identity) = doc.selected(source, invalid)?;
+  let allows = TalosDoc::allows(active, invalid)?;
   let label = rewrite_label(source, RewriteFormat::Talos, &doc.context)?;
   let env = label.to_uppercase().replace('-', "_");
   // Identity-only grant: the certificate never reaches the wire as
   // application data, so it can never match the swap; it still needs a value
   // to resolve.
-  let value = String::from_utf8_lossy(&crt).into_owned();
+  let value = String::from_utf8_lossy(&identity.crt).into_owned();
   let (guest_cert_path, guest_key_path) = load_or_generate_client_pair(ca, guests_dir, &label)?;
   let guest_cert = fs::read(&guest_cert_path).map_err(|source| Error::ReadFile {
     path: guest_cert_path.clone(),
@@ -134,7 +169,11 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
   let cert_name = format!("{label}.client.crt");
   let key_name = format!("{label}.client.key");
   let ca_name = format!("{label}.ca.crt");
-  let materialized = vec![(cert_name.clone(), crt), (key_name.clone(), key), (ca_name.clone(), ca_bundle)];
+  let materialized = vec![
+    (cert_name.clone(), identity.crt),
+    (key_name.clone(), identity.key),
+    (ca_name.clone(), identity.ca),
+  ];
   let tls = HostTlsCfg {
     client_cert: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}"))),
     client_key: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}"))),
@@ -159,8 +198,8 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     contexts: BTreeMap::from([(
       doc.context.clone(),
       DecoyContext {
-        endpoints: context.endpoints.clone(),
-        nodes: context.nodes.clone(),
+        endpoints: active.endpoints.clone(),
+        nodes: active.nodes.clone(),
         ca: STANDARD.encode(ca.cert_pem()),
         crt: STANDARD.encode(&guest_cert),
         key: STANDARD.encode(&guest_key),

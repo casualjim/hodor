@@ -207,7 +207,7 @@ impl Registry {
   fn apply(&mut self, text: &str, source: &Path) -> Result<(), Error> {
     let file: RegistryFile = toml::from_str(text).map_err(|err| Error::ParseFile {
       path: source.to_path_buf(),
-      source: err,
+      source: Box::new(err),
     })?;
     // One file claiming the same name twice is a data bug; a later file
     // overriding an earlier one is the intended mechanism.

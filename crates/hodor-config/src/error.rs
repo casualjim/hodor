@@ -33,7 +33,7 @@ pub enum Error {
     path: PathBuf,
     /// Underlying parse failure.
     #[source]
-    source: TomlError,
+    source: Box<TomlError>,
   },
   /// A rules file carries `rules` as something other than a table.
   #[error("{}: `rules` must be a table", path.display())]
@@ -50,7 +50,7 @@ pub enum Error {
     label: String,
     /// Underlying parse failure.
     #[source]
-    source: TomlError,
+    source: Box<TomlError>,
   },
   /// Two rules share one env name.
   #[error("rules `{previous}` and `{label}` share env name `{env}`")]
@@ -318,7 +318,7 @@ pub enum Error {
     name: String,
     /// Underlying parse failure.
     #[source]
-    source: TomlError,
+    source: Box<TomlError>,
   },
   /// A profile cookie's parent is not a string.
   #[error("{}: `[profile] parent` must be a string", path.display())]

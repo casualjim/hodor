@@ -382,7 +382,7 @@ fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> Result<BT
     })?;
     let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
       path: path.to_path_buf(),
-      source,
+      source: Box::new(source),
     })?;
     let Some(rules) = doc.get("rules") else {
       continue;
@@ -392,7 +392,7 @@ fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> Result<BT
       let cfg = RuleCfg::deserialize(entry.clone()).map_err(|source| Error::BadRule {
         path: path.to_path_buf(),
         label: label.clone(),
-        source,
+        source: Box::new(source),
       })?;
       merged.insert(label.clone(), cfg);
     }
@@ -410,7 +410,7 @@ fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> Result<BT
     })?;
     let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
       path: path.to_path_buf(),
-      source,
+      source: Box::new(source),
     })?;
     if let Some(tools) = doc.get("tools") {
       let table = tools.as_table().ok_or_else(|| Error::ToolsNotTable { path: path.to_path_buf() })?;
@@ -418,7 +418,7 @@ fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> Result<BT
         let cfg = ToolCfg::deserialize(entry.clone()).map_err(|source| Error::BadTool {
           path: path.to_path_buf(),
           name: name.clone(),
-          source,
+          source: Box::new(source),
         })?;
         merged.insert(name.clone(), cfg);
       }
@@ -500,7 +500,7 @@ fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) 
     })?;
     let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
       path: cookie.clone(),
-      source,
+      source: Box::new(source),
     })?;
     let Some(parent) = doc.get("profile").and_then(|table| table.get("parent")) else {
       return Ok(None);

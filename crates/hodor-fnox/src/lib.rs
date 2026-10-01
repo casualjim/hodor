@@ -32,7 +32,7 @@ fn discovered_or_none(found: fnox_core::Result<fnox_core::config::Config>) -> Re
   match found {
     Ok(config) => Ok(Some(config)),
     Err(fnox_core::FnoxError::ConfigNotFound { .. }) => Ok(None),
-    Err(err) => Err(Error::Discovery { source: err }),
+    Err(err) => Err(Error::Discovery { source: Box::new(err) }),
   }
 }
 
@@ -41,7 +41,7 @@ fn discovered_or_none(found: fnox_core::Result<fnox_core::config::Config>) -> Re
 fn active_profiles(config: &fnox_core::config::Config) -> Result<Vec<String>, Error> {
   config
     .resolve_profiles(&fnox_core::config::Config::get_profiles(&[]))
-    .map_err(|source| Error::Profiles { source })
+    .map_err(|source| Error::Profiles { source: Box::new(source) })
 }
 
 /// Names a config declares under the active profiles.
@@ -52,7 +52,7 @@ fn declared_names(config: &fnox_core::config::Config, profiles: &[String]) -> Re
   Ok(
     config
       .get_secrets_with_no_defaults(profiles, no_defaults)
-      .map_err(|source| Error::ListSecrets { source })?
+      .map_err(|source| Error::ListSecrets { source: Box::new(source) })?
       .into_keys()
       .collect(),
   )
@@ -83,7 +83,7 @@ impl FnoxSource {
   fn open_at(path: &Path) -> Result<Self, Error> {
     let config = crate::layers::load(path).map_err(|source| Error::ConfigFile {
       path: path.to_path_buf(),
-      source,
+      source: Box::new(source),
     })?;
     let profiles = active_profiles(&config)?;
     let declared = declared_names(&config, &profiles)?;
@@ -108,7 +108,7 @@ impl FnoxSource {
     }
     let Some(secret) = self.config.get_secret(&self.profiles, key).map_err(|source| Error::Secret {
       key: key.to_string(),
-      source,
+      source: Box::new(source),
     })?
     else {
       return Err(Error::DeclaredNoValue { key: key.to_string() });
@@ -117,7 +117,7 @@ impl FnoxSource {
       .await
       .map_err(|source| Error::Secret {
         key: key.to_string(),
-        source,
+        source: Box::new(source),
       })?;
     let Some(value) = resolved else {
       return Err(Error::DeclaredNoValue { key: key.to_string() });

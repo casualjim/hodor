@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use fnox_core::FnoxError;
+use hodor_config::Error as ConfigError;
 
 /// Every way fnox discovery and secret resolution can fail.
 #[derive(Debug, thiserror::Error)]
@@ -12,21 +13,21 @@ pub enum Error {
   Discovery {
     /// Underlying discovery failure.
     #[source]
-    source: FnoxError,
+    source: Box<FnoxError>,
   },
   /// Active profiles do not resolve.
   #[error("fnox profiles: {source}")]
   Profiles {
     /// Underlying profile failure.
     #[source]
-    source: FnoxError,
+    source: Box<FnoxError>,
   },
   /// Declared secrets cannot be listed.
   #[error("fnox: cannot list secrets: {source}")]
   ListSecrets {
     /// Underlying listing failure.
     #[source]
-    source: FnoxError,
+    source: Box<FnoxError>,
   },
   /// One config file does not load.
   #[error("fnox config {}: {source}", path.display())]
@@ -35,7 +36,7 @@ pub enum Error {
     path: PathBuf,
     /// Underlying load failure.
     #[source]
-    source: FnoxError,
+    source: Box<FnoxError>,
   },
   /// One secret does not read.
   #[error("fnox secret `{key}`: {source}")]
@@ -44,7 +45,7 @@ pub enum Error {
     key: String,
     /// Underlying read failure.
     #[source]
-    source: FnoxError,
+    source: Box<FnoxError>,
   },
   /// A declared key resolves to no value.
   #[error("fnox key `{key}` is declared but resolves to no value")]
@@ -70,5 +71,11 @@ pub enum Error {
   },
   /// A registry error passes through from `hodor-config`.
   #[error(transparent)]
-  Registry(#[from] hodor_config::Error),
+  Registry(Box<ConfigError>),
+}
+
+impl From<ConfigError> for Error {
+  fn from(source: ConfigError) -> Self {
+    Self::Registry(Box::new(source))
+  }
 }

@@ -38,6 +38,10 @@ printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/hodor/config.toml"
 k3d cluster delete "$cluster" >/dev/null 2>&1 || true
 k3d cluster create "$cluster" --wait --kubeconfig-update-default=false --kubeconfig-switch-context=false
 
+# With update-default off, k3d wrote no kubeconfig anywhere; write its
+# store copy to the task file so kubectl has a config to read.
+k3d kubeconfig get "$cluster" >"$KUBECONFIG"
+
 # k3d --wait covers node container readiness, not a serving apiserver; slow
 # runners hit EOF on the first request. kubectl wait polls until nodes are
 # Ready, which implies the apiserver answers.

@@ -1,6 +1,6 @@
 # Registry reference
 
-The bundled known-host registry: environment names, API hosts, and token shapes for the services hodor knows out of the box. The table lives in [`rules/registry.toml`](https://github.com/casualjim/hodor/blob/main/rules/registry.toml) in the repository; this page documents the format, which is the same for the bundled table and for overrides.
+The bundled known-host registry: environment names, API hosts, and token shapes for the services hodor knows out of the box. The table lives in [`rules/registry.toml`](https://raw.githubusercontent.com/casualjim/hodor/main/rules/registry.toml) in the repository; this page documents the format, which is the same for the bundled table and for overrides.
 
 ## Tables
 

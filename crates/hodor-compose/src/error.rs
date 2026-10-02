@@ -208,13 +208,6 @@ pub enum Error {
     /// Exit status.
     status: String,
   },
-  /// The workspace rules do not generate.
-  #[error("generate the workspace rules: {source}")]
-  GenerateRules {
-    /// Underlying generation failure.
-    #[source]
-    source: Box<Error>,
-  },
   /// A file mode cannot be set.
   #[error("chmod {}: {source}", path.display())]
   ChmodFile {

@@ -26,7 +26,7 @@ mod tests {
   use std::slice::from_ref;
 
   use hodor_config::cli::{Cli, ProxyBackend};
-  use hodor_config::config::{FileRewrite, RewriteFormat, ToolCfg};
+  use hodor_config::config::{FileRewrite, RewriteFormat, RuleCfg, ToolCfg};
   use tempfile::tempdir;
 
   use crate::confine::*;
@@ -101,13 +101,12 @@ mod tests {
   }
 
   #[test]
-  fn rules_toml_lists_every_env_without_values() {
+  fn rules_toml_lists_what_derives_automatically() {
     let toml = rules_toml(&decoys(), &[], &[]);
-    assert!(toml.contains("[rules.github_token]"), "{toml}");
-    assert!(toml.contains("env = \"GITHUB_TOKEN\""), "{toml}");
-    assert!(toml.contains("[rules.anthropic_api_key]"), "{toml}");
-    assert!(toml.contains("#   allow = [\"https://api.internal.example.com\"]"), "{toml}");
+    assert!(toml.contains("#   GITHUB_TOKEN"), "{toml}");
+    assert!(toml.contains("#   ANTHROPIC_API_KEY"), "{toml}");
     assert!(!toml.contains("value ="), "{toml}");
+    assert!(!toml.contains("\n[rules."), "{toml}");
   }
 
   #[test]
@@ -140,7 +139,6 @@ mod tests {
     assert!(toml.contains("# [rules.argo_cd_token]"), "{toml}");
     assert!(toml.contains("# env = \"ARGO_CD_TOKEN\""), "{toml}");
     assert!(toml.contains("# allow = [\"https://<your-host>\"]"), "{toml}");
-    assert!(!toml.contains("\n[rules.argo_cd_token]"), "{toml}");
     assert!(toml.contains("# TAVILY_API_KEY"), "{toml}");
   }
 
@@ -632,6 +630,30 @@ mod tests {
   }
 
   #[test]
+  fn rules_d_overrides_mount_into_the_hodor_service() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let rules_d = config_dir.path().join("rules.d");
+    std::fs::create_dir_all(&rules_d).unwrap();
+    std::fs::write(
+      rules_d.join("gitea.toml"),
+      "[names.GITEA_TOKEN]\nhosts = [\"https://code.lotsa.ai\"]\n",
+    )
+    .unwrap();
+
+    let binds = fnox_binds(None, Some(config_dir.path()));
+    let rendered: Vec<String> = binds
+      .mounts
+      .iter()
+      .map(|entry| format!("{}:{}:ro", entry.host.display(), entry.container.display()))
+      .collect();
+    assert_eq!(
+      rendered,
+      vec![format!("{}:/root/.config/hodor/rules.d:ro", rules_d.display())],
+      "serve derives rules from the registry in-container, so the global rules.d must be in view"
+    );
+  }
+
+  #[test]
   fn support_files_are_written_when_absent_and_stale_entrypoints_regenerate() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
@@ -941,22 +963,23 @@ mod tests {
     );
   }
 
-  /// Zero rules is the state that answers every provider with a decoy: it has
-  /// to be said out loud rather than served silently.
+  /// Zero rules with nothing derivable answers every provider with a decoy:
+  /// it has to be said out loud rather than served silently. A derivable
+  /// name substitutes on its own, so it silences the warning.
   #[test]
-  fn serving_no_rules_is_announced() {
-    let config_file = Path::new("/ws/.config/hodor/config.toml");
-    let warning = rules_warning(&BTreeMap::new(), config_file).expect("no rules is worth a warning");
-    assert!(
-      warning.contains("no [rules.*]") && warning.contains("/ws/.config/hodor/config.toml"),
-      "{warning}"
-    );
+  fn serving_no_rules_and_nothing_derivable_is_announced() {
+    let warning = rules_warning(&BTreeMap::new(), &[]).expect("no rules and nothing derivable is worth a warning");
+    assert!(warning.contains("no [rules.*]") && warning.contains("nothing derives"), "{warning}");
 
     let rules = BTreeMap::from([(
       "github".to_string(),
-      toml_edit::de::from_str::<hodor_config::config::RuleCfg>("env = \"GH_TOKEN\"\n").unwrap(),
+      toml_edit::de::from_str::<RuleCfg>("env = \"GH_TOKEN\"\n").unwrap(),
     )]);
-    assert!(rules_warning(&rules, config_file).is_none(), "one rule is enough not to warn");
+    assert!(rules_warning(&rules, &[]).is_none(), "one rule is enough not to warn");
+    assert!(
+      rules_warning(&BTreeMap::new(), &["GITEA_TOKEN".to_string()]).is_none(),
+      "a derivable name substitutes without any config rule"
+    );
   }
 
   #[test]

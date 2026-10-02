@@ -258,6 +258,29 @@ fn fnox_key(rule: &RuleCfg) -> String {
 pub async fn resolve(config: &mut AppConfig, registry: &Registry, fnox: Option<FnoxSource>) -> Result<(), Error> {
   // Values are fetched before the map is mutated, so rules stay borrowed
   // immutably while fnox is awaited.
+  // The catalog derives from what fnox declares and the registry hosts;
+  // config states overrides, not every name. An explicit rule wins per env,
+  // and a name the registry gives no hosts derives nothing.
+  if let Some(source) = &fnox {
+    let covered = config.rules.values().map(|rule| rule.env.clone()).collect::<BTreeSet<_>>();
+    for name in source.declared() {
+      if covered.contains(name) || registry.lookup(name).is_none_or(|known| known.hosts.is_empty()) {
+        continue;
+      }
+      config.rules.entry(name.to_lowercase()).or_insert_with(|| RuleCfg {
+        env: name.clone(),
+        value: None,
+        real: None,
+        fnox_key: None,
+        allow: Vec::new(),
+        pattern: None,
+        oauth2: None,
+        registry: None,
+        if_missing: IfMissing::Warn,
+        tls: BTreeMap::new(),
+      });
+    }
+  }
   let keys = config
     .rules
     .iter()
@@ -492,8 +515,8 @@ mod tests {
     }
   }
 
-  fn config_with(label: &str, rule: RuleCfg) -> AppConfig {
-    let mut config = AppConfig {
+  fn empty_config() -> AppConfig {
+    AppConfig {
       proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
@@ -504,7 +527,11 @@ mod tests {
       rules: BTreeMap::new(),
       plugins: BTreeMap::new(),
       tools: BTreeMap::new(),
-    };
+    }
+  }
+
+  fn config_with(label: &str, rule: RuleCfg) -> AppConfig {
+    let mut config = empty_config();
     config.rules.insert(label.to_string(), rule);
     config
   }
@@ -530,6 +557,36 @@ value = "other-real-token"
     let fnox = FnoxSource::open_at(&path).unwrap();
     assert_eq!(selected_envs(Some(&fnox), &registry), vec!["GITHUB_TOKEN".to_string()]);
     assert_eq!(selected_envs(None, &registry), [] as [std::string::String; 0]);
+  }
+
+  #[tokio::test]
+  async fn resolve_derives_a_rule_for_every_fnox_secret_the_registry_hosts() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fnox(dir.path(), FNOX_PLAIN);
+    let fnox = FnoxSource::open_at(&path).unwrap();
+    let mut config = empty_config();
+    resolve(&mut config, &registry, Some(fnox)).await.unwrap();
+    let rule = &config.rules["github_token"];
+    assert_eq!(rule.env, "GITHUB_TOKEN");
+    assert_eq!(rule.value.as_ref().unwrap().expose_secret(), "real-github-token");
+    assert!(rule.allow.contains(&"https://api.github.com".to_string()));
+    assert_eq!(rule.pattern.as_deref(), Some("ghp_{hex:40}"));
+    assert_eq!(config.rules.len(), 1, "OTHER_TOKEN has no registry entry and must not derive");
+  }
+
+  #[tokio::test]
+  async fn an_explicit_rule_for_the_env_beats_derivation() {
+    let registry = Registry::load(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fnox(dir.path(), FNOX_PLAIN);
+    let fnox = FnoxSource::open_at(&path).unwrap();
+    let mut rule = rule("GITHUB_TOKEN");
+    rule.allow = vec!["https://ghe.corp.example".to_string()];
+    let mut config = config_with("mine", rule);
+    resolve(&mut config, &registry, Some(fnox)).await.unwrap();
+    assert_eq!(config.rules.len(), 1, "the explicit rule must win, no derived twin");
+    assert!(config.rules.contains_key("mine"));
   }
 
   /// Config whose only rule pulls its value from the temp fnox file.

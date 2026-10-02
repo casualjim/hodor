@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -421,14 +422,22 @@ pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
 }
 
 /// Merge `[rules]` tables by label: global first, project wins wholesale
-/// per label. Errors name the file + label.
+/// per label. Errors name the file + label. A file that does not exist is
+/// no layer at all: generation names the project path even when the
+/// workspace has no config yet.
 fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> Result<BTreeMap<String, RuleCfg>, Error> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = fs::read_to_string(path).map_err(|source| Error::ReadFile {
-      path: path.to_path_buf(),
-      source,
-    })?;
+    let text = match fs::read_to_string(path) {
+      Ok(text) => text,
+      Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+      Err(source) => {
+        return Err(Error::ReadFile {
+          path: path.to_path_buf(),
+          source,
+        });
+      }
+    };
     let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
       path: path.to_path_buf(),
       source: Box::new(source),
@@ -450,13 +459,21 @@ fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> Result<BT
 }
 
 /// Merge `[tools]` tables by name: global first, project wins per name.
+/// A file that does not exist is no layer at all, as in
+/// [`load_merged_rules`].
 fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> Result<BTreeMap<String, ToolCfg>, Error> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = std::fs::read_to_string(path).map_err(|source| Error::ReadFile {
-      path: path.to_path_buf(),
-      source,
-    })?;
+    let text = match std::fs::read_to_string(path) {
+      Ok(text) => text,
+      Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+      Err(source) => {
+        return Err(Error::ReadFile {
+          path: path.to_path_buf(),
+          source,
+        });
+      }
+    };
     let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
       path: path.to_path_buf(),
       source: Box::new(source),
@@ -1056,6 +1073,34 @@ allow = ["https://c.example"]
     assert_eq!(config.rules["a"].value.as_ref().unwrap().expose_secret(), "global-a");
     assert_eq!(config.rules["b"].value.as_ref().unwrap().expose_secret(), "project-b");
     assert_eq!(config.rules["c"].value.as_ref().unwrap().expose_secret(), "project-c");
+    scrub_env();
+  }
+
+  #[test]
+  fn a_config_flag_pointing_at_nothing_yields_the_global_layer_alone() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(
+      &global,
+      r#"
+[rules.a]
+env = "A_TOKEN"
+value = "global-a"
+allow = ["https://a.example"]
+"#,
+    );
+    set_env("HODOR_CONFIG", &global);
+    let missing = dir.path().join("fresh").join(".config").join("hodor").join("config.toml");
+    let cli = cli_for(&["hodor", "--config", missing.to_str().unwrap()]);
+    let (config, _) = load(&cli, None).unwrap();
+    assert_eq!(config.rules["a"].value.as_ref().unwrap().expose_secret(), "global-a");
+    assert_eq!(
+      config.rules.len(),
+      1,
+      "a project file that does not exist is no project layer at all"
+    );
     scrub_env();
   }
 

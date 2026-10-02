@@ -1,3 +1,12 @@
+## [0.2.5] - 2026-10-02
+
+### 🚀 Features
+
+- *(compose)* [**breaking**] Known config file formats derive grants (kubeconfig, talosconfig) (#41)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Drop vendored skills from lychee
 ## [0.2.4] - 2026-09-29
 
 ### 🚀 Features
@@ -16,6 +25,8 @@
 - Update changelog for v0.4.0 [ci skip]
 - Release
 - Release hodor version 0.2.3
+- Update changelog for v0.2.4 [ci skip]
+- Release
 ## [0.2.2] - 2026-09-27
 
 ### ⚙️ Miscellaneous Tasks

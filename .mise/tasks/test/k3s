@@ -22,14 +22,21 @@ cleanup() {
 trap cleanup EXIT
 rm -rf "$scratch"
 mkdir -p "$scratch" "$scratch/config/hodor"
+
+# Isolation: every k3d/kubectl call in this task sees only task-local
+# kubeconfig files under $scratch; the user's ~/.kube/config is never
+# read, merged, or written.
+export KUBECONFIG="$scratch/task-kubeconfig"
 # Stack generation needs `[workspace] home`, which normally arrives via the
 # user's global config; the hermetic XDG_CONFIG_HOME hides that file, so the
 # task seeds the one value generation requires.
 printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/hodor/config.toml"
 
 # Fresh cluster every run: leftover state from a killed run must not leak in.
+# The kubeconfig flags keep k3d from touching ~/.kube/config even if the
+# KUBECONFIG export above were lost.
 k3d cluster delete "$cluster" >/dev/null 2>&1 || true
-k3d cluster create "$cluster" --wait
+k3d cluster create "$cluster" --wait --kubeconfig-update-default=false --kubeconfig-switch-context=false
 
 # k3d writes the server as 0.0.0.0, which is not a usable TLS identity or dial
 # address everywhere a grant travels; loopback is the same listener.

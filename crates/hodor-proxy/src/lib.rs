@@ -1,6 +1,7 @@
 //! Explicit proxy core: CONNECT splice, TLS intercept relay.
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +29,8 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use crate::connection::{GuestIo, PgTransport, Prefixed, PumpService, client_auth_policy, dial_marked, trust_anchors};
-use crate::identity::{Expect, Hello, MintBucket, expect, read_client_hello, read_http_head};
+use crate::identity::{Expect, Hello, MintBucket, expect, hello_complete, read_client_hello, read_http_head};
+use crate::mint::{MintHandle, MintStore};
 use crate::protocol::{MAX_HEAD, PairCtx, http_pair, postgres_pair, raw_tcp_pair};
 use crate::wire::{GuestOpening, read_guest_opening, request_upstream_tls};
 use hodor_config::grants::{Grant, ResolvedConfig, Scheme, SslMode};
@@ -36,6 +38,7 @@ use hodor_pki::ca::CertAuthority;
 pub(crate) use relay::relay_guarded;
 
 mod connection;
+mod error;
 mod identity;
 mod mint;
 mod protocol;
@@ -45,6 +48,9 @@ mod relay;
 
 /// One HTTPS MITM relay shape: cached in-memory leaf issuer.
 type HttpsRelay = TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>;
+
+pub use connection::TrustAnchorsError;
+pub use error::Error;
 
 /// Shared proxy state: live config snapshot, boring MITM relays, and the
 /// issuance burst guard.
@@ -81,9 +87,7 @@ impl std::fmt::Debug for ProxyState {
 }
 
 /// One MITM relay on `ca`'s leaves: webpki egress trust extended with `extra`
-/// bundle anchors. The hodor CA signs guest-facing leaves only and is never
-/// an egress anchor. Additive only — entries gain trust, never shed webpki.
-fn https_relay(ca: &CertAuthority, extra: &[CertificateDer<'static>]) -> eyre::Result<HttpsRelay> {
+fn https_relay(ca: &CertAuthority, extra: &[CertificateDer<'static>]) -> Result<HttpsRelay, Error> {
   let (crt, key) = ca.boring_pair()?;
   let mut egress = TlsMitmEgressServerAuth::new()
     .with_server_verify(ServerVerifyMode::Auto)
@@ -91,7 +95,7 @@ fn https_relay(ca: &CertAuthority, extra: &[CertificateDer<'static>]) -> eyre::R
   if !extra.is_empty() {
     egress = egress
       .try_with_extra_server_trust_anchors(extra.iter().cloned())
-      .map_err(|err| eyre::eyre!("egress trust anchors: {err}"))?;
+      .map_err(|err| Error::EgressTrustAnchors { source: err })?;
   }
   Ok(TlsMitmRelay::new_cached_in_memory(crt, key).with_egress_server_auth(egress))
 }
@@ -126,7 +130,7 @@ impl ProxyState {
   /// when the egress trust policy rejects its anchors, when a trust bundle
   /// cannot be read, when the CA cannot be read back for leaf minting, or
   /// when a configured plugin cannot be loaded.
-  pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> eyre::Result<Self> {
+  pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> Result<Self, Error> {
     let plugins = Arc::new(hodor_plugin::Registry::load(&resolved.plugins)?);
     let mut global = Vec::new();
     for path in &resolved.proxy.root_certs {
@@ -137,14 +141,19 @@ impl ProxyState {
     for path in entry_anchors(&resolved) {
       let mut anchors = global.clone();
       anchors.extend(trust_anchors(&path)?);
-      let extra_relay = https_relay(ca, &anchors).map_err(|err| eyre::eyre!("trust bundle `{}`: {err}", path.display()))?;
+      let extra_relay = https_relay(ca, &anchors).map_err(|source| Error::EntryTrustBundle {
+        path: path.clone(),
+        source: Box::new(source),
+      })?;
       extra_relays.insert(path, extra_relay);
     }
     // Trust for the `mtls` guest leg: the same CA that mints the leaves.
     // Per-connection policies built from it demand a guest certificate.
     let (crt, _) = ca.boring_pair()?;
-    let mut trust = X509StoreBuilder::new().map_err(|err| eyre::eyre!("mtls trust store: {err}"))?;
-    trust.add_cert(&crt).map_err(|err| eyre::eyre!("mtls trust anchor: {err}"))?;
+    let mut trust = X509StoreBuilder::new().map_err(|source| Error::MtlsTrustStore { source: source.into() })?;
+    trust
+      .add_cert(&crt)
+      .map_err(|source| Error::MtlsTrustAnchor { source: source.into() })?;
     let mtls_trust = trust.build();
     let pg = Arc::new(PgTransport::new(ca)?);
     Ok(Self {
@@ -154,7 +163,7 @@ impl ProxyState {
       mtls_trust,
       pg,
       mint: MintBucket::new(),
-      mint_store: Arc::new(crate::mint::MintStore::default()),
+      mint_store: Arc::new(MintStore::default()),
       fwmark: None,
       plugins,
     })
@@ -177,8 +186,8 @@ impl ProxyState {
 
   /// Handle to the runtime token-mint store for new connections.
   #[must_use]
-  pub(crate) fn mint_handle(&self) -> crate::mint::MintHandle {
-    crate::mint::MintHandle::new(Arc::clone(&self.mint_store))
+  pub(crate) fn mint_handle(&self) -> MintHandle {
+    MintHandle::new(Arc::clone(&self.mint_store))
   }
 
   /// `SO_MARK` for upstream sockets (`None` = unmarked).
@@ -188,8 +197,8 @@ impl ProxyState {
   }
 }
 
-/// Box an eyre report for a rama service error, preserving its debug chain.
-pub(crate) fn into_box_error(err: &eyre::Report) -> BoxError {
+/// Box an error for a rama service error, preserving its debug chain.
+pub(crate) fn into_box_error(err: &impl Debug) -> BoxError {
   BoxError::from(format!("{err:?}"))
 }
 /// Serve the explicit listener until its executor shuts down. Accept errors
@@ -206,18 +215,18 @@ pub async fn serve(listener: RamaTcpListener, state: Arc<ProxyState>) {
 ///
 /// Returns an error when the socket cannot be built, bound, or marked
 /// listening.
-pub async fn bind_explicit(addr: SocketAddr) -> eyre::Result<RamaTcpListener> {
+pub async fn bind_explicit(addr: SocketAddr) -> Result<RamaTcpListener, Error> {
   let domain = if addr.is_ipv4() { Domain::IPv4 } else { Domain::IPv6 };
   let socket = SocketOptions {
     address: Some(SocketAddress::from(addr)),
     ..SocketOptions::default_tcp()
   }
   .try_build_socket(domain)
-  .map_err(|err| eyre::eyre!("explicit listen socket: {err}"))?;
-  socket.listen(128).map_err(|err| eyre::eyre!("explicit listen: {err}"))?;
+  .map_err(|err| Error::ListenSocket { source: err.into() })?;
+  socket.listen(128).map_err(|err| Error::Listen { source: err.into() })?;
   RamaTcpListener::bind_socket(socket, Executor::default())
     .await
-    .map_err(|err| eyre::eyre!("explicit bind: {err}"))
+    .map_err(|err| Error::Bind { source: err })
 }
 
 /// Explicit ingress service: HTTP head dispatch (CONNECT vs forward).
@@ -241,7 +250,7 @@ impl Service<RamaTcpStream> for ExplicitService {
   }
 }
 
-async fn dispatch(mut client: TcpStream, state: &ProxyState) -> eyre::Result<()> {
+async fn dispatch(mut client: TcpStream, state: &ProxyState) -> Result<(), Error> {
   let snapshot = state.snapshot();
   let head = read_head(
     &mut client,
@@ -300,7 +309,7 @@ pub async fn serve_connect_stream<G>(
   host: &str,
   port: u16,
   initial: &[u8],
-) -> eyre::Result<()>
+) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -335,7 +344,7 @@ pub async fn serve_transparent_stream<G>(
   dial_host: &str,
   port: u16,
   raw_host: &str,
-) -> eyre::Result<()>
+) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -381,7 +390,7 @@ pub(crate) struct CandidateParams<'a> {
   clippy::too_many_lines,
   reason = "linear dispatch over the arm per protocol, a split would obscure the flow"
 )]
-async fn drive_candidate_stream<G>(mut guest: G, params: CandidateParams<'_>) -> eyre::Result<()>
+async fn drive_candidate_stream<G>(mut guest: G, params: CandidateParams<'_>) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -441,7 +450,13 @@ where
       };
       let (buf, sni, parsed) = match read {
         Hello::Named { buf, sni, hello } => (buf, Some(sni), Some(hello)),
-        Hello::Unnamed { buf } => (buf, None, None),
+        // A complete hello without SNI still carries the client's ALPN and
+        // fingerprint: mirror it instead of falling back to boring defaults,
+        // which negotiate no ALPN and drop framed substitution.
+        Hello::Unnamed { buf } => {
+          let parsed = hello_complete(&buf);
+          (buf, None, parsed)
+        }
       };
       if let (Some(authority), Some(sni)) = (host, sni.as_deref())
         && !sni.eq_ignore_ascii_case(authority)
@@ -464,7 +479,9 @@ where
       };
       let identity = identity.to_string();
       if !state.mint.allow() {
-        eyre::bail!("MITM issuance burst exceeded for {identity}");
+        return Err(Error::BurstExceeded {
+          identity: identity.clone(),
+        });
       }
       state.mint.record();
       let upstream = dial_marked(dial_host, port, state.fwmark).await?;
@@ -493,7 +510,7 @@ where
           .extra_relays
           .get(path)
           .cloned()
-          .ok_or_else(|| eyre::eyre!("unknown trust bundle `{}`", path.display()))?,
+          .ok_or_else(|| Error::UnknownTrustBundle { path: path.clone() })?,
       };
       let relay = TlsMitmRelayService::new(relay, pump);
       match parsed {
@@ -503,8 +520,8 @@ where
             client_hello: hello,
           })
           .await
-          .map_err(|err| eyre::eyre!("MITM relay: {err}")),
-        None => relay.serve(bridge).await.map_err(|err| eyre::eyre!("MITM relay: {err}")),
+          .map_err(|err| Error::MitmRelay { source: err.into() }),
+        None => relay.serve(bridge).await.map_err(|err| Error::MitmRelay { source: err.into() }),
       }
     }
     // Declared Postgres. The entry states the far side's transport and the guest
@@ -542,7 +559,9 @@ where
           return Ok(());
         };
         if !state.mint.allow() {
-          eyre::bail!("MITM issuance burst exceeded for {identity}");
+          return Err(Error::BurstExceeded {
+            identity: identity.clone(),
+          });
         }
         state.mint.record();
         guest_tls = Some((hello_buf, identity));
@@ -612,7 +631,7 @@ where
 
 /// Pump one settled Postgres pair: both legs are plaintext by the time this
 /// runs, whichever transports carried them there.
-async fn relay_pg<G, S>(guest: G, server: S, ctx: &PairCtx<'_>) -> eyre::Result<()>
+async fn relay_pg<G, S>(guest: G, server: S, ctx: &PairCtx<'_>) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
@@ -623,7 +642,7 @@ where
 
 /// Copy bytes unchanged, replaying whatever was already read past the ingress
 /// head so no guest byte is dropped.
-async fn splice_replay<G>(mut guest: G, dial_host: &str, port: u16, fwmark: Option<u32>, read: &[u8]) -> eyre::Result<()>
+async fn splice_replay<G>(mut guest: G, dial_host: &str, port: u16, fwmark: Option<u32>, read: &[u8]) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
@@ -635,7 +654,7 @@ where
   Ok(())
 }
 
-async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &ProxyState, snapshot: &ResolvedConfig) -> eyre::Result<()> {
+async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &ProxyState, snapshot: &ResolvedConfig) -> Result<(), Error> {
   let remainder = target.get(..7).filter(|p| p.eq_ignore_ascii_case("http://")).map(|_| &target[7..]);
   let Some(remainder) = remainder else {
     return Ok(()); // origin-form / unknown scheme: close
@@ -666,13 +685,13 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
 /// Read until the end of the HTTP head (`\r\n\r\n`) or `MAX_HEAD` bytes.
 /// Returns whatever was read; caller checks completeness. Bounded by the
 /// handshake timeout: this runs pre-auth on unauthenticated client bytes.
-async fn read_head(stream: &mut TcpStream, budget: std::time::Duration) -> eyre::Result<Vec<u8>> {
+async fn read_head(stream: &mut TcpStream, budget: std::time::Duration) -> Result<Vec<u8>, Error> {
   tokio::time::timeout(budget, read_head_inner(stream))
     .await
-    .map_err(|_elapsed| eyre::eyre!("client head read timed out"))?
+    .map_err(|_elapsed| Error::HeadTimeout)?
 }
 
-async fn read_head_inner(stream: &mut TcpStream) -> eyre::Result<Vec<u8>> {
+async fn read_head_inner(stream: &mut TcpStream) -> Result<Vec<u8>, Error> {
   let mut buf = Vec::new();
   let mut chunk = [0u8; 8192];
   loop {
@@ -1076,7 +1095,7 @@ mod tests {
       .await
       .unwrap()
       .unwrap();
-    assert!(response.is_empty());
+    assert_eq!(response, [] as [u8; 0]);
     proxy.abort();
   }
 

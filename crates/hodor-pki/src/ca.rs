@@ -1,15 +1,28 @@
 //! CA management + per-domain leaf certificate generation.
 
-use std::io::Write as _;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::fs;
+use std::io::{ErrorKind, Write as _};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::str;
 use std::sync::Arc;
+use std::thread;
 
-use rcgen::{CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair};
+use rama::crypto::pem::PemEncode as _;
+use rama::tls::boring::core::pkey::{PKey, Private};
+use rama::tls::boring::core::x509::X509;
+use rcgen::{
+  BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+};
+use rustls::ServerConfig;
+use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::{Duration, OffsetDateTime};
+
+use crate::error::Error;
 
 /// Leaf validity for generated per-domain certificates.
 const LEAF_VALIDITY_HOURS: u64 = 24;
@@ -21,10 +34,10 @@ pub struct CertAuthority {
   cert_pem: String,
 }
 
-impl std::fmt::Debug for CertAuthority {
+impl Debug for CertAuthority {
   /// Prints only what is safe to log: the private key is never rendered, and
   /// the certificate is summarized rather than dumped.
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+  fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
     f.debug_struct("CertAuthority")
       .field("cert_pem_bytes", &self.cert_pem.len())
       .field("cert_der_bytes", &self.cert_der.len())
@@ -38,19 +51,17 @@ impl CertAuthority {
   /// # Errors
   ///
   /// Returns an error when key generation or self-signing fails.
-  pub fn generate() -> eyre::Result<Self> {
+  pub fn generate() -> Result<Self, Error> {
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, "hodor CA");
-    dn.push(rcgen::DnType::OrganizationName, "hodor");
+    dn.push(DnType::CommonName, "hodor CA");
+    dn.push(DnType::OrganizationName, "hodor");
     params.distinguished_name = dn;
-    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign];
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-    let key_pair = KeyPair::generate().map_err(|err| eyre::eyre!("failed to generate CA key pair: {err}"))?;
-    let cert = params
-      .self_signed(&key_pair)
-      .map_err(|err| eyre::eyre!("failed to self-sign CA certificate: {err}"))?;
+    let key_pair = KeyPair::generate().map_err(|source| Error::Keygen { source })?;
+    let cert = params.self_signed(&key_pair).map_err(|source| Error::SelfSign { source })?;
 
     let cert_pem = cert.pem();
     let cert_der = CertificateDer::from(cert.der().to_vec());
@@ -72,17 +83,17 @@ impl CertAuthority {
   ///
   /// Returns an error when either PEM is not valid UTF-8, the key is not a
   /// parseable PKCS#8 key pair, or the certificate is not a parseable CA.
-  pub fn load(cert_pem_bytes: &[u8], key_pem_bytes: &[u8]) -> eyre::Result<Self> {
-    let cert_pem_str = std::str::from_utf8(cert_pem_bytes).map_err(|err| eyre::eyre!("invalid cert PEM: {err}"))?;
-    let key_pem_str = std::str::from_utf8(key_pem_bytes).map_err(|err| eyre::eyre!("invalid key PEM: {err}"))?;
+  pub fn load(cert_pem_bytes: &[u8], key_pem_bytes: &[u8]) -> Result<Self, Error> {
+    let cert_pem_str = str::from_utf8(cert_pem_bytes).map_err(|source| Error::InvalidCertPem { source })?;
+    let key_pem_str = str::from_utf8(key_pem_bytes).map_err(|source| Error::InvalidKeyPem { source })?;
 
-    let key_pair = KeyPair::from_pem(key_pem_str).map_err(|err| eyre::eyre!("failed to parse CA key: {err}"))?;
-    let issuer = Issuer::from_ca_cert_pem(cert_pem_str, key_pair).map_err(|err| eyre::eyre!("failed to parse CA cert: {err}"))?;
+    let key_pair = KeyPair::from_pem(key_pem_str).map_err(|source| Error::ParseKey { source })?;
+    let issuer = Issuer::from_ca_cert_pem(cert_pem_str, key_pair).map_err(|source| Error::ParseCert { source })?;
 
     let original_der = {
       CertificateDer::from_pem_slice(cert_pem_str.as_bytes())
         .map(|cert| cert.to_vec())
-        .map_err(|err| eyre::eyre!("failed to parse PEM: {err}"))?
+        .map_err(|source| Error::ParsePem { source })?
     };
 
     Ok(Self {
@@ -115,7 +126,7 @@ impl CertAuthority {
   /// # Errors
   ///
   /// Returns an error when the domain is not a valid SAN or signing fails.
-  pub fn generate_domain_cert(&self, domain: &str) -> eyre::Result<DomainCert> {
+  pub fn generate_domain_cert(&self, domain: &str) -> Result<DomainCert, Error> {
     generate_domain_cert(domain, self)
   }
 
@@ -126,16 +137,10 @@ impl CertAuthority {
   ///
   /// Returns an error when the cert DER or the PKCS8 key bytes fail to parse
   /// as boring types.
-  pub fn boring_pair(
-    &self,
-  ) -> eyre::Result<(
-    rama::tls::boring::core::x509::X509,
-    rama::tls::boring::core::pkey::PKey<rama::tls::boring::core::pkey::Private>,
-  )> {
-    let crt = rama::tls::boring::core::x509::X509::from_der(self.cert_der.as_ref())
-      .map_err(|err| eyre::eyre!("CA cert DER is not a valid boring X509: {err}"))?;
-    let key = rama::tls::boring::core::pkey::PKey::private_key_from_pkcs8(&self.issuer.key().serialize_der())
-      .map_err(|err| eyre::eyre!("CA key is not a valid boring PKCS8 key: {err}"))?;
+  pub fn boring_pair(&self) -> Result<(X509, PKey<Private>), Error> {
+    let crt = X509::from_der(self.cert_der.as_ref()).map_err(|source| Error::BoringCert { source: source.into() })?;
+    let key =
+      PKey::private_key_from_pkcs8(&self.issuer.key().serialize_der()).map_err(|source| Error::BoringKey { source: source.into() })?;
     Ok((crt, key))
   }
 }
@@ -154,7 +159,7 @@ impl CertAuthority {
 /// Returns an error when the existing file cannot be read or parsed, when the
 /// parent directory cannot be created, or when no process wins the
 /// generate-and-persist race.
-pub fn load_or_generate(path: &Path) -> eyre::Result<CertAuthority> {
+pub fn load_or_generate(path: &Path) -> Result<CertAuthority, Error> {
   let ca = if path.exists() {
     load_ca_file(path)?
   } else {
@@ -165,9 +170,9 @@ pub fn load_or_generate(path: &Path) -> eyre::Result<CertAuthority> {
 }
 
 /// Generate a CA and persist it, electing one winner across racing processes.
-fn generate_and_persist(path: &Path) -> eyre::Result<CertAuthority> {
+fn generate_and_persist(path: &Path) -> Result<CertAuthority, Error> {
   if let Some(parent) = path.parent() {
-    std::fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).map_err(Error::Io)?;
   }
   let ca = CertAuthority::generate()?;
   let mut contents = ca.cert_pem();
@@ -175,8 +180,8 @@ fn generate_and_persist(path: &Path) -> eyre::Result<CertAuthority> {
   match persist_ca_0600(path, &contents) {
     Ok(()) => Ok(ca),
     // Raced with another process creating it: load the winner.
-    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => load_ca_file_with_retry(path),
-    Err(err) => Err(err.into()),
+    Err(err) if err.kind() == ErrorKind::AlreadyExists => load_ca_file_with_retry(path),
+    Err(err) => Err(Error::Io(err)),
   }
 }
 
@@ -190,7 +195,7 @@ fn sync_split_pems(path: &Path, ca: &CertAuthority) {
     (path.with_extension("crt"), ca.cert_pem(), 0o644),
     (path.with_extension("key"), ca.key_pem(), 0o600),
   ] {
-    if std::fs::read(&target).is_ok_and(|existing| existing == contents) {
+    if fs::read(&target).is_ok_and(|existing| existing == contents) {
       continue;
     }
     if let Err(err) = write_with_mode(&target, &contents, mode) {
@@ -202,7 +207,7 @@ fn sync_split_pems(path: &Path, ca: &CertAuthority) {
 /// Write `contents` to `target`, forcing `mode` so a umask cannot leave the
 /// private key world readable.
 fn write_with_mode(target: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
-  let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(target)?;
+  let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).open(target)?;
   file.write_all(contents)?;
   file.sync_all()?;
   set_mode(target, mode)
@@ -210,8 +215,7 @@ fn write_with_mode(target: &Path, contents: &[u8], mode: u32) -> std::io::Result
 
 #[cfg(unix)]
 fn set_mode(target: &Path, mode: u32) -> std::io::Result<()> {
-  use std::os::unix::fs::PermissionsExt as _;
-  std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+  fs::set_permissions(target, fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
@@ -219,12 +223,12 @@ fn set_mode(_target: &Path, _mode: u32) -> std::io::Result<()> {
   Ok(())
 }
 
-fn load_ca_file(path: &Path) -> eyre::Result<CertAuthority> {
+fn load_ca_file(path: &Path) -> Result<CertAuthority, Error> {
   warn_on_loose_ca_perms(path);
-  let text = std::fs::read_to_string(path)?;
+  let text = fs::read_to_string(path)?;
   let key_start = text
     .find("-----BEGIN PRIVATE KEY-----")
-    .ok_or_else(|| eyre::eyre!("{}: no private-key PEM block", path.display()))?;
+    .ok_or_else(|| Error::NoKeyBlock { path: path.to_path_buf() })?;
   CertAuthority::load(&text.as_bytes()[..key_start], &text.as_bytes()[key_start..])
 }
 
@@ -232,8 +236,7 @@ fn load_ca_file(path: &Path) -> eyre::Result<CertAuthority> {
 /// lives in the same file, so loose permissions are a full MITM hazard.
 #[cfg(unix)]
 fn warn_on_loose_ca_perms(path: &Path) {
-  use std::os::unix::fs::PermissionsExt as _;
-  let Ok(meta) = std::fs::metadata(path) else {
+  let Ok(meta) = fs::metadata(path) else {
     return;
   };
   if meta.permissions().mode() & 0o077 != 0 {
@@ -247,26 +250,26 @@ fn warn_on_loose_ca_perms(_path: &Path) {}
 /// Load the winner's CA file, retrying while the winner is still writing.
 /// Truncated reads (missing key block, PEM parse failure) retry for ~2s;
 /// the last error surfaces when the file stays unparseable.
-fn load_ca_file_with_retry(path: &Path) -> eyre::Result<CertAuthority> {
+fn load_ca_file_with_retry(path: &Path) -> Result<CertAuthority, Error> {
   let mut last = load_ca_file(path).err();
   for _ in 0..20 {
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    thread::sleep(std::time::Duration::from_millis(100));
     match load_ca_file(path) {
       Ok(ca) => return Ok(ca),
       Err(err) => last = Some(err),
     }
   }
-  Err(last.unwrap_or_else(|| eyre::eyre!("{}: CA file never became readable", path.display())))
+  Err(last.unwrap_or_else(|| Error::NeverReadable { path: path.to_path_buf() }))
 }
 
 #[cfg(unix)]
 fn persist_ca_0600(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-  let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+  let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
   file.write_all(contents)?;
   file.sync_all()?;
   // Best-effort dir sync so the directory entry survives a crash.
   if let Some(parent) = path.parent()
-    && let Ok(dir) = std::fs::File::open(parent)
+    && let Ok(dir) = fs::File::open(parent)
   {
     let _ = dir.sync_all();
   }
@@ -275,7 +278,7 @@ fn persist_ca_0600(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn persist_ca_0600(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-  let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+  let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
   file.write_all(contents)?;
   file.sync_all()
 }
@@ -286,13 +289,13 @@ pub struct DomainCert {
   /// Expiry time for the generated leaf certificate.
   pub expires_at: OffsetDateTime,
   /// Pre-built `ServerConfig` for this domain (avoids per-connection rebuild).
-  pub server_config: Arc<rustls::ServerConfig>,
+  pub server_config: Arc<ServerConfig>,
 }
 
-impl std::fmt::Debug for DomainCert {
+impl Debug for DomainCert {
   /// The pre-built `ServerConfig` holds the leaf private key and is not
   /// rendered; only the expiry is.
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+  fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
     f.debug_struct("DomainCert")
       .field("expires_at", &self.expires_at)
       .finish_non_exhaustive()
@@ -305,12 +308,12 @@ impl std::fmt::Debug for DomainCert {
 ///
 /// Returns an error when `domain` is not a valid SAN, when leaf key
 /// generation or signing fails, or when rustls rejects the resulting chain.
-pub fn generate_domain_cert(domain: &str, ca: &CertAuthority) -> eyre::Result<DomainCert> {
+pub fn generate_domain_cert(domain: &str, ca: &CertAuthority) -> Result<DomainCert, Error> {
   let (chain, key, expires_at) = signed_leaf(ca, domain, ExtendedKeyUsagePurpose::ServerAuth)?;
-  let server_config = rustls::ServerConfig::builder()
+  let server_config = ServerConfig::builder()
     .with_no_client_auth()
     .with_single_cert(chain, key)
-    .map_err(|err| eyre::eyre!("server config: {err}"))?;
+    .map_err(|source| Error::ServerConfig { source })?;
   Ok(DomainCert {
     expires_at,
     server_config: Arc::new(server_config),
@@ -323,7 +326,7 @@ pub fn generate_domain_cert(domain: &str, ca: &CertAuthority) -> eyre::Result<Do
 /// # Errors
 ///
 /// Returns an error when key generation or signing fails.
-pub fn generate_client_pair(ca: &CertAuthority, domain: &str) -> eyre::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+pub fn generate_client_pair(ca: &CertAuthority, domain: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Error> {
   let (chain, key, _) = signed_leaf(ca, domain, ExtendedKeyUsagePurpose::ClientAuth)?;
   Ok((chain, key))
 }
@@ -336,30 +339,35 @@ pub fn generate_client_pair(ca: &CertAuthority, domain: &str) -> eyre::Result<(V
 /// # Errors
 ///
 /// Returns an error when the pair cannot be generated or written.
-pub fn load_or_generate_client_pair(ca: &CertAuthority, dir: &Path, name: &str) -> eyre::Result<(PathBuf, PathBuf)> {
-  use rama::crypto::pem::PemEncode as _;
+pub fn load_or_generate_client_pair(ca: &CertAuthority, dir: &Path, name: &str) -> Result<(PathBuf, PathBuf), Error> {
   let cert = dir.join(format!("{name}.pem"));
   let key = dir.join(format!("{name}.key"));
   if cert.is_file() && key.is_file() {
     return Ok((cert, key));
   }
   let (chain, private) = generate_client_pair(ca, name)?;
-  std::fs::create_dir_all(dir).map_err(|err| eyre::eyre!("create {}: {err}", dir.display()))?;
+  fs::create_dir_all(dir).map_err(|source| Error::CreateGuestDir {
+    dir: dir.to_path_buf(),
+    source,
+  })?;
   let mut cert_pem = String::new();
   for leaf in &chain {
     cert_pem.push_str(&leaf.to_pem());
   }
-  std::fs::write(&cert, cert_pem).map_err(|err| eyre::eyre!("write {}: {err}", cert.display()))?;
-  let mut key_file = std::fs::OpenOptions::new()
+  fs::write(&cert, cert_pem).map_err(|source| Error::WriteGuestCert {
+    path: cert.clone(),
+    source,
+  })?;
+  let mut key_file = fs::OpenOptions::new()
     .write(true)
     .create(true)
     .truncate(true)
     .mode(0o600)
     .open(&key)
-    .map_err(|err| eyre::eyre!("open {}: {err}", key.display()))?;
+    .map_err(|source| Error::OpenGuestKey { path: key.clone(), source })?;
   key_file
     .write_all(private.to_pem().as_bytes())
-    .map_err(|err| eyre::eyre!("write {}: {err}", key.display()))?;
+    .map_err(|source| Error::WriteGuestKey { path: key.clone(), source })?;
   Ok((cert, key))
 }
 
@@ -369,7 +377,7 @@ pub fn load_or_generate_client_pair(ca: &CertAuthority, dir: &Path, name: &str) 
 /// # Errors
 ///
 /// Returns an error when key generation or signing fails.
-pub fn generate_domain_pair(ca: &CertAuthority, domain: &str) -> eyre::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+pub fn generate_domain_pair(ca: &CertAuthority, domain: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Error> {
   let (chain, key, _) = signed_leaf(ca, domain, ExtendedKeyUsagePurpose::ServerAuth)?;
   Ok((chain, key))
 }
@@ -381,22 +389,24 @@ fn signed_leaf(
   ca: &CertAuthority,
   domain: &str,
   usage: ExtendedKeyUsagePurpose,
-) -> eyre::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, OffsetDateTime)> {
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, OffsetDateTime), Error> {
   let now = OffsetDateTime::now_utc();
-  let mut params = CertificateParams::new(vec![domain.to_string()]).map_err(|err| eyre::eyre!("bad SNI: {err}"))?;
-  let mut dn = rcgen::DistinguishedName::new();
-  dn.push(rcgen::DnType::CommonName, domain);
+  let mut params = CertificateParams::new(vec![domain.to_string()]).map_err(|source| Error::BadSni { source })?;
+  let mut dn = DistinguishedName::new();
+  dn.push(DnType::CommonName, domain);
   params.distinguished_name = dn;
   params.is_ca = IsCa::ExplicitNoCa;
   params.use_authority_key_identifier_extension = true;
-  params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature, rcgen::KeyUsagePurpose::KeyEncipherment];
+  params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
   params.extended_key_usages = vec![usage];
   // Backdate not_before by 2 seconds for clock skew.
   params.not_before = now - Duration::seconds(2);
   params.not_after = now + Duration::hours(LEAF_VALIDITY_HOURS.cast_signed());
   let expires_at = params.not_after;
-  let key_pair = rcgen::KeyPair::generate().map_err(|err| eyre::eyre!("keygen: {err}"))?;
-  let cert_der = params.signed_by(&key_pair, &ca.issuer).map_err(|err| eyre::eyre!("sign: {err}"))?;
+  let key_pair = KeyPair::generate().map_err(|source| Error::LeafKeygen { source })?;
+  let cert_der = params
+    .signed_by(&key_pair, &ca.issuer)
+    .map_err(|source| Error::LeafSign { source })?;
   Ok((
     vec![CertificateDer::from(cert_der.der().to_vec()), ca.cert_der.clone()],
     PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
@@ -407,21 +417,26 @@ fn signed_leaf(
 /// Install the aws-lc-rs crypto provider as the process default. Idempotent;
 /// required before building any rustls config.
 pub fn install_crypto_provider() {
-  let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+  let _ = aws_lc_rs::default_provider().install_default();
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use rustls::pki_types::ServerName;
+  use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConnection, StreamOwned};
+  use std::io::Read as _;
+  use std::net::{TcpListener, TcpStream};
+  use tempfile::tempdir;
 
   #[test]
   fn ca_roundtrips_through_file_byte_exact() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let path = dir.path().join("sub").join("ca.pem");
     let ca = load_or_generate(&path).unwrap();
-    let before = std::fs::read(&path).unwrap();
+    let before = fs::read(&path).unwrap();
     let reloaded = load_or_generate(&path).unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&path).unwrap(), before);
     assert_eq!(reloaded.cert_der, ca.cert_der);
   }
 
@@ -435,19 +450,19 @@ mod tests {
 
   #[test]
   fn split_pems_hold_one_half_each() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let path = dir.path().join("ca.pem");
     let ca = load_or_generate(&path).unwrap();
 
-    let crt = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
-    let key = std::fs::read_to_string(dir.path().join("ca.key")).unwrap();
+    let crt = fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+    let key = fs::read_to_string(dir.path().join("ca.key")).unwrap();
     assert!(crt.contains("BEGIN CERTIFICATE"));
     assert!(!crt.contains("PRIVATE KEY"), "the certificate file carried the key");
     assert!(key.contains("PRIVATE KEY"));
     assert!(!key.contains("CERTIFICATE"), "the key file carried the certificate");
 
     // The combined file is still the certificate followed by the key.
-    let pem = std::fs::read_to_string(&path).unwrap();
+    let pem = fs::read_to_string(&path).unwrap();
     assert!(pem.starts_with(&crt));
     assert!(pem.contains(&key));
     assert_eq!(crt, String::from_utf8(ca.cert_pem()).unwrap());
@@ -456,24 +471,23 @@ mod tests {
   #[cfg(unix)]
   #[test]
   fn split_key_is_owner_only() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let path = dir.path().join("ca.pem");
     load_or_generate(&path).unwrap();
-    let mode = std::fs::metadata(dir.path().join("ca.key")).unwrap().permissions().mode();
+    let mode = fs::metadata(dir.path().join("ca.key")).unwrap().permissions().mode();
     assert_eq!(mode & 0o077, 0, "key mode was {mode:o}");
   }
 
   #[test]
   fn a_deleted_split_file_is_rewritten_from_the_pem() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let path = dir.path().join("ca.pem");
     load_or_generate(&path).unwrap();
-    let before = std::fs::read(dir.path().join("ca.crt")).unwrap();
-    std::fs::remove_file(dir.path().join("ca.crt")).unwrap();
+    let before = fs::read(dir.path().join("ca.crt")).unwrap();
+    fs::remove_file(dir.path().join("ca.crt")).unwrap();
 
     load_or_generate(&path).unwrap();
-    assert_eq!(std::fs::read(dir.path().join("ca.crt")).unwrap(), before);
+    assert_eq!(fs::read(dir.path().join("ca.crt")).unwrap(), before);
   }
 
   /// Leaves minted for IP-look identities carry an IP SAN (rcgen's
@@ -485,46 +499,35 @@ mod tests {
   fn ip_identities_mint_leaves_a_verifying_client_accepts() {
     install_crypto_provider();
     let ca = CertAuthority::generate().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
     let mint = |name: &str| {
       let (chain, key) = generate_domain_pair(&ca, name).unwrap();
-      std::sync::Arc::new(
-        rustls::ServerConfig::builder()
-          .with_no_client_auth()
-          .with_single_cert(chain, key)
-          .unwrap(),
-      )
+      Arc::new(ServerConfig::builder().with_no_client_auth().with_single_cert(chain, key).unwrap())
     };
     let leaves = [mint("127.0.0.1"), mint("localhost")];
 
-    let server = std::thread::spawn(move || {
-      use std::io::Write as _;
+    let server = thread::spawn(move || {
       for config in leaves {
         let Ok((stream, _)) = listener.accept() else { return };
-        let Ok(conn) = rustls::ServerConnection::new(config) else { return };
-        let mut tls = rustls::StreamOwned::new(conn, stream);
+        let Ok(conn) = ServerConnection::new(config) else { return };
+        let mut tls = StreamOwned::new(conn, stream);
         let _ = tls.write_all(b"ok");
         let _ = tls.flush();
       }
     });
 
-    let mut roots = rustls::RootCertStore::empty();
+    let mut roots = RootCertStore::empty();
     roots.add(ca.cert_der().clone()).unwrap();
     let handshake = |label: &str| {
-      use std::io::{Read as _, Write as _};
-      let stream = std::net::TcpStream::connect(addr).unwrap();
-      let conn = rustls::ClientConnection::new(
-        std::sync::Arc::new(
-          rustls::ClientConfig::builder()
-            .with_root_certificates(roots.clone())
-            .with_no_client_auth(),
-        ),
-        rustls::pki_types::ServerName::IpAddress(addr.ip().into()),
+      let stream = TcpStream::connect(addr).unwrap();
+      let conn = ClientConnection::new(
+        Arc::new(ClientConfig::builder().with_root_certificates(roots.clone()).with_no_client_auth()),
+        ServerName::IpAddress(addr.ip().into()),
       )
       .map_err(|err| format!("{label}: connect {err}"))?;
-      let mut tls = rustls::StreamOwned::new(conn, stream);
+      let mut tls = StreamOwned::new(conn, stream);
       tls.write_all(b"x").map_err(|err| format!("{label}: write {err}"))?;
       let mut buf = [0u8; 2];
       tls.read_exact(&mut buf).map_err(|err| format!("{label}: read {err}"))?;

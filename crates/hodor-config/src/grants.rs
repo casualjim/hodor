@@ -6,8 +6,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use secrecy::{ExposeSecret as _, SecretString};
+use url::{Host, Url};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, fake_for};
+use crate::error::Error;
+use crate::plugins::resolve_plugins;
 
 /// Host pattern: exact, `*.`-wildcard (subdomains only), or any.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +71,7 @@ fn parse_db_string(entry: &str) -> Result<ParsedDbString, String> {
   if !entry.starts_with("postgres://") {
     return Err(format!("bad connection string `{entry}`: expected `postgres://`"));
   }
-  let url = url::Url::parse(entry).map_err(|err| format!("bad connection string `{entry}`: {err}"))?;
+  let url = Url::parse(entry).map_err(|err| format!("bad connection string `{entry}`: {err}"))?;
   let host = url
     .host()
     .map(|host| host.to_string())
@@ -386,7 +389,7 @@ impl FromStr for EndpointScope {
     } else {
       entry.to_string()
     };
-    let url = url::Url::parse(&probe).map_err(|err| format!("bad allow entry `{entry}`: {err}"))?;
+    let url = Url::parse(&probe).map_err(|err| format!("bad allow entry `{entry}`: {err}"))?;
     let scheme = match url.scheme() {
       "http" => Scheme::Http,
       "https" => Scheme::Https,
@@ -404,9 +407,9 @@ impl FromStr for EndpointScope {
       ));
     }
     let parsed_host = match url.host() {
-      Some(url::Host::Domain(domain)) => domain.to_string(),
-      Some(url::Host::Ipv4(addr)) => addr.to_string(),
-      Some(url::Host::Ipv6(addr)) => addr.to_string(),
+      Some(Host::Domain(domain)) => domain.to_string(),
+      Some(Host::Ipv4(addr)) => addr.to_string(),
+      Some(Host::Ipv6(addr)) => addr.to_string(),
       None => return Err(format!("bad allow entry `{entry}`: empty host")),
     };
     let host = if wildcard {
@@ -621,17 +624,16 @@ pub struct ResolvedConfig {
 ///
 /// Panics when a database rule states no value; [`crate::config::Rule::is_database`]
 /// guarantees one, so this is a programmer error, not a config error.
-pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
+pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
   let mut grants = Vec::with_capacity(cfg.rules.len());
   for (label, rule) in &cfg.rules {
     if rule.is_database() {
       // Database rule: the rule states the fake connection string in
       // `value`; the real one resolved from the secret source into `real`.
       // No allow entries — the connection string is the grant.
-      eyre::ensure!(
-        rule.allow.is_empty(),
-        "rule `{label}`: a database rule states no allow entries; the connection string is the grant"
-      );
+      if !rule.allow.is_empty() {
+        return Err(Error::DatabaseAllow { label: label.clone() });
+      }
       let Some(real) = rule.real.clone() else {
         // The secret source did not resolve this name; no grant rather than
         // a rule that swaps in nothing.
@@ -639,22 +641,25 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
         continue;
       };
       let fake = rule.value.as_ref().expect("is_database checked a value").expose_secret();
-      let mut scope = DatabaseScope::from_strings(fake, real.expose_secret()).map_err(|err| eyre::eyre!("rule `{label}`: {err}"))?;
+      let mut scope = DatabaseScope::from_strings(fake, real.expose_secret()).map_err(|err| Error::DatabaseScope {
+        label: label.clone(),
+        detail: err,
+      })?;
       // The rule table states the guest leg only; the upstream identity
       // lives in the real string's libpq URL.
       for (key, tls) in &rule.tls {
-        eyre::ensure!(
-          key == &rule.env,
-          "rule `{label}`: tls config names `{key}` but the rule's env is `{}`",
-          rule.env
-        );
+        if key != &rule.env {
+          return Err(Error::TlsEnvMismatch {
+            label: label.clone(),
+            key: key.clone(),
+            env: rule.env.clone(),
+          });
+        }
         if tls.client_cert.is_some() || tls.client_key.is_some() {
-          eyre::bail!(
-            "rule `{label}`: postgres states the upstream identity in its libpq URL (`sslcert`/`sslkey`), never in the rule table"
-          );
+          return Err(Error::PostgresIdentity { label: label.clone() });
         }
         if tls.root_cert.is_some() {
-          eyre::bail!("rule `{label}`: postgres states upstream trust in its libpq URL (`sslrootcert`), never in the rule table");
+          return Err(Error::PostgresTrust { label: label.clone() });
         }
         scope.guest_tls = tls.guest_tls_mode;
       }
@@ -681,14 +686,19 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
     };
     let mut parsed = Vec::with_capacity(rule.allow.len());
     for entry in &rule.allow {
-      let mut scope: EndpointScope = entry
-        .parse()
-        .map_err(|err| eyre::eyre!("rule `{label}`: bad allow entry `{entry}`: {err}"))?;
+      let mut scope: EndpointScope = entry.parse().map_err(|err| Error::BadAllow {
+        label: label.clone(),
+        entry: entry.clone(),
+        detail: err,
+      })?;
       // Identity comes from the entry; hodor's own TLS configuration comes
       // from the rule's `tls` table, keyed by the entry itself.
       if let Some(tls) = rule.tls.get(entry) {
         if tls.client_cert.is_some() != tls.client_key.is_some() {
-          eyre::bail!("rule `{label}`: entry `{entry}`: client_cert and client_key come together");
+          return Err(Error::CertKeyPair {
+            label: label.clone(),
+            entry: (*entry).clone(),
+          });
         }
         scope.client_cert.clone_from(&tls.client_cert);
         scope.client_key.clone_from(&tls.client_key);
@@ -699,7 +709,10 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
     }
     for key in rule.tls.keys() {
       if !rule.allow.iter().any(|entry| entry == key) {
-        eyre::bail!("rule `{label}`: tls config names entry `{key}` the rule does not allow");
+        return Err(Error::TlsUnknownEntry {
+          label: label.clone(),
+          key: key.clone(),
+        });
       }
     }
     if parsed.is_empty() {
@@ -724,7 +737,7 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
       oauth2: rule.oauth2.clone(),
     });
   }
-  let plugins = crate::plugins::resolve_plugins(cfg)?;
+  let plugins = resolve_plugins(cfg)?;
   Ok(ResolvedConfig {
     proxy: cfg.proxy.clone(),
     grants,
@@ -738,7 +751,7 @@ pub fn resolve(cfg: &AppConfig) -> eyre::Result<ResolvedConfig> {
 /// whether the length-matched fallback fired.
 #[must_use]
 pub fn decoy_for_rule(env: &str, pattern: Option<&str>, allow: &[EndpointScope], value_len: usize) -> (String, bool) {
-  let shaped = crate::config::fake_for(env, pattern);
+  let shaped = fake_for(env, pattern);
   if allow.iter().any(|scope| scope.scheme == Scheme::Tcp) && shaped.len() != value_len {
     let length_pattern = format!("{{hex:{value_len}}}");
     (crate::config::fake_for(env, Some(&length_pattern)), true)
@@ -759,6 +772,7 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
+  use crate::config::{HostTlsCfg, IfMissing, ProxyCfg, RuleCfg, WorkspaceCfg};
 
   fn endpoint_grant(entries: &[&str]) -> Grant {
     Grant::Token {
@@ -783,7 +797,7 @@ mod tests {
     let mut rules = BTreeMap::new();
     rules.insert(
       "t".to_string(),
-      crate::config::RuleCfg {
+      RuleCfg {
         env: "DATABASE_URL".into(),
         value: Some(SecretString::from(fake)),
         real: Some(SecretString::from(real)),
@@ -797,13 +811,13 @@ mod tests {
       },
     );
     AppConfig {
-      proxy: crate::config::ProxyCfg {
+      proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
-      workspace: crate::config::WorkspaceCfg::default(),
+      workspace: WorkspaceCfg::default(),
       rules,
       plugins: BTreeMap::new(),
       tools: BTreeMap::new(),
@@ -830,11 +844,11 @@ mod tests {
   }
 
   /// [`cfg_with_rule`] plus per-entry TLS configuration.
-  fn cfg_with_tls(entries: &[&str], tls: BTreeMap<String, crate::config::HostTlsCfg>) -> AppConfig {
+  fn cfg_with_tls(entries: &[&str], tls: BTreeMap<String, HostTlsCfg>) -> AppConfig {
     let mut rules = BTreeMap::new();
     rules.insert(
       "t".to_string(),
-      crate::config::RuleCfg {
+      RuleCfg {
         env: "T".into(),
         value: Some(SecretString::from("value")),
         real: None,
@@ -848,13 +862,13 @@ mod tests {
       },
     );
     AppConfig {
-      proxy: crate::config::ProxyCfg {
+      proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
-      workspace: crate::config::WorkspaceCfg::default(),
+      workspace: WorkspaceCfg::default(),
       rules,
       plugins: BTreeMap::new(),
       tools: BTreeMap::new(),
@@ -862,10 +876,10 @@ mod tests {
   }
 
   fn config_with_rule(label: &str, env: &str, value: &str, allow: Vec<&str>) -> AppConfig {
-    let mut rules = std::collections::BTreeMap::new();
+    let mut rules = BTreeMap::new();
     rules.insert(
       label.to_string(),
-      crate::config::RuleCfg {
+      RuleCfg {
         env: env.to_string(),
         value: Some(SecretString::from(value)),
         real: None,
@@ -875,17 +889,17 @@ mod tests {
         oauth2: None,
         registry: Some(false),
         tls: BTreeMap::new(),
-        if_missing: crate::config::IfMissing::Error,
+        if_missing: IfMissing::Error,
       },
     );
     AppConfig {
-      proxy: crate::config::ProxyCfg {
+      proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
-      workspace: crate::config::WorkspaceCfg::default(),
+      workspace: WorkspaceCfg::default(),
       rules,
       plugins: BTreeMap::new(),
       tools: BTreeMap::new(),
@@ -1009,7 +1023,7 @@ mod tests {
     let mut tls = BTreeMap::new();
     tls.insert(
       "https://api.internal:443".to_string(),
-      crate::config::HostTlsCfg {
+      HostTlsCfg {
         client_cert: Some(PathBuf::from("/c.pem")),
         client_key: Some(PathBuf::from("/c.key")),
         root_cert: None,
@@ -1034,7 +1048,7 @@ mod tests {
       "postgres://app:fake@db.internal:5432/main",
       "postgres://app:real@db.internal:5432/main?sslmode=require",
     );
-    let entry = || crate::config::HostTlsCfg {
+    let entry = || HostTlsCfg {
       client_cert: None,
       client_key: None,
       root_cert: None,
@@ -1074,7 +1088,7 @@ mod tests {
     let mut tls = BTreeMap::new();
     tls.insert(
       "https://other.internal:443".to_string(),
-      crate::config::HostTlsCfg {
+      HostTlsCfg {
         client_cert: None,
         client_key: None,
         root_cert: None,

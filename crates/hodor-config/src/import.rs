@@ -1,10 +1,12 @@
 //! Curation-time import of `OAuth2` flow declarations from discovery and
 //! `OpenAPI` documents. Pure mapping: a document string in, a `rules.d` TOML
 //! fragment out. Nothing here fetches; the operator hands it a file.
-use eyre::WrapErr as _;
+use std::fmt::Write as _;
+
 use serde_json::Value;
 
-use crate::registry::{FlowKind, OAuthFlow};
+use crate::error::Error;
+use crate::registry::{FlowKind, OAuthFlow, validate_flow};
 
 /// Map an OIDC discovery document onto one `oauth2` block.
 ///
@@ -17,25 +19,23 @@ use crate::registry::{FlowKind, OAuthFlow};
 ///
 /// Returns an error when the document is not valid JSON, when
 /// `token_endpoint` is missing, or when no supported grant type is listed.
-pub fn flow_from_oidc(doc: &str) -> eyre::Result<OAuthFlow> {
-  let value: Value = serde_json::from_str(doc).wrap_err_with(|| "parse discovery document")?;
-  let obj = value
-    .as_object()
-    .ok_or_else(|| eyre::eyre!("discovery document is not a JSON object"))?;
+pub fn flow_from_oidc(doc: &str) -> Result<OAuthFlow, Error> {
+  let value: Value = serde_json::from_str(doc).map_err(|source| Error::ParseDiscovery { source })?;
+  let obj = value.as_object().ok_or(Error::DiscoveryNotAnObject)?;
   let token_url = obj
     .get("token_endpoint")
     .and_then(Value::as_str)
-    .ok_or_else(|| eyre::eyre!("discovery document: missing `token_endpoint`"))?;
+    .ok_or(Error::DiscoveryMissingTokenEndpoint)?;
   let grants = obj
     .get("grant_types_supported")
     .and_then(Value::as_array)
-    .ok_or_else(|| eyre::eyre!("discovery document: missing `grant_types_supported`"))?;
+    .ok_or(Error::DiscoveryMissingGrantTypes)?;
   let flow = if grants.iter().any(|g| g.as_str() == Some("authorization_code")) {
     FlowKind::AuthorizationCode
   } else if grants.iter().any(|g| g.as_str() == Some("client_credentials")) {
     FlowKind::ClientCredentials
   } else {
-    eyre::bail!("discovery document: no supported grant type (need `authorization_code` or `client_credentials`)");
+    return Err(Error::DiscoveryNoSupportedGrantType);
   };
   Ok(OAuthFlow {
     flow,
@@ -53,6 +53,9 @@ struct SchemeEntry {
   flow: Result<OAuthFlow, String>,
 }
 
+/// One curated scheme: its slug and its flow, or why the scheme was skipped.
+pub type FlowEntry = (String, Result<OAuthFlow, String>);
+
 /// Map an `OpenAPI` document's `components.securitySchemes` onto `oauth2`
 /// blocks, one per `type: oauth2` scheme. `type: openIdConnect` schemes are
 /// reported and skipped: that leg is user-login authorization-code, which
@@ -61,12 +64,12 @@ struct SchemeEntry {
 /// # Errors
 ///
 /// Returns an error when the document is not valid JSON.
-pub fn flows_from_openapi(doc: &str) -> eyre::Result<Vec<(String, Result<OAuthFlow, String>)>> {
-  let value: Value = serde_json::from_str(doc).wrap_err_with(|| "parse openapi document")?;
+pub fn flows_from_openapi(doc: &str) -> Result<Vec<FlowEntry>, Error> {
+  let value: Value = serde_json::from_str(doc).map_err(|source| Error::ParseOpenapi { source })?;
   let schemes = value
     .pointer("/components/securitySchemes")
     .and_then(Value::as_object)
-    .ok_or_else(|| eyre::eyre!("openapi document: no `components.securitySchemes`"))?;
+    .ok_or(Error::OpenapiNoSchemes)?;
   let mut out = Vec::new();
   for (name, scheme) in schemes {
     let entry = match scheme.get("type").and_then(Value::as_str) {
@@ -119,10 +122,8 @@ fn flow_from_openapi_scheme(scheme: &Value) -> Result<OAuthFlow, String> {
 /// # Errors
 ///
 /// Returns an error when the flow fails validation.
-pub fn to_toml_fragment(slug: &str, env: &str, flow: &OAuthFlow) -> eyre::Result<String> {
-  use std::fmt::Write as _;
-
-  crate::registry::validate_flow(flow, "<generated>", slug)?;
+pub fn to_toml_fragment(slug: &str, env: &str, flow: &OAuthFlow) -> Result<String, Error> {
+  validate_flow(flow, "<generated>", slug)?;
   let mut out = String::new();
   let _ = writeln!(out, "[providers.{slug}]");
   let _ = writeln!(out, "env = [\"{env}\"]");

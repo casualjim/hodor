@@ -2,14 +2,16 @@
 //! overrides.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::Path;
 
-use eyre::WrapErr as _;
 use serde::Deserialize;
+use url::{Host, Url};
 
-use crate::config::RuleCfg;
-use crate::grants::EndpointScope;
+use crate::config::{RuleCfg, validate_pattern};
+use crate::error::Error;
+use crate::grants::{EndpointScope, HostPat};
 
 /// Bundled registry: environment names, API hosts, and token shapes.
 const BUNDLED: &str = include_str!("../../../rules/registry.toml");
@@ -160,7 +162,7 @@ impl Registry {
   ///
   /// Returns an error when the bundled table is malformed, when the override
   /// directory cannot be read, or when an override does not parse.
-  pub fn load(rules_dir: Option<&Path>) -> eyre::Result<Self> {
+  pub fn load(rules_dir: Option<&Path>) -> Result<Self, Error> {
     Self::load_union(rules_dir, None)
   }
 
@@ -171,19 +173,30 @@ impl Registry {
   ///
   /// Returns an error when the bundled table is malformed, when an override
   /// directory cannot be read, or when an override does not parse.
-  pub fn load_union(global: Option<&Path>, project: Option<&Path>) -> eyre::Result<Self> {
+  pub fn load_union(global: Option<&Path>, project: Option<&Path>) -> Result<Self, Error> {
     let dirs = [global, project].into_iter().flatten().collect::<Vec<_>>();
     let mut registry = Self::default();
     registry.apply(BUNDLED, Path::new("<bundled>"))?;
     for dir in dirs.iter().filter(|dir| dir.is_dir()) {
-      let mut files = std::fs::read_dir(dir)
-        .wrap_err_with(|| format!("read {}", dir.display()))?
-        .map(|entry| entry.map(|entry| entry.path()).wrap_err_with(|| format!("read {}", dir.display())))
-        .collect::<eyre::Result<Vec<_>>>()?;
+      let mut files = fs::read_dir(dir)
+        .map_err(|source| Error::ReadFile {
+          path: dir.to_path_buf(),
+          source,
+        })?
+        .map(|entry| {
+          entry.map(|entry| entry.path()).map_err(|source| Error::ReadFile {
+            path: dir.to_path_buf(),
+            source,
+          })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
       files.retain(|path| path.extension().is_some_and(|ext| ext == "toml"));
       files.sort();
       for path in files {
-        let text = std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
+        let text = fs::read_to_string(&path).map_err(|source| Error::ReadFile {
+          path: path.clone(),
+          source,
+        })?;
         registry.apply(&text, &path)?;
       }
     }
@@ -191,15 +204,23 @@ impl Registry {
   }
 
   /// Merge one registry file over what is already loaded.
-  fn apply(&mut self, text: &str, source: &Path) -> eyre::Result<()> {
-    let file: RegistryFile = toml::from_str(text).wrap_err_with(|| format!("parse {}", source.display()))?;
+  fn apply(&mut self, text: &str, source: &Path) -> Result<(), Error> {
+    let file: RegistryFile = toml::from_str(text).map_err(|err| Error::ParseFile {
+      path: source.to_path_buf(),
+      source: Box::new(err),
+    })?;
     // One file claiming the same name twice is a data bug; a later file
     // overriding an earlier one is the intended mechanism.
     let mut claimed: BTreeMap<String, &str> = BTreeMap::new();
     for (provider, entry) in &file.providers {
       for env in &entry.env {
         if let Some(previous) = claimed.insert(env.to_ascii_uppercase(), provider.as_str()) {
-          eyre::bail!("{}: providers `{previous}` and `{provider}` both claim `{env}`", source.display());
+          return Err(Error::ClaimConflict {
+            file: source.to_path_buf(),
+            previous: previous.to_string(),
+            provider: provider.clone(),
+            env: env.clone(),
+          });
         }
       }
     }
@@ -213,7 +234,7 @@ impl Registry {
   }
 
   /// Apply one `[providers.<name>]` entry.
-  fn apply_provider(&mut self, provider: &str, entry: &ProviderEntry, source: &Path) -> eyre::Result<()> {
+  fn apply_provider(&mut self, provider: &str, entry: &ProviderEntry, source: &Path) -> Result<(), Error> {
     validate_hosts(&entry.hosts, source, "provider", provider)?;
     let pattern = entry.pattern.as_deref().filter(|pattern| !pattern.is_empty());
     validate_optional_pattern(pattern, source, "provider", provider)?;
@@ -243,13 +264,17 @@ impl Registry {
       self.contains.retain(|rule| rule.provider != provider);
     }
     for needle in &entry.contains {
-      eyre::ensure!(
-        !needle.is_empty(),
-        "{}: provider `{provider}`: `contains` entries must not be empty",
-        source.display()
-      );
+      if needle.is_empty() {
+        return Err(Error::EmptyContains {
+          file: source.to_path_buf(),
+          provider: provider.to_string(),
+        });
+      }
       let Some(pattern) = pattern else {
-        eyre::bail!("{}: provider `{provider}`: `contains` needs a `pattern`", source.display());
+        return Err(Error::ContainsNeedsPattern {
+          file: source.to_path_buf(),
+          provider: provider.to_string(),
+        });
       };
       self.contains.push(ContainsRule {
         provider: provider.to_string(),
@@ -261,7 +286,7 @@ impl Registry {
   }
 
   /// Apply one `[names.<ENV>]` entry.
-  fn apply_name(&mut self, env: &str, entry: &NameEntry, source: &Path) -> eyre::Result<()> {
+  fn apply_name(&mut self, env: &str, entry: &NameEntry, source: &Path) -> Result<(), Error> {
     validate_hosts(&entry.hosts, source, "name", env)?;
     let pattern = entry.pattern.as_deref().filter(|pattern| !pattern.is_empty());
     validate_optional_pattern(pattern, source, "name", env)?;
@@ -346,13 +371,18 @@ impl Registry {
 ///
 /// Returns an error naming the rule when an endpoint URL does not parse
 /// or the flow kind lacks its required endpoint.
-pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> eyre::Result<()> {
+pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> Result<(), Error> {
   for url in [&Some(flow.token_url.clone()), &flow.authorize_url, &flow.refresh_url]
     .into_iter()
     .flatten()
   {
-    let authority = flow_authority(url).map_err(|err| eyre::eyre!("{source}: `{name}`: bad oauth2 url `{url}`: {err}"))?;
-    if matches!(authority, crate::grants::HostPat::Any) {
+    let authority = flow_authority(url).map_err(|err| Error::BadOAuthUrl {
+      origin: source.to_string(),
+      name: name.to_string(),
+      url: url.clone(),
+      detail: err,
+    })?;
+    if matches!(authority, HostPat::Any) {
       tracing::warn!(
         entry = url,
         what = format!("`{name}` oauth2"),
@@ -361,15 +391,27 @@ pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> eyre::Result
     }
   }
   if matches!(flow.flow, FlowKind::AuthorizationCode) && flow.authorize_url.is_none() {
-    eyre::bail!("{source}: `{name}`: `authorization_code` flow needs an `authorize_url`");
+    return Err(Error::FlowNeedsAuthorize {
+      origin: source.to_string(),
+      name: name.to_string(),
+    });
   }
   for field in &flow.token_fields {
-    eyre::ensure!(!field.is_empty(), "{source}: `{name}`: `token_fields` entries must not be empty");
+    if field.is_empty() {
+      return Err(Error::EmptyTokenField {
+        origin: source.to_string(),
+        name: name.to_string(),
+      });
+    }
   }
-  let mut seen = std::collections::BTreeSet::new();
+  let mut seen = BTreeSet::new();
   for field in &flow.token_fields {
     if !seen.insert(field) {
-      eyre::bail!("{source}: `{name}`: duplicate `token_fields` entry `{field}`");
+      return Err(Error::DuplicateTokenField {
+        origin: source.to_string(),
+        name: name.to_string(),
+        field: field.clone(),
+      });
     }
   }
   Ok(())
@@ -377,14 +419,14 @@ pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> eyre::Result
 
 /// Endpoint URLs are full URLs; grants are authority-only. Parse the URL,
 /// then reduce it to its host pattern for the exfil-risk warning.
-fn flow_authority(url: &str) -> Result<crate::grants::HostPat, String> {
-  let parsed = url::Url::parse(url).map_err(|err| err.to_string())?;
+fn flow_authority(url: &str) -> Result<HostPat, String> {
+  let parsed = Url::parse(url).map_err(|err| err.to_string())?;
   let host = match parsed.host() {
-    Some(url::Host::Domain("*")) => crate::grants::HostPat::Any,
-    Some(url::Host::Domain(domain)) if domain.starts_with("*.") => crate::grants::HostPat::Wildcard(domain[1..].to_string()),
-    Some(url::Host::Domain(domain)) => crate::grants::HostPat::Exact(domain.to_string()),
-    Some(url::Host::Ipv4(addr)) => crate::grants::HostPat::Exact(addr.to_string()),
-    Some(url::Host::Ipv6(addr)) => crate::grants::HostPat::Exact(addr.to_string()),
+    Some(Host::Domain("*")) => HostPat::Any,
+    Some(Host::Domain(domain)) if domain.starts_with("*.") => HostPat::Wildcard(domain[1..].to_string()),
+    Some(Host::Domain(domain)) => HostPat::Exact(domain.to_string()),
+    Some(Host::Ipv4(addr)) => HostPat::Exact(addr.to_string()),
+    Some(Host::Ipv6(addr)) => HostPat::Exact(addr.to_string()),
     None => return Err("empty host".to_string()),
   };
   Ok(host)
@@ -396,11 +438,14 @@ fn flow_authority(url: &str) -> Result<crate::grants::HostPat, String> {
 /// # Errors
 ///
 /// Returns an error when the URL does not parse or carries no host.
-pub fn authority_of(url: &str) -> eyre::Result<String> {
-  let parsed = url::Url::parse(url).wrap_err_with(|| format!("bad oauth2 url `{url}`"))?;
+pub fn authority_of(url: &str) -> Result<String, Error> {
+  let parsed = Url::parse(url).map_err(|source| Error::BadUrlParse {
+    url: url.to_string(),
+    source,
+  })?;
   let host = parsed
     .host_str()
-    .ok_or_else(|| eyre::eyre!("bad oauth2 url `{url}`: empty host"))?
+    .ok_or_else(|| Error::BadUrlHost { url: url.to_string() })?
     .trim_start_matches('[')
     .trim_end_matches(']');
   let port = parsed.port();
@@ -415,12 +460,16 @@ fn is_default_port(scheme: &str, port: u16) -> bool {
 }
 
 /// Validate one host entry with the same grammar as `allow`.
-fn validate_hosts(hosts: &[String], source: &Path, kind: &str, name: &str) -> eyre::Result<()> {
+fn validate_hosts(hosts: &[String], source: &Path, kind: &str, name: &str) -> Result<(), Error> {
   for host in hosts {
-    let scope: EndpointScope = host
-      .parse()
-      .map_err(|err| eyre::eyre!("{}: {kind} `{name}`: bad host `{host}`: {err}", source.display()))?;
-    if matches!(scope.host, crate::grants::HostPat::Any) {
+    let scope: EndpointScope = host.parse().map_err(|err| Error::BadHost {
+      file: source.to_path_buf(),
+      kind: kind.to_string(),
+      name: name.to_string(),
+      host: host.clone(),
+      detail: err,
+    })?;
+    if matches!(scope.host, HostPat::Any) {
       let what = format!("{kind} `{name}`");
       tracing::warn!(file = %source.display(), entry = %host, what, "grant matches any host; secret is exfil-risky");
     }
@@ -429,10 +478,15 @@ fn validate_hosts(hosts: &[String], source: &Path, kind: &str, name: &str) -> ey
 }
 
 /// Validate one decoy template when present.
-fn validate_optional_pattern(pattern: Option<&str>, source: &Path, kind: &str, name: &str) -> eyre::Result<()> {
+fn validate_optional_pattern(pattern: Option<&str>, source: &Path, kind: &str, name: &str) -> Result<(), Error> {
   if let Some(pattern) = pattern {
-    crate::config::validate_pattern(pattern)
-      .map_err(|err| eyre::eyre!("{}: {kind} `{name}`: bad pattern `{pattern}`: {err}", source.display()))?;
+    validate_pattern(pattern).map_err(|err| Error::BadRegistryPattern {
+      file: source.to_path_buf(),
+      kind: kind.to_string(),
+      name: name.to_string(),
+      pattern: pattern.to_string(),
+      detail: err,
+    })?;
   }
   Ok(())
 }
@@ -441,12 +495,15 @@ fn validate_optional_pattern(pattern: Option<&str>, source: &Path, kind: &str, n
 mod tests {
   use super::*;
   use std::path::PathBuf;
+  use tempfile::tempdir;
 
   use pretty_assertions::assert_eq;
 
+  use crate::config::DEFAULT_PATTERN;
+
   fn write_rules(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, body).unwrap();
+    fs::write(&path, body).unwrap();
     path
   }
 
@@ -525,7 +582,7 @@ mod tests {
 
   #[test]
   fn rules_d_unions_hosts_and_overrides_the_pattern() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-ghe.toml",
@@ -552,7 +609,7 @@ pattern = "ghp_ghe_{hex:32}"
 
   #[test]
   fn replace_discards_the_bundled_entry() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-narrow.toml",
@@ -571,7 +628,7 @@ replace = true
 
   #[test]
   fn names_entry_overrides_a_provider_claim() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-name.toml",
@@ -607,12 +664,12 @@ pattern = "ghp_named_{hex:32}"
   #[test]
   fn unknown_env_name_falls_back_to_the_default_pattern() {
     let registry = Registry::load(None).unwrap();
-    assert_eq!(registry.template("SOME_RANDOM_THING", None), crate::config::DEFAULT_PATTERN);
+    assert_eq!(registry.template("SOME_RANDOM_THING", None), DEFAULT_PATTERN);
   }
 
   #[test]
   fn duplicate_claim_in_one_file_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-dup.toml",
@@ -632,7 +689,7 @@ hosts = ["https://b.example"]
 
   #[test]
   fn contains_without_a_pattern_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-bad.toml",
@@ -647,7 +704,7 @@ contains = ["bad"]
 
   #[test]
   fn empty_contains_needle_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-bad.toml",
@@ -663,7 +720,7 @@ contains = [""]
 
   #[test]
   fn empty_registry_pattern_is_treated_as_absent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-blank.toml",
@@ -679,12 +736,12 @@ pattern = ""
       registry.lookup("BLANK_TOKEN").expect("BLANK_TOKEN in the loaded registry").pattern,
       None
     );
-    assert_eq!(registry.template("BLANK_TOKEN", None), crate::config::DEFAULT_PATTERN);
+    assert_eq!(registry.template("BLANK_TOKEN", None), DEFAULT_PATTERN);
   }
 
   #[test]
   fn any_host_entry_warns_but_loads() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-any.toml",
@@ -702,7 +759,7 @@ hosts = ["https://*"]
 
   #[test]
   fn bad_host_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-bad.toml",
@@ -727,7 +784,7 @@ hosts = ["https://api.example/path"]
 
   #[test]
   fn rules_d_files_load_in_filename_order() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-first.toml",
@@ -742,14 +799,11 @@ hosts = ["https://api.example/path"]
 
   #[test]
   fn missing_rules_dir_is_not_an_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let registry = Registry::load(Some(&dir.path().join("absent"))).unwrap();
-    assert!(
-      !registry
-        .lookup("GITHUB_TOKEN")
-        .expect("GITHUB_TOKEN in the bundled registry")
-        .hosts
-        .is_empty()
+    assert_ne!(
+      registry.lookup("GITHUB_TOKEN").expect("GITHUB_TOKEN in the bundled registry").hosts,
+      [] as [String; 0]
     );
   }
   #[test]
@@ -834,7 +888,7 @@ hosts = ["https://api.example/path"]
 
   #[test]
   fn replace_discards_the_oauth2_flow() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-flow.toml",
@@ -865,7 +919,7 @@ hosts = ["https://api.example/path"]
 
   #[test]
   fn authorization_code_without_authorize_url_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-bad.toml",
@@ -885,7 +939,7 @@ hosts = ["https://api.example/path"]
 
   #[test]
   fn bad_flow_token_url_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-bad.toml",
@@ -905,7 +959,7 @@ hosts = ["https://api.example/path"]
 
   #[test]
   fn duplicate_and_empty_token_fields_are_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     write_rules(
       dir.path(),
       "10-bad.toml",

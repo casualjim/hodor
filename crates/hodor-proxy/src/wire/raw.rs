@@ -199,7 +199,7 @@ mod tests {
     let mut full = out;
     full.extend_from_slice(&flush);
     assert_eq!(full, b"xxSHORTyy");
-    assert!(hits.is_empty());
+    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
   }
 
   #[tokio::test]

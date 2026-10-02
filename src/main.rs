@@ -5,19 +5,80 @@
 //! match, and redacts real values back to fakes on responses. Everything
 //! else splices through byte-identical.
 
-pub use hodor_config::cli::{
-  AgentArgs, Cli, Command, FakeArgs, ImportArgs, InitArgs, LogsArgs, ProxyBackend, RegistryCommand, ServeArgs, WorkspaceArgs,
-};
-
-use std::path::{Path, PathBuf};
-
-use clap::Parser as _;
-
+mod commands;
 mod fwd;
 
-/// The workspace a command names, or the current directory.
-fn workspace_arg(workspace: Option<&Path>) -> PathBuf {
-  workspace.unwrap_or(Path::new(".")).to_path_buf()
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use hodor_config::cli::{Cli, CliCommand, ProxyBackend};
+
+use commands::{CaArgs, ConfigArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, ServeArgs};
+use hodor_compose::{AgentArgs, DownArgs, InitArgs, LogsArgs, UpArgs};
+
+/// Command-line interface: global flags plus a subcommand.
+#[derive(Parser, Debug)]
+#[command(name = "hodor", about = "grant-scoped MITM proxy")]
+struct HodorCli {
+  /// Global flags: the highest-precedence config layer.
+  #[command(flatten)]
+  globals: Cli,
+  /// Subcommand; absent means `serve`.
+  #[command(subcommand)]
+  command: Option<Command>,
+}
+
+/// Available subcommands. Each variant's args own a `run` method, so dispatch
+/// is one method call per variant — awaited for the genuinely asynchronous
+/// ones, plain for the rest.
+#[derive(Subcommand, Debug, Clone)]
+enum Command {
+  /// Serve the proxy: the explicit listener, plus transparent capture when
+  /// `--proxy-backend` selects one.
+  Serve(ServeArgs),
+  /// Print the deterministic fake for an env var name.
+  Fake(FakeArgs),
+  /// Generate (or load) the CA, print its certificate PEM to stdout, and write
+  /// the certificate and the key beside the CA file as `ca.crt` and `ca.key`.
+  ///
+  /// The printed PEM is the trust anchor to install into workload
+  /// containers; the private key stays in the CA file and in `ca.key`.
+  Ca(CaArgs),
+  /// Print `[rules.*]` for the secrets this workspace can get (fnox ∩ registry).
+  Rules(RulesArgs),
+  /// Print a reference config: every setting, its default, and the doc
+  /// comment explaining it. Load errors surface first, so this doubles as a
+  /// config check. Secrets never appear: the template is derived from the
+  /// config schema, never from values.
+  Config(ConfigArgs),
+  /// Curate an `oauth2` registry fragment from a discovery or `OpenAPI`
+  /// document. Reads a local file; prints TOML to stdout. Never touches
+  /// the bundled registry or runtime config.
+  Registry(RegistryArgs),
+  /// Generate this workspace's stack as an editable file: the workspace
+  /// `[rules.*]` config when it has none, the CA, the agent entrypoint, and
+  /// the compose file. Existing files are left untouched; the stack is
+  /// regenerated when the workspace config changed since it was generated.
+  Init(InitArgs),
+  /// Enter the confined agent environment in one go: generate what is missing,
+  /// start the stack, then run the configured shell (or the command after
+  /// `--`). The stack keeps running when that exits, unless `--rm` stops it.
+  Agent(AgentArgs),
+  /// Forward agent-owned loopback listeners to the wildcard interface.
+  ///
+  /// A sidecar of the generated compose stack, not a user command: it shares
+  /// the agent's PID namespace and hodor's network namespace, so it sees every
+  /// listener of the shared namespace and can attribute the ones the agent's
+  /// own processes hold. Anything else — hodor's capture and explicit-proxy
+  /// listeners, docker's embedded DNS — is never attributable from here and
+  /// is never forwarded. Raw bytes only: payloads are never inspected.
+  Fwd(FwdArgs),
+  /// Start the layered compose project `hodor init` generated.
+  Up(UpArgs),
+  /// Stop the layered compose project.
+  Down(DownArgs),
+  /// Read the stack's logs.
+  Logs(LogsArgs),
 }
 
 #[global_allocator]
@@ -43,111 +104,34 @@ async fn main() -> eyre::Result<()> {
     .with_thread_names(true)
     .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
     .init();
-  let cli = Cli::parse();
-  let command = cli.command.clone().unwrap_or(Command::Serve(ServeArgs::default()));
+  let HodorCli { globals: cli, command } = HodorCli::parse();
+  let command = command.unwrap_or(Command::Serve(ServeArgs::default()));
+  let hodor_version = env!("CARGO_PKG_VERSION");
   match command {
-    Command::Fake(args) => {
-      if let Some(pattern) = args.pattern.as_deref() {
-        hodor_config::config::validate_pattern(pattern).map_err(|err| eyre::eyre!("bad --pattern: {err}"))?;
-      }
-      let registry = generation_registry()?;
-      let (mut config, _) = hodor_config::config::load(&cli)?;
-      // Resolve the rule's value the way `serve` does, so a `tcp://` rule
-      // previews the length-matched decoy the proxy will actually use.
-      let needs_fnox = config.rules.values().any(|rule| rule.env == args.env && rule.value.is_none());
-      if needs_fnox {
-        let fnox = hodor_fnox::FnoxSource::open()?;
-        hodor_fnox::resolve(&mut config, &registry, fnox).await?;
-      }
-      let rule = config.rules.values().find(|rule| rule.env == args.env);
-      let Some(rule) = rule else {
-        println!("{}", registry.decoy(&args.env, args.pattern.as_deref()));
-        return Ok(());
-      };
-      let Some(value) = rule.value.as_ref() else {
-        println!("{}", registry.decoy(&args.env, args.pattern.as_deref()));
-        return Ok(());
-      };
-      let allow: Vec<hodor_config::grants::EndpointScope> = rule
-        .allow
-        .iter()
-        .map(|entry| entry.parse())
-        .collect::<Result<_, _>>()
-        .map_err(|err| eyre::eyre!("bad allow entry: {err}"))?;
-      let (decoy, length_matched) = hodor_config::grants::decoy_for_rule(
-        &rule.env,
-        rule.pattern.as_deref().or(args.pattern.as_deref()),
-        &allow,
-        hodor_config::ExposeSecret::expose_secret(value).len(),
-      );
-      if length_matched {
-        eprintln!("# length-matched for a tcp:// allow entry; the registry shape rendered another length");
-      }
-      println!("{decoy}");
-      Ok(())
-    }
-    Command::Ca => {
-      let (config, _) = hodor_config::config::load(&cli)?;
-      let ca = hodor_pki::ca::load_or_generate(&ca_path(&config.proxy)?)?;
-      print!("{}", String::from_utf8_lossy(&ca.cert_pem()));
-      Ok(())
-    }
-    Command::Rules => {
-      print!(
-        "{}",
-        hodor_compose::rules_command(hodor_config::config::cwd_project_rules_dir().as_deref())?
-      );
-      Ok(())
-    }
-    Command::Registry(args) => {
-      let import = match &args.command {
-        RegistryCommand::FromOidc(import) | RegistryCommand::FromOpenapi(import) => import,
-      };
-      let doc = std::fs::read_to_string(&import.file).map_err(|err| eyre::eyre!("read {}: {err}", import.file.display()))?;
-      let flows = match &args.command {
-        RegistryCommand::FromOidc(_) => vec![(
-          import.slug.clone(),
-          hodor_config::import::flow_from_oidc(&doc).map_err(|err| err.to_string()),
-        )],
-        RegistryCommand::FromOpenapi(_) => hodor_config::import::flows_from_openapi(&doc)?,
-      };
-      for (slug, flow) in flows {
-        match flow {
-          Ok(flow) => print!("{}", hodor_config::import::to_toml_fragment(&slug, &import.env, &flow)?),
-          Err(reason) => tracing::warn!(scheme = %slug, reason, "skipped security scheme"),
-        }
-      }
-      Ok(())
-    }
-    Command::Init(args) => {
-      let workspace = workspace_arg(args.workspace.as_deref());
-      hodor_compose::init_command(&workspace, args.backend)
-    }
-    Command::Agent(args) => {
-      let workspace = workspace_arg(args.workspace.as_deref());
-      hodor_compose::agent_command(&workspace, &args.command, args.rm)
-    }
-    Command::Up(args) => hodor_compose::up_command(&workspace_arg(args.workspace.as_deref())),
-    Command::Down(args) => hodor_compose::down_command(&workspace_arg(args.workspace.as_deref())),
-    Command::Logs(args) => hodor_compose::logs_command(&workspace_arg(args.workspace.as_deref()), &args),
-    Command::Fwd => {
-      #[cfg(not(target_os = "linux"))]
-      eyre::bail!("hodor fwd reads /proc/net/tcp and exists on Linux only");
-      #[cfg(target_os = "linux")]
-      crate::fwd::run().await
-    }
-    Command::Serve(args) => serve(&cli, args).await,
+    Command::Serve(args) => args.run(&cli, hodor_version).await?,
+    Command::Fake(args) => args.run(&cli, hodor_version).await?,
+    Command::Ca(args) => args.run(&cli, hodor_version).await?,
+    Command::Rules(args) => args.run(&cli, hodor_version).await?,
+    Command::Config(args) => args.run(&cli, hodor_version).await?,
+    Command::Registry(args) => args.run(&cli, hodor_version).await?,
+    Command::Init(args) => args.run(&cli, hodor_version).await?,
+    Command::Agent(args) => args.run(&cli, hodor_version).await?,
+    Command::Fwd(args) => args.run(&cli, hodor_version).await?,
+    Command::Up(args) => args.run(&cli, hodor_version).await?,
+    Command::Down(args) => args.run(&cli, hodor_version).await?,
+    Command::Logs(args) => args.run(&cli, hodor_version).await?,
   }
+  Ok(())
 }
 
 /// The registry the value-resolving commands run with: the bundled table,
 /// the global `rules.d`, then the workspace's own when one encloses the
 /// working directory.
 fn generation_registry() -> eyre::Result<hodor_config::registry::Registry> {
-  hodor_config::registry::Registry::load_union(
+  Ok(hodor_config::registry::Registry::load_union(
     hodor_config::config::rules_dir().as_deref(),
     hodor_config::config::cwd_project_rules_dir().as_deref(),
-  )
+  )?)
 }
 
 /// `hodor serve`: bind the explicit listener, then run the selected capture
@@ -162,7 +146,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   if args.proxy_backend == ProxyBackend::Ebpf && args.ebpf_cgroup.is_none() {
     eyre::bail!("--ebpf-cgroup is required for --proxy-backend ebpf");
   }
-  let (mut config, workspace) = hodor_config::config::load(cli)?;
+  let (mut config, workspace) = hodor_config::config::load(cli, Some(&args.proxy))?;
   let registry = generation_registry()?;
   // fnox is needed exactly when a rule has no inline value: every
   // credential the proxy runs with resolves from fnox, age-encrypted secrets
@@ -170,7 +154,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   let needs_fnox = config.rules.values().any(|rule| rule.value.is_none() || rule.is_database());
   let fnox = if needs_fnox { hodor_fnox::FnoxSource::open()? } else { None };
   if let Some(source) = &fnox {
-    for name in hodor_fnox::export_provider_env(source).await? {
+    for name in hodor_fnox::export_provider_env(source).await {
       tracing::debug!(name, "provider credential taken from fnox");
     }
   }
@@ -218,14 +202,19 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     let capture = std::sync::Arc::clone(&state);
     // Dropping the task runs its teardown guard, which removes the policy
     // routes; a leaked default route in the capture table blackholes all egress.
-    return with_capture(listener, state, "TUN", async move { hodor_tun::run_tun(capture).await }).await;
+    return with_capture(listener, state, "TUN", async move {
+      hodor_tun::run_tun(capture).await.map_err(eyre::Report::from)
+    })
+    .await;
   }
   #[cfg(target_os = "linux")]
   if args.proxy_backend == ProxyBackend::Tproxy {
     let capture = std::sync::Arc::clone(&state);
     let allow_root_netns = args.tproxy_allow_root_netns;
     return with_capture(listener, state, "TPROXY", async move {
-      hodor_tproxy::run_tproxy(capture, allow_root_netns).await
+      hodor_tproxy::run_tproxy(capture, allow_root_netns)
+        .await
+        .map_err(eyre::Report::from)
     })
     .await;
   }
@@ -236,7 +225,10 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
       .clone()
       .ok_or_else(|| eyre::eyre!("--ebpf-cgroup is required for --proxy-backend ebpf"))?;
     let capture = std::sync::Arc::clone(&state);
-    return with_capture(listener, state, "eBPF", async move { hodor_ebpf::run_ebpf(capture, cgroup).await }).await;
+    return with_capture(listener, state, "eBPF", async move {
+      hodor_ebpf::run_ebpf(capture, cgroup).await.map_err(eyre::Report::from)
+    })
+    .await;
   }
   hodor_proxy::serve(listener, state).await;
   Ok(())

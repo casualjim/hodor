@@ -20,6 +20,7 @@ use pgwire::messages::startup::{GssEncRequest, SslRequest, Startup};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use super::{Direction, Hit, Raw, Rewritten, Wire};
+use crate::Error;
 
 /// Cap for one greeting message. Real `StartupMessages` are hundreds of
 /// bytes; anything past this is a drip or an attack, never a greeting.
@@ -309,7 +310,7 @@ pub(crate) async fn read_guest_opening<G: AsyncRead + AsyncWrite + Unpin>(
   guest: &mut G,
   initial: &[u8],
   budget: std::time::Duration,
-) -> eyre::Result<Option<GuestOpening>> {
+) -> Result<Option<GuestOpening>, Error> {
   let mut buf = initial.to_vec();
   let mut chunk = [0u8; 256];
   let deadline = tokio::time::Instant::now() + budget;
@@ -359,7 +360,7 @@ pub(crate) async fn request_upstream_tls<S: AsyncRead + AsyncWrite + Unpin>(
   server: &mut S,
   negotiation: SslNegotiation,
   budget: std::time::Duration,
-) -> eyre::Result<bool> {
+) -> Result<bool, Error> {
   if negotiation == SslNegotiation::Direct {
     return Ok(true);
   }
@@ -370,7 +371,7 @@ pub(crate) async fn request_upstream_tls<S: AsyncRead + AsyncWrite + Unpin>(
   // the budget, not hold the connection forever.
   tokio::time::timeout(budget, server.read_exact(&mut answer))
     .await
-    .map_err(|_elapsed| eyre::eyre!("upstream never answered the TLS request"))??;
+    .map_err(|_elapsed| Error::TlsRequestUnanswered)??;
   Ok(answer[0] == b'S')
 }
 

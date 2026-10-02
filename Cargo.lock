@@ -3709,16 +3709,25 @@ dependencies = [
 name = "hodor-compose"
 version = "0.1.16"
 dependencies = [
+ "base64 0.22.1",
+ "clap",
  "dirs",
- "eyre",
  "hodor-config",
  "hodor-fnox",
  "hodor-pki",
  "libc",
  "pretty_assertions",
+ "secrecy",
+ "serde",
+ "serde_yaml",
+ "shellexpand",
  "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 0.8.23",
  "toml_edit 0.25.15+spec-1.1.0",
  "tracing",
+ "xpanda",
 ]
 
 [[package]]
@@ -3730,7 +3739,6 @@ dependencies = [
  "code-workspace",
  "confique",
  "dirs",
- "eyre",
  "hex",
  "pretty_assertions",
  "secrecy",
@@ -3738,6 +3746,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.20",
  "toml 0.8.23",
  "tracing",
  "url",
@@ -3752,7 +3761,6 @@ dependencies = [
  "aya-build",
  "aya-obj",
  "dashmap",
- "eyre",
  "hodor-config",
  "hodor-pki",
  "hodor-proxy",
@@ -3760,6 +3768,7 @@ dependencies = [
  "rustls 0.23.45",
  "secrecy",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls 0.26.5",
  "tracing",
@@ -3776,7 +3785,6 @@ dependencies = [
 name = "hodor-fnox"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "fnox-core",
  "hodor-config",
  "miette",
@@ -3784,6 +3792,7 @@ dependencies = [
  "secrecy",
  "serde",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "toml 0.8.23",
  "toml_edit 0.25.15+spec-1.1.0",
@@ -3794,12 +3803,12 @@ dependencies = [
 name = "hodor-pki"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "pretty_assertions",
  "rama",
  "rcgen",
  "rustls 0.23.45",
  "tempfile",
+ "thiserror 2.0.20",
  "time",
  "tracing",
 ]
@@ -3808,10 +3817,10 @@ dependencies = [
 name = "hodor-plugin"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "hodor-config",
  "pretty_assertions",
  "tempfile",
+ "thiserror 2.0.20",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
@@ -3824,7 +3833,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
- "eyre",
  "futures",
  "h2 0.4.19",
  "hodor-config",
@@ -3856,7 +3864,6 @@ dependencies = [
 name = "hodor-tproxy"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "futures-util",
  "hodor-config",
  "hodor-pki",
@@ -3871,6 +3878,7 @@ dependencies = [
  "rustls 0.23.45",
  "secrecy",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls 0.26.5",
  "tracing",
@@ -3880,7 +3888,6 @@ dependencies = [
 name = "hodor-tun"
 version = "0.1.16"
 dependencies = [
- "eyre",
  "futures-sink",
  "futures-util",
  "hodor-config",
@@ -3893,6 +3900,7 @@ dependencies = [
  "smoltcp",
  "socket2 0.6.5",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls 0.26.5",
  "tokio-util",
@@ -10167,6 +10175,12 @@ name = "xmlparser"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
+
+[[package]]
+name = "xpanda"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b466aaacda7bd72de169d2838690889307f37948f9f2929f1cfeb51f36af301"
 
 [[package]]
 name = "xx"

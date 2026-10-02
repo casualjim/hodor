@@ -1,18 +1,23 @@
 //! Config overlay: global + project files, env, CLI via confique.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fmt;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use confique::{Config as _, Layer as _};
-use eyre::WrapErr as _;
+use confique::{Config, Layer as _};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use validator::{Validate, ValidationError};
 
-use crate::cli::{Cli, Command};
+use crate::cli::Cli;
+use crate::error::Error;
+use crate::grants::{EndpointScope, GuestTlsMode, HostPat};
+use crate::plugins::{PluginCfg, PluginDirection};
+use crate::registry::{FlowKind, OAuthFlow, validate_flow};
 use code_workspace::{Workspace, resolve_root};
 
 /// Pattern used when neither the rule nor the registry supplies one.
@@ -34,7 +39,7 @@ pub struct AppConfig {
   /// WASM rewrite plugins by name; loaded at startup, fail closed.
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-  pub plugins: BTreeMap<String, crate::plugins::PluginCfg>,
+  pub plugins: BTreeMap<String, PluginCfg>,
   /// Tool config mounts by tool name; extends or overrides the built-in table.
   #[config(default = {})]
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -95,15 +100,123 @@ pub struct WorkspaceCfg {
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub ports: Vec<u16>,
+  /// Env names forwarded into the agent environment as `${NAME}` compose
+  /// interpolation: compose substitutes the host value when the stack starts,
+  /// so the generated file holds no secret and values stay fresh without
+  /// regenerating. A name that is also a `[rules.*]` env or a selected decoy
+  /// is a generation-time error — boundary discipline, one name one path.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub passthrough: Vec<String>,
+  /// Host files rewritten with decoys and mounted read-only into the agent:
+  /// each listed env name's real value is byte-replaced by its decoy and the
+  /// result lands under the workspace state directory, mounted at `dest`
+  /// (`{home}` expands to `home` above). A name with no known real value or
+  /// no decoy fails generation, naming the name. Kubeconfig sources take a
+  /// structural adapter instead of the byte-swap (detected, not declared)
+  /// and state no `envs`: the file is the secret source.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub file_rewrite: Vec<FileRewrite>,
 }
-
 impl WorkspaceCfg {
   /// Selected profile name, or the shared base when unset.
   #[must_use]
   pub fn profile_name(&self) -> &str {
     self.profile.as_deref().unwrap_or(SHARED_PROFILE)
   }
+
+  /// Every `$VAR` this workspace's settings reference: `include` entries,
+  /// rewrite sources and dests with their envs, plus any extra strings the
+  /// caller layers on top (the home).
+  #[must_use]
+  pub fn referenced_variables(&self, extra: &[&str]) -> BTreeSet<String> {
+    let mut referenced = BTreeSet::new();
+    for entry in &self.include {
+      collect_referenced_variables(&entry.to_string_lossy(), &mut referenced);
+    }
+    for rewrite in &self.file_rewrite {
+      collect_referenced_variables(&rewrite.source.to_string_lossy(), &mut referenced);
+      collect_referenced_variables(&rewrite.dest, &mut referenced);
+      referenced.extend(rewrite.envs.iter().cloned());
+    }
+    for value in extra {
+      collect_referenced_variables(value, &mut referenced);
+    }
+    referenced
+  }
 }
+
+/// Collect every `$VAR` reference in one interpolated string.
+fn collect_referenced_variables(value: &str, names: &mut BTreeSet<String>) {
+  for candidate in value.split('$').skip(1) {
+    let name = match candidate.strip_prefix('{') {
+      Some(braced) => match braced.split_once('}') {
+        Some((inside, _)) => inside.split_once(":-").map_or(inside, |(name, _)| name),
+        None => continue,
+      },
+      None => candidate
+        .split(|character: char| !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'))
+        .next()
+        .unwrap_or_default(),
+    };
+    if valid_env_name(name) {
+      names.insert(name.to_string());
+    }
+  }
+}
+
+/// Env names are `[_A-Za-z][_0-9A-Za-z]*`; anything else after a `$` is not a
+/// reference.
+fn valid_env_name(name: &str) -> bool {
+  let mut chars = name.chars();
+  let Some(first) = chars.next() else {
+    return false;
+  };
+  matches!(first, 'A'..='Z' | 'a'..='z' | '_') && chars.all(|character| matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_'))
+}
+
+/// One host file to rewrite with decoys before the agent sees it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRewrite {
+  /// Host file to read: `~` and `$VAR` expand, relative paths resolve
+  /// against the workspace root.
+  pub source: PathBuf,
+  /// Container path the rewritten file mounts at, read-only; `{home}`
+  /// expands to `[workspace] home` and `$VAR` expands first.
+  pub dest: String,
+  /// Env names whose real values are replaced by their decoys in the file.
+  /// Empty for the known config formats (`kubeconfig`, `talos`): the
+  /// adapter knows where the secrets live.
+  #[serde(default)]
+  pub envs: Vec<String>,
+  /// Declared format, skipping detection. Known formats: `kubeconfig`
+  /// (kubectl), `talos` (talosctl). More formats later; unknown files keep
+  /// the raw byte-swap when this is absent.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub format: Option<RewriteFormat>,
+}
+
+/// Declared `file_rewrite` format: the named adapter handles the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RewriteFormat {
+  /// Kubectl config: structural grant derivation plus decoy twin.
+  Kubeconfig,
+  /// Talos client config: structural grant derivation plus decoy twin.
+  Talos,
+}
+
+impl fmt::Display for RewriteFormat {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Kubeconfig => "kubeconfig",
+      Self::Talos => "talos",
+    })
+  }
+}
+
 /// Proxy listener settings (CLI/env/file overlay).
 #[derive(confique::Config, Clone, Debug, Serialize)]
 #[config(layer_attr(derive(clap::Args, Clone, Debug, Default)))]
@@ -162,7 +275,7 @@ pub struct RuleCfg {
   pub pattern: Option<String>,
   /// `OAuth2` token-issuer flow overriding the registry.
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub oauth2: Option<crate::registry::OAuthFlow>,
+  pub oauth2: Option<OAuthFlow>,
   /// Consult the host registry for this rule (default true).
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub registry: Option<bool>,
@@ -205,7 +318,7 @@ pub struct HostTlsCfg {
   pub root_cert: Option<PathBuf>,
   /// How the guest leg treats client certificates.
   #[serde(default)]
-  pub guest_tls_mode: crate::grants::GuestTlsMode,
+  pub guest_tls_mode: GuestTlsMode,
   /// Container-internal path the guest's minted certificate mounts at.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub guest_cert: Option<PathBuf>,
@@ -217,7 +330,7 @@ pub struct HostTlsCfg {
 /// `allow` entries must all parse as URI grants.
 fn validate_allow(entries: &Vec<String>) -> Result<(), ValidationError> {
   for entry in entries {
-    entry.parse::<crate::grants::EndpointScope>().map_err(|err| {
+    entry.parse::<EndpointScope>().map_err(|err| {
       let mut error = ValidationError::new("allow");
       error.message = Some(format!("bad allow entry `{entry}`: {err}").into());
       error
@@ -260,11 +373,11 @@ pub enum IfMissing {
 ///
 /// Returns an error when the working directory is unreadable, when a config
 /// layer is malformed, or when an `allow` entry fails to resolve.
-pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
-  let cwd = env::current_dir()?;
+pub fn load(cli: &Cli, proxy: Option<&<ProxyCfg as Config>::Layer>) -> Result<(AppConfig, Option<Workspace>), Error> {
+  let cwd = env::current_dir().map_err(Error::CurrentDir)?;
   let mut cli_layer = <AppConfig as confique::Config>::Layer::empty();
-  if let Some(Command::Serve(args)) = &cli.command {
-    cli_layer.proxy = args.proxy.clone();
+  if let Some(proxy) = proxy {
+    cli_layer.proxy = proxy.clone();
   }
 
   let mut builder = AppConfig::builder().preloaded(cli_layer).env();
@@ -282,7 +395,7 @@ pub fn load(cli: &Cli) -> eyre::Result<(AppConfig, Option<Workspace>)> {
     builder = builder.file(path);
   }
 
-  let mut config: AppConfig = builder.load().map_err(eyre::Report::from)?;
+  let mut config: AppConfig = builder.load()?;
   // confique merges the `rules` map wholesale per winning file, so re-merge
   // by label here: global entries first, project entries replace by label.
   // This second read of the same files is deliberate. confique's builder
@@ -309,19 +422,27 @@ pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
 
 /// Merge `[rules]` tables by label: global first, project wins wholesale
 /// per label. Errors name the file + label.
-fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> eyre::Result<BTreeMap<String, RuleCfg>> {
+fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> Result<BTreeMap<String, RuleCfg>, Error> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
-    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
+    let text = fs::read_to_string(path).map_err(|source| Error::ReadFile {
+      path: path.to_path_buf(),
+      source,
+    })?;
+    let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
+      path: path.to_path_buf(),
+      source: Box::new(source),
+    })?;
     let Some(rules) = doc.get("rules") else {
       continue;
     };
-    let table = rules
-      .as_table()
-      .ok_or_else(|| eyre::eyre!("{}: `rules` must be a table", path.display()))?;
+    let table = rules.as_table().ok_or_else(|| Error::RulesNotTable { path: path.to_path_buf() })?;
     for (label, entry) in table {
-      let cfg = RuleCfg::deserialize(entry.clone()).wrap_err_with(|| format!("{}: rule `{label}`", path.display()))?;
+      let cfg = RuleCfg::deserialize(entry.clone()).map_err(|source| Error::BadRule {
+        path: path.to_path_buf(),
+        label: label.clone(),
+        source: Box::new(source),
+      })?;
       merged.insert(label.clone(), cfg);
     }
   }
@@ -329,17 +450,25 @@ fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> eyre::Res
 }
 
 /// Merge `[tools]` tables by name: global first, project wins per name.
-fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> eyre::Result<BTreeMap<String, ToolCfg>> {
+fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> Result<BTreeMap<String, ToolCfg>, Error> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
-    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))?;
+    let text = std::fs::read_to_string(path).map_err(|source| Error::ReadFile {
+      path: path.to_path_buf(),
+      source,
+    })?;
+    let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
+      path: path.to_path_buf(),
+      source: Box::new(source),
+    })?;
     if let Some(tools) = doc.get("tools") {
-      let table = tools
-        .as_table()
-        .ok_or_else(|| eyre::eyre!("{}: `tools` must be a table", path.display()))?;
+      let table = tools.as_table().ok_or_else(|| Error::ToolsNotTable { path: path.to_path_buf() })?;
       for (name, entry) in table {
-        let cfg = ToolCfg::deserialize(entry.clone()).wrap_err_with(|| format!("{}: tool `{name}`", path.display()))?;
+        let cfg = ToolCfg::deserialize(entry.clone()).map_err(|source| Error::BadTool {
+          path: path.to_path_buf(),
+          name: name.clone(),
+          source: Box::new(source),
+        })?;
         merged.insert(name.clone(), cfg);
       }
     }
@@ -408,28 +537,35 @@ pub fn valid_profile(name: &str) -> bool {
 /// cookie without a `parent` key inherits the shared base directly, it does
 /// not fall through to the other layer's cookie. No cookie at all means the
 /// shared base. The shared base itself takes no parent.
-fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) -> eyre::Result<Option<String>> {
+fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) -> Result<Option<String>, Error> {
   for layer in [project, global].into_iter().flatten() {
     let cookie = layer.join(profile).join("profile.toml");
     if !cookie.is_file() {
       continue;
     }
-    let text = std::fs::read_to_string(&cookie).wrap_err_with(|| format!("read {}", cookie.display()))?;
-    let doc: toml::Table = toml::from_str(&text).wrap_err_with(|| format!("parse {}", cookie.display()))?;
+    let text = std::fs::read_to_string(&cookie).map_err(|source| Error::ReadFile {
+      path: cookie.clone(),
+      source,
+    })?;
+    let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
+      path: cookie.clone(),
+      source: Box::new(source),
+    })?;
     let Some(parent) = doc.get("profile").and_then(|table| table.get("parent")) else {
       return Ok(None);
     };
     let Some(parent) = parent.as_str() else {
-      eyre::bail!("{}: `[profile] parent` must be a string", cookie.display());
+      return Err(Error::ProfileParentNotString { path: cookie.clone() });
     };
     if profile == SHARED_PROFILE {
-      eyre::bail!("{}: the shared base profile takes no parent", cookie.display());
+      return Err(Error::SharedProfileParent { path: cookie.clone() });
     }
-    eyre::ensure!(
-      valid_profile(parent),
-      "{}: parent `{parent}` is not a plain directory name",
-      cookie.display()
-    );
+    if !valid_profile(parent) {
+      return Err(Error::BadProfileParent {
+        path: cookie.clone(),
+        parent: parent.to_string(),
+      });
+    }
     return Ok(Some(parent.to_string()));
   }
   Ok(None)
@@ -449,8 +585,12 @@ fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) 
 ///
 /// Never panics: the chain starts at one element and the loop only appends,
 /// so `chain.last()` always finds a name.
-pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &str) -> eyre::Result<Vec<String>> {
-  eyre::ensure!(valid_profile(selected), "profile `{selected}` is not a plain directory name");
+pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &str) -> Result<Vec<String>, Error> {
+  if !valid_profile(selected) {
+    return Err(Error::BadProfileName {
+      name: selected.to_string(),
+    });
+  }
   let mut chain = vec![selected.to_string()];
   loop {
     let name = chain.last().expect("the chain never empties").clone();
@@ -459,9 +599,16 @@ pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &s
       break;
     }
     let parent = profile_parent(project, global, &name)?.unwrap_or_else(|| SHARED_PROFILE.to_string());
-    eyre::ensure!(!chain.contains(&parent), "profile inheritance cycle through `{parent}`");
+    if chain.contains(&parent) {
+      return Err(Error::ProfileCycle { parent: parent.clone() });
+    }
     let held = parent == SHARED_PROFILE || [project, global].into_iter().flatten().any(|layer| layer.join(&parent).is_dir());
-    eyre::ensure!(held, "profile `{name}` inherits `{parent}`, which no layer holds");
+    if !held {
+      return Err(Error::ProfileParentMissing {
+        name: name.clone(),
+        parent: parent.clone(),
+      });
+    }
     chain.push(parent);
   }
   let held = [project, global].into_iter().flatten().any(|layer| layer.join(selected).is_dir());
@@ -509,42 +656,57 @@ pub fn rules_dir() -> Option<PathBuf> {
 }
 
 impl AppConfig {
-  fn validate(&self) -> eyre::Result<()> {
+  fn validate(&self) -> Result<(), Error> {
     let mut env_names: BTreeMap<&str, &str> = BTreeMap::new();
     for (label, rule) in &self.rules {
       if let Some(previous) = env_names.insert(rule.env.as_str(), label.as_str()) {
-        eyre::bail!("rules `{previous}` and `{label}` share env name `{}`", rule.env);
+        return Err(Error::DuplicateEnv {
+          previous: previous.to_string(),
+          label: label.clone(),
+          env: rule.env.clone(),
+        });
       }
-      eyre::ensure!(!rule.env.is_empty(), "rule `{label}`: `env` must not be empty");
-      if let Some(value) = &rule.value {
-        eyre::ensure!(!value.expose_secret().is_empty(), "rule `{label}`: `value` must not be empty");
+      if rule.env.is_empty() {
+        return Err(Error::EmptyEnv { label: label.clone() });
+      }
+      if let Some(value) = &rule.value
+        && value.expose_secret().is_empty()
+      {
+        return Err(Error::EmptyValue { label: label.clone() });
       }
       for entry in &rule.allow {
-        let scope: crate::grants::EndpointScope = entry
-          .parse()
-          .map_err(|err| eyre::eyre!("rule `{label}`: bad allow entry `{entry}`: {err}"))?;
-        if matches!(scope.host, crate::grants::HostPat::Any) {
+        let scope: EndpointScope = entry.parse().map_err(|err| Error::BadAllow {
+          label: label.clone(),
+          entry: entry.clone(),
+          detail: err,
+        })?;
+        if matches!(scope.host, HostPat::Any) {
           tracing::warn!(label, entry, "grant matches any host; secret is exfil-risky");
         }
       }
       if let Some(pattern) = rule.pattern.as_deref().filter(|p| !p.is_empty()) {
-        validate_pattern(pattern).map_err(|err| eyre::eyre!("rule `{label}`: bad pattern `{pattern}`: {err}"))?;
+        validate_pattern(pattern).map_err(|err| Error::BadPattern {
+          label: label.clone(),
+          pattern: pattern.to_string(),
+          detail: err,
+        })?;
       }
       if let Some(flow) = &rule.oauth2 {
-        crate::registry::validate_flow(flow, "config", label)?;
+        validate_flow(flow, "config", label)?;
       }
     }
     for port in &self.workspace.ports {
-      eyre::ensure!(*port != 0, "[workspace] ports: port 0 cannot be published");
+      if *port == 0 {
+        return Err(Error::PortZero);
+      }
       // The capture listeners hold these ports inside the shared netns, and
       // the `fwd` sidecar only forwards agent-owned listeners, so a published
       // capture port would shadow a host port with a dead binding. The
       // literals must stay in step with hodor-ebpf's `TCP_LISTEN_PORT` and
       // `UDP_LISTEN_PORT`.
-      eyre::ensure!(
-        *port != 15_000 && *port != 15_001,
-        "[workspace] port {port} is a capture listener port and cannot be published"
-      );
+      if *port == 15_000 || *port == 15_001 {
+        return Err(Error::CapturePort { port: *port });
+      }
     }
     Ok(())
   }
@@ -690,18 +852,111 @@ fn fill_encoding(seed: &str, encoding: Encoding, count: usize) -> String {
   out
 }
 
+/// One sample entry per map-valued table, serialized for the reference
+/// `hodor config` appends to the schema template. Drift is compile-checked:
+/// every literal below names all fields of its struct, so a new field fails
+/// the build until the sample states it, and
+/// `reference_samples_name_every_setting` fails when the serializer then
+/// hides one. No production type carries reference-only baggage.
+///
+/// # Panics
+///
+/// Only on serialization of in-repo literals, which the suite catches.
+#[must_use]
+pub fn reference_samples() -> String {
+  #[derive(Serialize)]
+  struct Samples<'a> {
+    rules: BTreeMap<&'a str, RuleCfg>,
+    plugins: BTreeMap<&'a str, PluginCfg>,
+    tools: BTreeMap<&'a str, ToolCfg>,
+    workspace: WorkspaceSamples,
+  }
+  #[derive(Serialize)]
+  struct WorkspaceSamples {
+    file_rewrite: Vec<FileRewrite>,
+  }
+  let mut rule_tls = BTreeMap::new();
+  rule_tls.insert(
+    "https://api.example".to_string(),
+    HostTlsCfg {
+      client_cert: Some("/certs/client.pem".into()),
+      client_key: Some("/certs/client.key".into()),
+      root_cert: Some("/certs/bundle.pem".into()),
+      guest_tls_mode: GuestTlsMode::Mtls,
+      guest_cert: Some("{home}/.certs/client.pem".into()),
+      guest_key: Some("{home}/.certs/client.key".into()),
+    },
+  );
+  let rule = RuleCfg {
+    env: "EXAMPLE_TOKEN".to_string(),
+    value: None,
+    real: None,
+    fnox_key: Some("EXAMPLE_FNOX_KEY".to_string()),
+    allow: vec![
+      "https://api.example".to_string(),
+      "postgres://db.example:5432/app?sslmode=verify-full&sslrootcert=/certs/bundle.pem".to_string(),
+    ],
+    pattern: Some("example_{hex:32}".to_string()),
+    oauth2: Some(OAuthFlow {
+      flow: FlowKind::ClientCredentials,
+      token_url: "https://auth.example/token".to_string(),
+      authorize_url: Some("https://auth.example/authorize".to_string()),
+      refresh_url: Some("https://auth.example/refresh".to_string()),
+      rotates_refresh: true,
+      token_fields: vec!["access_token".to_string()],
+    }),
+    registry: Some(true),
+    if_missing: IfMissing::Warn,
+    tls: rule_tls,
+  };
+  let samples = Samples {
+    rules: [("example", rule)].into_iter().collect(),
+    plugins: [(
+      "example",
+      PluginCfg {
+        path: "target/plugins/example.wasm".into(),
+        allow: vec!["https://api.example".to_string()],
+        direction: PluginDirection::Both,
+      },
+    )]
+    .into_iter()
+    .collect(),
+    tools: [(
+      "example",
+      ToolCfg {
+        config_dir: "{home}/.example".to_string(),
+      },
+    )]
+    .into_iter()
+    .collect(),
+    workspace: WorkspaceSamples {
+      file_rewrite: vec![FileRewrite {
+        source: "~/.example/settings".into(),
+        dest: "{home}/.example/settings".to_string(),
+        envs: vec!["EXAMPLE_TOKEN".to_string()],
+        format: Some(RewriteFormat::Kubeconfig),
+      }],
+    },
+  };
+  let mut out = String::from("\n# ── Map-valued tables: one sample entry each; copy and rename the key ──\n\n");
+  out.push_str("# `value` and `real` never serialize (secrets): `value` is the inline\n# real secret (or the database rule's FAKE postgres:// URL), `real` is the\n# database rule's REAL string, resolved from the secret source.\n\n");
+  out.push_str(&toml::to_string_pretty(&samples).expect("in-repo literals always serialize"));
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::ffi::OsStr;
   use std::io::Write as _;
-  use std::sync::{Mutex, MutexGuard};
+  use std::sync::{Mutex, MutexGuard, PoisonError};
 
   use clap::Parser as _;
 
   static ENV_LOCK: Mutex<()> = Mutex::new(());
 
   fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
   fn scrub_env() {
@@ -712,21 +967,27 @@ mod tests {
   }
 
   /// Test-only env write; callers hold `ENV_LOCK`.
-  fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+  fn set_env(key: &str, value: impl AsRef<OsStr>) {
     // SAFETY: test-only mutation, serialized by ENV_LOCK.
     unsafe { env::set_var(key, value) };
   }
 
   fn write_file(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
-      std::fs::create_dir_all(parent).unwrap();
+      fs::create_dir_all(parent).unwrap();
     }
-    let mut file = std::fs::File::create(path).unwrap();
+    let mut file = fs::File::create(path).unwrap();
     file.write_all(body.as_bytes()).unwrap();
   }
 
+  #[derive(clap::Parser)]
+  struct TestCli {
+    #[command(flatten)]
+    cli: Cli,
+  }
+
   fn cli_for(argv: &[&str]) -> Cli {
-    Cli::try_parse_from(argv).unwrap()
+    TestCli::try_parse_from(argv).unwrap().cli
   }
 
   /// Enter `dir` as the process cwd, restoring the previous one on drop.
@@ -787,10 +1048,10 @@ allow = ["https://c.example"]
     set_env("HODOR_CONFIG", &global);
     let nested = project_root.join("crates").join("inner");
     write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
-    std::fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&nested).unwrap();
     let _cwd = CwdGuard::enter(&nested);
-    let cli = cli_for(&["hodor", "serve"]);
-    let (config, _ws) = load(&cli).unwrap();
+    let cli = cli_for(&["hodor"]);
+    let (config, _ws) = load(&cli, None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:2222");
     assert_eq!(config.rules["a"].value.as_ref().unwrap().expose_secret(), "global-a");
     assert_eq!(config.rules["b"].value.as_ref().unwrap().expose_secret(), "project-b");
@@ -820,7 +1081,7 @@ allow = ["https://c.example"]
       discover_project_config(&nested),
       Some(project_root.join(".config").join("hodor").join("config.toml"))
     );
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:3333");
     assert_eq!(WorkspaceCfg::default().profile_name(), SHARED_PROFILE);
     scrub_env();
@@ -844,7 +1105,7 @@ allow = ["https://c.example"]
     write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
     set_env("HODOR_CONFIG", &global);
     let _cwd = CwdGuard::enter(&project_root);
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.tools["pi"].config_dir, "{home}/.pi-proj");
     assert_eq!(config.tools["gh"].config_dir, "{home}/.config/gh");
     assert_eq!(config.workspace.profile_name(), "work");
@@ -888,24 +1149,28 @@ allow = ["https://c.example"]
     set_env("HODOR_CONFIG", &global);
     let nested = project_root.join("crates").join("inner");
     write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
-    std::fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&nested).unwrap();
     let _cwd = CwdGuard::enter(&nested);
     // project beats global
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:2222");
     // env beats project
     set_env("HODOR_LISTEN", "127.0.0.1:3333");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:3333");
     // CLI beats env
-    let (config, _) = load(&cli_for(&["hodor", "serve", "--listen", "127.0.0.1:4444"])).unwrap();
+    let mut proxy = <ProxyCfg as Config>::Layer::empty();
+    proxy.listen = Some("127.0.0.1:4444".parse().unwrap());
+    let (config, _) = load(&cli_for(&["hodor"]), Some(&proxy)).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:4444");
     // the handshake budget defaults to 10 and layers like everything else
     assert_eq!(config.proxy.handshake_timeout_secs, 10);
     set_env("HODOR_HANDSHAKE_TIMEOUT_SECS", "3");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.handshake_timeout_secs, 3);
-    let (config, _) = load(&cli_for(&["hodor", "serve", "--handshake-timeout", "5"])).unwrap();
+    let mut proxy = <ProxyCfg as Config>::Layer::empty();
+    proxy.handshake_timeout_secs = Some(5);
+    let (config, _) = load(&cli_for(&["hodor"]), Some(&proxy)).unwrap();
     assert_eq!(config.proxy.handshake_timeout_secs, 5);
     scrub_env();
   }
@@ -921,10 +1186,10 @@ allow = ["https://c.example"]
     write_file(&override_file, "[proxy]\nlisten = \"127.0.0.1:5555\"\n");
     set_env("HODOR_CONFIG", &global);
     let markerless = dir.path().join("markerless");
-    std::fs::create_dir_all(&markerless).unwrap();
+    fs::create_dir_all(&markerless).unwrap();
     let _cwd = CwdGuard::enter(&markerless);
-    let cli = cli_for(&["hodor", "--config", override_file.to_str().unwrap(), "serve"]);
-    let (config, _) = load(&cli).unwrap();
+    let cli = cli_for(&["hodor", "--config", override_file.to_str().unwrap()]);
+    let (config, _) = load(&cli, None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:5555");
     scrub_env();
   }
@@ -934,14 +1199,14 @@ allow = ["https://c.example"]
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("ws");
     let nested = root.join("crates").join("inner");
-    std::fs::create_dir_all(&nested).unwrap();
-    std::fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
     write_file(&root.join("Cargo.toml"), "[workspace]\n");
     let project = root.join(".config").join("hodor.toml");
     write_file(&project, "[proxy]\n");
     assert_eq!(discover_project_config(&nested), Some(project));
     // same tree without the file: no project layer
-    std::fs::remove_file(root.join(".config").join("hodor.toml")).unwrap();
+    fs::remove_file(root.join(".config").join("hodor.toml")).unwrap();
     assert_eq!(discover_project_config(&nested), None);
   }
 
@@ -965,10 +1230,10 @@ env = "GITHUB_TOKEN"
 "#,
     );
     set_env("HODOR_CONFIG", &global);
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     let rule = &config.rules["gh"];
     assert!(rule.value.is_none());
-    assert!(rule.allow.is_empty());
+    assert_eq!(rule.allow, [] as [String; 0]);
     assert_eq!(rule.if_missing, IfMissing::Error);
     assert_eq!(rule.registry, None);
     assert!(rule.fnox_key.is_none());
@@ -995,7 +1260,7 @@ if_missing = "warn"
 "#,
     );
     set_env("HODOR_CONFIG", &global);
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     let rule = &config.rules["gh"];
     assert_eq!(rule.fnox_key.as_deref(), Some("GH_PAT"));
     assert_eq!(rule.registry, Some(false));
@@ -1040,7 +1305,7 @@ if_missing = "warn"
     let global = dir.path().join("global.toml");
     write_file(&global, "[rules.bad]\nenv = \"B\"\nvalue = \"v\"\nallow = [\"gopher://h\"]\n");
     set_env("HODOR_CONFIG", &global);
-    let err = load(&cli_for(&["hodor", "serve"])).unwrap_err();
+    let err = load(&cli_for(&["hodor"]), None).unwrap_err();
     assert!(err.to_string().contains("gopher://h"), "{err:?}");
     scrub_env();
   }
@@ -1074,7 +1339,7 @@ allow = ["https://b.example"]
 "#,
     );
     set_env("HODOR_CONFIG", &global);
-    let err = load(&cli_for(&["hodor", "serve"])).unwrap_err();
+    let err = load(&cli_for(&["hodor"]), None).unwrap_err();
     assert!(err.to_string().contains("share env name"), "{err:?}");
     scrub_env();
   }
@@ -1103,15 +1368,117 @@ allow = ["https://b.example"]
       ("[3000, 0]", "port 0"),
     ] {
       write_file(&global, format!("[workspace]\nports = {ports}\n").as_str());
-      let err = load(&cli_for(&["hodor", "serve"])).unwrap_err();
+      let err = load(&cli_for(&["hodor"]), None).unwrap_err();
       assert!(err.to_string().contains(expected), "ports {ports}: {err:?}");
     }
     write_file(&global, "[workspace]\nports = [3000, 8080, 5432]\n");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.workspace.ports, vec![3000, 8080, 5432]);
     write_file(&global, "[proxy]\n");
-    let (config, _) = load(&cli_for(&["hodor", "serve"])).unwrap();
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert!(config.workspace.ports.is_empty(), "absent ports stay empty");
     scrub_env();
+  }
+
+  /// `$VAR`, `${VAR}` and `${VAR:-default}` all collect from every setting
+  /// that interpolates, plus the extras; `$` alone and non-names do not.
+  #[test]
+  fn referenced_variables_collect_dollar_references_and_skip_noise() {
+    let workspace = WorkspaceCfg {
+      include: vec![PathBuf::from("$HOME/.cargo/${TOOL_BIN:-tool}/x")],
+      file_rewrite: vec![FileRewrite {
+        source: PathBuf::from("${UNBRACED}.npmrc"),
+        dest: "{home}/.npmrc".to_string(),
+        envs: vec!["NPM_TOKEN".to_string()],
+        format: None,
+      }],
+      ..WorkspaceCfg::default()
+    };
+    let names = workspace.referenced_variables(&["$HOME"]);
+    assert!(names.contains("HOME"));
+    assert!(names.contains("TOOL_BIN"));
+    assert!(names.contains("UNBRACED"));
+    assert!(names.contains("NPM_TOKEN"));
+    assert!(!names.contains("1"));
+    assert!(!names.contains(""));
+  }
+
+  /// Braced references collect the name before `:-`, and a missing closing
+  /// brace collects nothing.
+  #[test]
+  fn referenced_variables_collect_inside_composed_values() {
+    let workspace = WorkspaceCfg {
+      include: vec![PathBuf::from("https://${REGISTRY_HOST}/v2/${MISSING")],
+      ..WorkspaceCfg::default()
+    };
+    assert_eq!(workspace.referenced_variables(&[]), BTreeSet::from(["REGISTRY_HOST".to_string()]));
+  }
+
+  /// `hodor config` prints this: every setting, its default, and the doc
+  /// comment explaining it, so undiscovered settings surface here first.
+  #[test]
+  fn config_template_lists_every_setting_with_its_default() {
+    let template = confique::toml::template::<AppConfig>(confique::toml::FormatOptions::default());
+    // Defaults render even though no config file names them.
+    assert!(template.contains("handshake_timeout_secs = 10"), "{template}");
+    assert!(template.contains("listen = \"127.0.0.1:8080\""), "{template}");
+    // Every configurable table appears, including the maps.
+    for section in ["[proxy]", "[workspace]", "#rules", "#plugins", "#tools", "#file_rewrite"] {
+      assert!(template.contains(section), "missing `{section}` in:\n{template}");
+    }
+    // Doc comments travel with the settings they explain.
+    assert!(template.contains("Default value"), "{template}");
+    // Derived from the schema, never from values, and every line is
+    // commented out: the template is a reference, never live config.
+    assert!(!template.contains("\nvalue ="), "{template}");
+  }
+
+  /// Every field the sample literals name must survive serialization into
+  /// the reference. The literals in [`reference_samples`] are exhaustive
+  /// over their structs, so a new field fails to compile until sampled
+  /// there; this test then fails if a skip attribute hides it anyway.
+  #[test]
+  fn reference_samples_name_every_setting() {
+    let samples = reference_samples();
+    for name in [
+      "[rules.example]",
+      "env",
+      "fnox_key",
+      "allow",
+      "pattern",
+      "oauth2",
+      "flow",
+      "token_url",
+      "authorize_url",
+      "refresh_url",
+      "rotates_refresh",
+      "token_fields",
+      "registry",
+      "if_missing",
+      "[rules.example.tls.\"https://api.example\"]",
+      "client_cert",
+      "client_key",
+      "root_cert",
+      "guest_tls_mode",
+      "guest_cert",
+      "guest_key",
+      "[plugins.example]",
+      "path",
+      "direction",
+      "[tools.example]",
+      "config_dir",
+      "[[workspace.file_rewrite]]",
+      "source",
+      "dest",
+      "envs",
+      "format",
+    ] {
+      assert!(samples.contains(name), "samples miss `{name}`:\n{samples}");
+    }
+    // The two secret fields never serialize; the sample explains them in
+    // its own comment instead.
+    assert!(samples.contains("`value` and `real` never serialize"), "{samples}");
+    assert!(!samples.contains("\nvalue ="), "{samples}");
+    assert!(!samples.contains("\nreal ="), "{samples}");
   }
 }

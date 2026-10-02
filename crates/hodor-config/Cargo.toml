@@ -13,13 +13,13 @@ clap = { version = "4", features = ["derive", "env"] }
 code-workspace = "0.1.4"
 confique = { version = "0.4", features = ["toml"] }
 dirs = "6"
-eyre = "0.6"
 hex = "0.4"
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-toml = "0.8"
+thiserror = "2"
+toml.workspace = true
 tracing = "0.1"
 url = "2"
 validator = { version = "0.20", features = ["derive"] }

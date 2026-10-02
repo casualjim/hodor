@@ -27,8 +27,9 @@ use std::time::Duration;
 use hodor_config::config::ProxyCfg;
 use hodor_config::grants::{Credential, EndpointScope, Grant, ResolvedConfig, Scheme};
 use hodor_proxy::ProxyState;
+use tokio::task::JoinHandle;
 
-use crate::{Options, SelfExclusion, run_ebpf_with};
+use crate::{Error, Options, SelfExclusion, run_ebpf_with};
 
 /// Serializes the live tests: each one creates a host-wide cgroup.
 static LIVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -140,7 +141,7 @@ async fn start_capture(
   cgroup: &TestCgroup,
   state: Arc<ProxyState>,
   upstream_override: Option<SocketAddr>,
-) -> tokio::task::JoinHandle<eyre::Result<()>> {
+) -> JoinHandle<Result<(), Error>> {
   let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
   let capture = tokio::spawn(run_ebpf_with(
     Options {

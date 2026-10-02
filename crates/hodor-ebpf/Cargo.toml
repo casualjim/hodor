@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 aya = "0.14"
 dashmap = "6"
-eyre = "0.6"
+thiserror = "2"
 hodor-config = { path = "../hodor-config" }
 hodor-proxy = { path = "../hodor-proxy" }
 libc = "0.2"

@@ -14,6 +14,7 @@ use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
+use crate::Error;
 use crate::flow::{FlowTables, PROTO_UDP};
 
 /// Drop a flow after this long with no traffic in either direction.
@@ -35,7 +36,7 @@ pub(crate) struct Flow {
 pub(crate) type FlowTable = DashMap<SocketAddr, Arc<Mutex<Flow>>>;
 
 /// Relay captured datagrams for `port` until the listener fails.
-pub(crate) async fn serve(port: u16, flows: FlowTables, upstream_override: Option<SocketAddr>) -> eyre::Result<()> {
+pub(crate) async fn serve(port: u16, flows: FlowTables, upstream_override: Option<SocketAddr>) -> Result<(), Error> {
   let listener = Arc::new(UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?);
   // `DashMap` because the janitor sweeps concurrently with the receive loop;
   // entries are short-lived and few (one per client).
@@ -65,7 +66,7 @@ async fn one(
   listener: &UdpSocket,
   table: &FlowTable,
   upstream_override: Option<SocketAddr>,
-) -> eyre::Result<()> {
+) -> Result<(), Error> {
   let flow = if let Some(existing) = table.get(&client) {
     Arc::clone(existing.value())
   } else {

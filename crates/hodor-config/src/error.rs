@@ -1,0 +1,369 @@
+//! Crate error type: every fallible API returns `Result<T, Error>`.
+
+use std::io::Error as IoError;
+use std::path::PathBuf;
+
+use confique::Error as ConfiqueError;
+use serde_json::Error as JsonError;
+use toml::de::Error as TomlError;
+use url::ParseError as UrlError;
+
+/// Every way config loading, validation, and grant resolution can fail.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+  /// The working directory is unreadable.
+  #[error(transparent)]
+  CurrentDir(#[from] IoError),
+  /// A config layer fails to load through confique.
+  #[error(transparent)]
+  LoadConfig(#[from] ConfiqueError),
+  /// A file cannot be read.
+  #[error("read {}: {source}", path.display())]
+  ReadFile {
+    /// File that could not be read.
+    path: PathBuf,
+    /// Underlying I/O failure.
+    #[source]
+    source: IoError,
+  },
+  /// A file does not parse as TOML.
+  #[error("parse {}: {source}", path.display())]
+  ParseFile {
+    /// File that did not parse.
+    path: PathBuf,
+    /// Underlying parse failure.
+    #[source]
+    source: Box<TomlError>,
+  },
+  /// A rules file carries `rules` as something other than a table.
+  #[error("{}: `rules` must be a table", path.display())]
+  RulesNotTable {
+    /// File carrying the bad `rules` value.
+    path: PathBuf,
+  },
+  /// One rule entry does not deserialize.
+  #[error("{}: rule `{label}`: {source}", path.display())]
+  BadRule {
+    /// File carrying the bad rule.
+    path: PathBuf,
+    /// Rule label.
+    label: String,
+    /// Underlying parse failure.
+    #[source]
+    source: Box<TomlError>,
+  },
+  /// Two rules share one env name.
+  #[error("rules `{previous}` and `{label}` share env name `{env}`")]
+  DuplicateEnv {
+    /// First label claiming the name.
+    previous: String,
+    /// Second label claiming the name.
+    label: String,
+    /// Shared env name.
+    env: String,
+  },
+  /// A rule names an empty env var.
+  #[error("rule `{label}`: `env` must not be empty")]
+  EmptyEnv {
+    /// Rule label.
+    label: String,
+  },
+  /// A rule states an empty inline value.
+  #[error("rule `{label}`: `value` must not be empty")]
+  EmptyValue {
+    /// Rule label.
+    label: String,
+  },
+  /// An `allow` entry does not parse as a URI grant.
+  #[error("rule `{label}`: bad allow entry `{entry}`: {detail}")]
+  BadAllow {
+    /// Rule label.
+    label: String,
+    /// Offending entry.
+    entry: String,
+    /// Parse failure.
+    detail: String,
+  },
+  /// A fake `pattern` does not compile as a template.
+  #[error("rule `{label}`: bad pattern `{pattern}`: {detail}")]
+  BadPattern {
+    /// Rule label.
+    label: String,
+    /// Offending pattern.
+    pattern: String,
+    /// Validation failure.
+    detail: String,
+  },
+  /// Port 0 cannot be published.
+  #[error("[workspace] ports: port 0 cannot be published")]
+  PortZero,
+  /// A capture listener port cannot be published.
+  #[error("[workspace] port {port} is a capture listener port and cannot be published")]
+  CapturePort {
+    /// Offending port.
+    port: u16,
+  },
+  /// A database rule states `allow` entries; the connection string is the grant.
+  #[error("rule `{label}`: a database rule states no allow entries; the connection string is the grant")]
+  DatabaseAllow {
+    /// Rule label.
+    label: String,
+  },
+  /// A database connection string does not parse.
+  #[error("rule `{label}`: {detail}")]
+  DatabaseScope {
+    /// Rule label.
+    label: String,
+    /// Parse failure.
+    detail: String,
+  },
+  /// A `tls` entry names an env that is not the rule's own.
+  #[error("rule `{label}`: tls config names `{key}` but the rule's env is `{env}`")]
+  TlsEnvMismatch {
+    /// Rule label.
+    label: String,
+    /// Offending key.
+    key: String,
+    /// Rule env name.
+    env: String,
+  },
+  /// A postgres rule states its identity outside the libpq URL.
+  #[error("rule `{label}`: postgres states the upstream identity in its libpq URL (`sslcert`/`sslkey`), never in the rule table")]
+  PostgresIdentity {
+    /// Rule label.
+    label: String,
+  },
+  /// A `tls` entry carries only half of the client pair.
+  #[error("rule `{label}`: entry `{entry}`: client_cert and client_key come together")]
+  CertKeyPair {
+    /// Rule label.
+    label: String,
+    /// Offending entry.
+    entry: String,
+  },
+  /// A `tls` entry names an `allow` entry the rule does not grant.
+  #[error("rule `{label}`: tls config names entry `{key}` the rule does not allow")]
+  TlsUnknownEntry {
+    /// Rule label.
+    label: String,
+    /// Offending key.
+    key: String,
+  },
+  /// A plugin states no `allow` entries.
+  #[error("plugin `{name}`: `allow` must not be empty")]
+  PluginEmptyAllow {
+    /// Plugin name.
+    name: String,
+  },
+  /// A plugin `allow` entry does not parse as a URI grant.
+  #[error("plugin `{name}`: invalid allow entry `{entry}`: {detail}")]
+  PluginBadAllow {
+    /// Plugin name.
+    name: String,
+    /// Offending entry.
+    entry: String,
+    /// Parse failure.
+    detail: String,
+  },
+  /// An OIDC discovery document is not valid JSON.
+  #[error("parse discovery document: {source}")]
+  ParseDiscovery {
+    /// Underlying parse failure.
+    #[source]
+    source: JsonError,
+  },
+  /// An OIDC discovery document is not a JSON object.
+  #[error("discovery document is not a JSON object")]
+  DiscoveryNotAnObject,
+  /// An OIDC discovery document lacks `token_endpoint`.
+  #[error("discovery document: missing `token_endpoint`")]
+  DiscoveryMissingTokenEndpoint,
+  /// An OIDC discovery document lacks `grant_types_supported`.
+  #[error("discovery document: missing `grant_types_supported`")]
+  DiscoveryMissingGrantTypes,
+  /// An OIDC discovery document lists no supported grant type.
+  #[error("discovery document: no supported grant type (need `authorization_code` or `client_credentials`)")]
+  DiscoveryNoSupportedGrantType,
+  /// An `OpenAPI` document is not valid JSON.
+  #[error("parse openapi document: {source}")]
+  ParseOpenapi {
+    /// Underlying parse failure.
+    #[source]
+    source: JsonError,
+  },
+  /// An `OpenAPI` document has no `components.securitySchemes`.
+  #[error("openapi document: no `components.securitySchemes`")]
+  OpenapiNoSchemes,
+  /// One file claims one env name for two providers.
+  #[error("{}: providers `{previous}` and `{provider}` both claim `{env}`", file.display())]
+  ClaimConflict {
+    /// File carrying the conflict.
+    file: PathBuf,
+    /// First provider claiming the name.
+    previous: String,
+    /// Second provider claiming the name.
+    provider: String,
+    /// Claimed env name.
+    env: String,
+  },
+  /// A registry host entry does not parse.
+  #[error("{}: {kind} `{name}`: bad host `{host}`: {detail}", file.display())]
+  BadHost {
+    /// File carrying the bad host.
+    file: PathBuf,
+    /// Entry kind (`provider` or `name`).
+    kind: String,
+    /// Entry name.
+    name: String,
+    /// Offending host.
+    host: String,
+    /// Parse failure.
+    detail: String,
+  },
+  /// A registry decoy template does not compile.
+  #[error("{}: {kind} `{name}`: bad pattern `{pattern}`: {detail}", file.display())]
+  BadRegistryPattern {
+    /// File carrying the bad pattern.
+    file: PathBuf,
+    /// Entry kind (`provider` or `name`).
+    kind: String,
+    /// Entry name.
+    name: String,
+    /// Offending pattern.
+    pattern: String,
+    /// Validation failure.
+    detail: String,
+  },
+  /// A `contains` entry is empty.
+  #[error("{}: provider `{provider}`: `contains` entries must not be empty", file.display())]
+  EmptyContains {
+    /// File carrying the bad entry.
+    file: PathBuf,
+    /// Provider name.
+    provider: String,
+  },
+  /// A `contains` entry has no `pattern` to select.
+  #[error("{}: provider `{provider}`: `contains` needs a `pattern`", file.display())]
+  ContainsNeedsPattern {
+    /// File carrying the bad entry.
+    file: PathBuf,
+    /// Provider name.
+    provider: String,
+  },
+  /// An `oauth2` URL does not parse.
+  #[error("{origin}: `{name}`: bad oauth2 url `{url}`: {detail}")]
+  BadOAuthUrl {
+    /// Config origin.
+    origin: String,
+    /// Entry name.
+    name: String,
+    /// Offending URL.
+    url: String,
+    /// Parse failure.
+    detail: String,
+  },
+  /// An `authorization_code` flow lacks its `authorize_url`.
+  #[error("{origin}: `{name}`: `authorization_code` flow needs an `authorize_url`")]
+  FlowNeedsAuthorize {
+    /// Config origin.
+    origin: String,
+    /// Entry name.
+    name: String,
+  },
+  /// A `token_fields` entry is empty.
+  #[error("{origin}: `{name}`: `token_fields` entries must not be empty")]
+  EmptyTokenField {
+    /// Config origin.
+    origin: String,
+    /// Entry name.
+    name: String,
+  },
+  /// A `token_fields` entry repeats.
+  #[error("{origin}: `{name}`: duplicate `token_fields` entry `{field}`")]
+  DuplicateTokenField {
+    /// Config origin.
+    origin: String,
+    /// Entry name.
+    name: String,
+    /// Repeated field.
+    field: String,
+  },
+  /// An `oauth2` URL does not parse.
+  #[error("bad oauth2 url `{url}`: {source}")]
+  BadUrlParse {
+    /// Offending URL.
+    url: String,
+    /// Underlying parse failure.
+    #[source]
+    source: UrlError,
+  },
+  /// An `oauth2` URL carries no host.
+  #[error("bad oauth2 url `{url}`: empty host")]
+  BadUrlHost {
+    /// Offending URL.
+    url: String,
+  },
+  /// A file carries `tools` as something other than a table.
+  #[error("{}: `tools` must be a table", path.display())]
+  ToolsNotTable {
+    /// File carrying the bad `tools` value.
+    path: PathBuf,
+  },
+  /// A `[tools]` entry does not deserialize.
+  #[error("{}: tool `{name}`: {source}", path.display())]
+  BadTool {
+    /// File carrying the bad tool.
+    path: PathBuf,
+    /// Tool name.
+    name: String,
+    /// Underlying parse failure.
+    #[source]
+    source: Box<TomlError>,
+  },
+  /// A profile cookie's parent is not a string.
+  #[error("{}: `[profile] parent` must be a string", path.display())]
+  ProfileParentNotString {
+    /// Cookie carrying the bad parent.
+    path: PathBuf,
+  },
+  /// The shared base profile names a parent.
+  #[error("{}: the shared base profile takes no parent", path.display())]
+  SharedProfileParent {
+    /// Cookie carrying the parent.
+    path: PathBuf,
+  },
+  /// A profile parent is not a plain directory name.
+  #[error("{}: parent `{parent}` is not a plain directory name", path.display())]
+  BadProfileParent {
+    /// Cookie carrying the bad parent.
+    path: PathBuf,
+    /// Offending parent.
+    parent: String,
+  },
+  /// A selected profile is not a plain directory name.
+  #[error("profile `{name}` is not a plain directory name")]
+  BadProfileName {
+    /// Offending profile.
+    name: String,
+  },
+  /// Profile inheritance cycles.
+  #[error("profile inheritance cycle through `{parent}`")]
+  ProfileCycle {
+    /// Offending parent.
+    parent: String,
+  },
+  /// A profile parent no layer holds.
+  #[error("profile `{name}` inherits `{parent}`, which no layer holds")]
+  ProfileParentMissing {
+    /// Child profile.
+    name: String,
+    /// Missing parent.
+    parent: String,
+  },
+  /// A postgres rule states its upstream trust outside the libpq URL.
+  #[error("rule `{label}`: postgres states upstream trust in its libpq URL (`sslrootcert`), never in the rule table")]
+  PostgresTrust {
+    /// Rule label.
+    label: String,
+  },
+}

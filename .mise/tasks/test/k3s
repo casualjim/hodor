@@ -38,6 +38,11 @@ printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/hodor/config.toml"
 k3d cluster delete "$cluster" >/dev/null 2>&1 || true
 k3d cluster create "$cluster" --wait --kubeconfig-update-default=false --kubeconfig-switch-context=false
 
+# k3d --wait covers node container readiness, not a serving apiserver; slow
+# runners hit EOF on the first request. kubectl wait polls until nodes are
+# Ready, which implies the apiserver answers.
+kubectl wait --for=condition=ready node --all --timeout=180s >/dev/null
+
 # k3d writes the server as 0.0.0.0, which is not a usable TLS identity or dial
 # address everywhere a grant travels; loopback is the same listener.
 k3d kubeconfig get "$cluster" | sed 's|https://0.0.0.0:|https://127.0.0.1:|' >"$scratch/cert-kubeconfig"

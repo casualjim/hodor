@@ -193,8 +193,9 @@ pub struct FileRewrite {
   #[serde(default)]
   pub envs: Vec<String>,
   /// Declared format, skipping detection. Known formats: `kubeconfig`
-  /// (kubectl), `talos` (talosctl), `ssh` (ssh config; never sniffed).
-  /// Unknown files keep the raw byte-swap when this is absent.
+  /// (kubectl), `talos` (talosctl). The git, jj, and ssh configs are not
+  /// declared: hodor reads them as ambient sources from their default
+  /// locations. Unknown files keep the raw byte-swap when this is absent.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub format: Option<RewriteFormat>,
 }
@@ -207,9 +208,6 @@ pub enum RewriteFormat {
   Kubeconfig,
   /// Talos client config: structural grant derivation plus decoy twin.
   Talos,
-  /// SSH config: per-host identity grants plus decoy key and `known_hosts`.
-  /// Never sniffed; ssh configs carry no unambiguous markers.
-  Ssh,
 }
 
 impl fmt::Display for RewriteFormat {
@@ -217,7 +215,6 @@ impl fmt::Display for RewriteFormat {
     f.write_str(match self {
       Self::Kubeconfig => "kubeconfig",
       Self::Talos => "talos",
-      Self::Ssh => "ssh",
     })
   }
 }

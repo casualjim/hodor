@@ -141,12 +141,11 @@ pub(crate) fn decode(file: &Path, format: RewriteFormat, data: Option<&str>, fie
 ///
 /// # Errors
 ///
-/// Returns [`Error::RewriteInvalid`] when the path or name sluggifies to
+/// Returns [`Error::SourceInvalid`] when the path or name sluggifies to
 /// nothing.
-pub(crate) fn rewrite_label(source: &Path, format: RewriteFormat, name: &str) -> Result<String, Error> {
-  let invalid = |detail: String| Error::RewriteInvalid {
+pub(crate) fn rewrite_label(source: &Path, name: &str) -> Result<String, Error> {
+  let invalid = |detail: String| Error::SourceInvalid {
     file: source.to_path_buf(),
-    format,
     detail,
   };
   let parent = source.parent().ok_or_else(|| invalid("has no parent directory".to_string()))?;
@@ -199,7 +198,10 @@ pub(crate) fn write_state(state_dir: &Path, adapted: &[RewriteAdapted]) -> Resul
     }
   }
   write_secret(&marker, toml.as_bytes())?;
-  let stale = |name: &str| (name.starts_with("kube-") || name.starts_with("talos-") || name.starts_with("ssh-")) && !current.contains(name);
+  let stale = |name: &str| {
+    (name.starts_with("kube-") || name.starts_with("talos-") || name.starts_with("ssh-") || name.starts_with("git-"))
+      && !current.contains(name)
+  };
   for entry in fs::read_dir(&rules_dir).map_err(|source| Error::ReadFile {
     path: rules_dir.clone(),
     source,

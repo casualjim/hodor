@@ -8,6 +8,8 @@ mod adapt;
 mod confine;
 mod error;
 mod expand;
+mod git;
+mod jj;
 mod kube;
 mod paths;
 mod ssh;
@@ -1337,6 +1339,187 @@ users:
     .unwrap_err()
     .to_string();
     assert!(error.contains("drop `envs`"), "{error}");
+  }
+
+  /// The automatic pass maps the default-path sources onto decoy twins at
+  /// their default container paths and mints grants, with no declaration.
+  #[test]
+  fn derive_sources_maps_default_paths_to_twins_and_grants() {
+    use hodor_config::registry::Registry;
+    use hodor_pki::ssh::SshKey;
+    use std::collections::HashMap;
+    use std::env;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    let host = tempdir().unwrap();
+    let gitconfig = host.path().join(".gitconfig");
+    fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
+    let key = SshKey::generate().unwrap().to_openssh().unwrap();
+    fs::create_dir_all(host.path().join(".ssh")).unwrap();
+    fs::write(host.path().join(".ssh").join("forge"), key).unwrap();
+    fs::write(
+      host.path().join(".ssh").join("config"),
+      "Host git.internal\n\tIdentityFile ~/.ssh/forge\n",
+    )
+    .unwrap();
+    let work = tempdir().unwrap();
+    let git = work.path().join(".git");
+    fs::create_dir_all(git.join("objects")).unwrap();
+    fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(
+      git.join("config"),
+      "[remote \"origin\"]\n\turl = https://github.com/casualjim/hodor.git\n[remote \"internal\"]\n\turl = git@git.internal:org/repo.git\n",
+    )
+    .unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let saved: Vec<(&str, Option<OsString>)> = [
+      "KUBECONFIG",
+      "TALOSCONFIG",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_NOSYSTEM",
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "JJ_CONFIG",
+    ]
+    .map(|name| (name, env::var_os(name)))
+    .to_vec();
+    unset_env("KUBECONFIG");
+    unset_env("TALOSCONFIG");
+    unset_env("JJ_CONFIG");
+    set_env("GIT_CONFIG_GLOBAL", &gitconfig);
+    set_env("GIT_CONFIG_NOSYSTEM", "1");
+    set_env("HOME", host.path());
+    set_env("XDG_CONFIG_HOME", empty_xdg.path());
+    let files = work.path().join("files");
+    let decoys = vec![Decoy {
+      env: "GITHUB_TOKEN".to_string(),
+      value: "ghp_decoy_decoy_decoy_decoy_decoy".to_string(),
+    }];
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &files,
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &decoys,
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    for (name, value) in saved {
+      match value {
+        Some(value) => set_env(name, value),
+        None => unset_env(name),
+      }
+    }
+    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
+    for expected in [
+      "/home/eng/.gitconfig",
+      "/home/eng/.ssh/config",
+      "/home/eng/.ssh/forge",
+      "/home/eng/.ssh/known_hosts",
+    ] {
+      assert!(containers.contains(&expected.to_string()), "{expected} missing from {containers:?}");
+    }
+    assert!(
+      !containers.iter().any(|path| path.ends_with(".config/jj/config.toml")),
+      "no jj chain, no jj twin"
+    );
+    let gitconfig_mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.gitconfig"))
+      .unwrap();
+    let twin = fs::read_to_string(&gitconfig_mount.host).unwrap();
+    assert!(twin.contains("extraHeader"), "{twin}");
+    assert!(twin.contains("casualjim"), "{twin}");
+    assert!(
+      outputs.grants.iter().any(|grant| grant.fragment.contains("ssh://git.internal")),
+      "the ssh config source minted the identity grant: {:?}",
+      outputs.grants.iter().map(|grant| grant.fragment.clone()).collect::<Vec<_>>()
+    );
+  }
+
+  /// Broken ambient sources warn and skip; the healthy ones still map.
+  #[test]
+  fn broken_ambient_sources_skip_without_failing() {
+    use hodor_config::registry::Registry;
+    use std::collections::HashMap;
+    use std::env;
+
+    let host = tempdir().unwrap();
+    let gitconfig = host.path().join(".gitconfig");
+    fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
+    fs::create_dir_all(host.path().join(".ssh")).unwrap();
+    fs::write(host.path().join(".ssh").join("config"), "Include work-stuff\nMatch final all\n").unwrap();
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(host.path().join(".kube").join("config"), "not: [valid: yaml\n").unwrap();
+    let work = tempdir().unwrap();
+    let git = work.path().join(".git");
+    fs::create_dir_all(git.join("objects")).unwrap();
+    fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(
+      git.join("config"),
+      "[remote \"origin\"]\n\turl = https://github.com/casualjim/hodor.git\n",
+    )
+    .unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let saved: Vec<(&str, Option<OsString>)> = [
+      "KUBECONFIG",
+      "TALOSCONFIG",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_NOSYSTEM",
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "JJ_CONFIG",
+    ]
+    .map(|name| (name, env::var_os(name)))
+    .to_vec();
+    unset_env("KUBECONFIG");
+    unset_env("TALOSCONFIG");
+    unset_env("JJ_CONFIG");
+    set_env("GIT_CONFIG_GLOBAL", &gitconfig);
+    set_env("GIT_CONFIG_NOSYSTEM", "1");
+    set_env("HOME", host.path());
+    set_env("XDG_CONFIG_HOME", empty_xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[Decoy {
+        env: "GITHUB_TOKEN".to_string(),
+        value: "ghp_decoy_decoy_decoy_decoy_decoy".to_string(),
+      }],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    for (name, value) in saved {
+      match value {
+        Some(value) => set_env(name, value),
+        None => unset_env(name),
+      }
+    }
+    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
+    assert!(
+      containers.contains(&"/home/eng/.gitconfig".to_string()),
+      "the healthy source still maps: {containers:?}"
+    );
+    assert!(
+      !containers.contains(&"/home/eng/.ssh/config".to_string()),
+      "the Include-only ssh config derives nothing: {containers:?}"
+    );
+    assert!(
+      !containers.contains(&"/home/eng/.kube/config".to_string()),
+      "the broken kubeconfig derives nothing: {containers:?}"
+    );
   }
 
   /// Home prefixes move to the container home; URLs, relative paths, and

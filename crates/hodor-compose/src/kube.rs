@@ -279,7 +279,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     cluster.cluster.ca_data.as_deref(),
     "certificate-authority-data",
   )?;
-  let label = rewrite_label(source, RewriteFormat::Kubeconfig, &doc.current_context)?;
+  let label = rewrite_label(source, &doc.current_context)?;
   let env = label.to_uppercase().replace('-', "_");
   // Identity-only grants (cert auth, no bearer) still need a value to
   // resolve; the certificate never reaches the wire as application data, so
@@ -534,7 +534,7 @@ users:
 
   #[test]
   fn label_slugs_the_source_path_and_context() {
-    let label = rewrite_label(Path::new(SOURCE), RewriteFormat::Kubeconfig, "k3s-local").expect("path slugs");
+    let label = rewrite_label(Path::new(SOURCE), "k3s-local").expect("path slugs");
     assert_eq!(label, "home-ivan-kube-k3s-k3s-local");
     let adapted = adapt_doc(BEARER_DOC);
     assert!(

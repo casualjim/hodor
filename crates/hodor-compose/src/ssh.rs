@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use hodor_config::config::{HostSshCfg, IfMissing, RewriteFormat};
+use hodor_config::config::{HostSshCfg, IfMissing};
 use hodor_pki::ssh::SshKey;
 
 use crate::adapt::{DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
@@ -29,10 +29,10 @@ struct HostBlock {
   port: Option<u16>,
   /// `IdentityFile`, when stated.
   identity: Option<String>,
-  /// `ProxyJump` was stated.
-  proxy_jump: bool,
-  /// `IdentityAgent` was stated.
-  identity_agent: bool,
+  /// Why this block cannot be derived, when it cannot. Real-world ssh
+  /// configs carry `Include`, `Match`, and second identities; the adapter
+  /// warns and skips the block instead of failing the source.
+  skip: Option<String>,
 }
 
 impl HostBlock {
@@ -51,42 +51,43 @@ impl HostBlock {
 /// (the config verbatim) and every decoy file; each entry carries its own
 /// fragment and key blobs.
 ///
+/// Real-world ssh configs are often not fully valid: a block an
+/// `Include`/`Match` directive, a second `IdentityFile`, `ProxyJump`,
+/// `IdentityAgent`, or an unreadable identity makes underivable is skipped
+/// with a warning, and the mappable blocks still derive. Only key minting
+/// failures are errors.
+///
 /// # Errors
 ///
-/// Returns [`Error::RewriteInvalid`] naming the config and the offending
-/// block when a mapped block cannot derive fail-closed: an unreadable
-/// identity, no pinned host key, `Include`/`Match` directives, a second
-/// `IdentityFile`, `ProxyJump`, or `IdentityAgent`.
+/// Returns an error when a decoy key cannot be minted.
 pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path) -> Result<Vec<RewriteAdapted>, Error> {
-  let invalid = |detail: String| Error::RewriteInvalid {
-    file: source.to_path_buf(),
-    format: RewriteFormat::Ssh,
-    detail,
-  };
-  let blocks = parse(source, content)?;
+  let blocks = parse(content);
   let mut adapted: Vec<RewriteAdapted> = Vec::new();
   for block in &blocks {
     if !block.mappable() {
       continue;
     }
     let host = block.hostname.clone().unwrap_or_else(|| block.patterns[0].clone());
+    if let Some(reason) = &block.skip {
+      tracing::warn!(config = %source.display(), host = %host, reason, "ssh block skipped: it cannot be derived");
+      continue;
+    }
     let port = block.port.unwrap_or(22);
     let identity = block.identity.as_ref().expect("mappable checked an identity");
-    if block.proxy_jump {
-      return Err(invalid(format!("host `{host}`: ProxyJump cannot be derived")));
-    }
-    if block.identity_agent {
-      return Err(invalid(format!("host `{host}`: IdentityAgent cannot be derived")));
-    }
-    let label = rewrite_label(source, RewriteFormat::Ssh, &host)?;
+    let label = rewrite_label(source, &host)?;
     let entry = if port == 22 {
       format!("ssh://{host}")
     } else {
       format!("ssh://{host}:{port}")
     };
     let real_path = host_identity_path(identity, host_home);
-    let real = fs::read_to_string(&real_path)
-      .map_err(|source| invalid(format!("host `{host}`: identity `{}` is unreadable: {source}", real_path.display())))?;
+    let real = match fs::read_to_string(&real_path) {
+      Ok(real) => real,
+      Err(err) => {
+        tracing::warn!(config = %source.display(), host = %host, identity = %real_path.display(), %err, "ssh block skipped: the identity is unreadable");
+        continue;
+      }
+    };
     let decoy = SshKey::generate()?;
     let decoy_line = decoy.public_line()?;
     let fragment = render_fragment(
@@ -109,14 +110,16 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
       },
     );
     let decoy_key = decoy.to_openssh()?;
+    let container = if let Ok(container) = mirror_container_path(identity, host_home, home) {
+      container
+    } else {
+      tracing::warn!(config = %source.display(), host = %host, identity = %identity, "ssh block skipped: the identity does not mirror under the container home");
+      continue;
+    };
     let decoy_files = vec![DecoyFile {
       name: format!("ssh-{label}.decoy-key"),
       bytes: decoy_key.into_bytes(),
-      container: mirror_container_path(identity, host_home, home).map_err(|()| {
-        invalid(format!(
-          "host `{host}`: identity `{identity}` does not mirror under the container home"
-        ))
-      })?,
+      container,
     }];
     let entry = RewriteAdapted {
       fragment,
@@ -143,55 +146,51 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
   Ok(adapted)
 }
 
-/// Parse the config into blocks, rejecting what cannot be derived.
-fn parse(source: &Path, content: &[u8]) -> Result<Vec<HostBlock>, Error> {
-  let invalid = |detail: String| Error::RewriteInvalid {
-    file: source.to_path_buf(),
-    format: RewriteFormat::Ssh,
-    detail,
-  };
+/// Parse the config into blocks, marking what cannot be derived. Nothing
+/// fails: an underivable line marks its block with the reason, and the
+/// caller warns and skips that block.
+fn parse(content: &[u8]) -> Vec<HostBlock> {
   let mut blocks: Vec<HostBlock> = vec![HostBlock::default()];
   for line in String::from_utf8_lossy(content).lines() {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
       continue;
     }
-    let (keyword, value) = line
-      .split_once(char::is_whitespace)
-      .or_else(|| line.split_once('='))
-      .ok_or_else(|| invalid(format!("line `{line}` is not a directive")))?;
+    let Some((keyword, value)) = line.split_once(char::is_whitespace).or_else(|| line.split_once('=')) else {
+      blocks.last_mut().expect("blocks starts with one").skip = Some(format!("line `{line}` is not a directive"));
+      continue;
+    };
     let keyword = keyword.to_ascii_lowercase();
     let value = value.trim();
-    match keyword.as_str() {
-      "include" | "match" => return Err(invalid(format!("`{keyword}` cannot be derived"))),
-      "host" => blocks.push(HostBlock {
+    if keyword == "host" {
+      blocks.push(HostBlock {
         patterns: value.split_whitespace().map(str::to_string).collect(),
         ..HostBlock::default()
-      }),
-      "hostname" => blocks.last_mut().expect("blocks starts with one").hostname = Some(value.to_string()),
-      "port" => {
-        let port = value.parse().map_err(|_| invalid(format!("port `{value}` is not a number")))?;
-        blocks.last_mut().expect("blocks starts with one").port = Some(port);
+      });
+      continue;
+    }
+    let block = blocks.last_mut().expect("blocks starts with one");
+    match keyword.as_str() {
+      "include" | "match" => block.skip = Some(format!("`{keyword}` cannot be derived")),
+      "hostname" => block.hostname = Some(value.to_string()),
+      "port" => match value.parse() {
+        Ok(port) => block.port = Some(port),
+        Err(_) => block.skip = Some(format!("port `{value}` is not a number")),
+      },
+      "proxyjump" => block.skip = Some("ProxyJump cannot be derived".to_string()),
+      "identityagent" => block.skip = Some("IdentityAgent cannot be derived".to_string()),
+      "identityfile" if block.identity.replace(value.to_string()).is_some() => {
+        block.skip = Some(format!("identityfile `{value}`: a derived host states exactly one identity"));
       }
-      "identityfile" => {
-        let block = blocks.last_mut().expect("blocks starts with one");
-        if block.identity.replace(value.to_string()).is_some() {
-          return Err(invalid(format!(
-            "identityfile `{value}`: a mapped host states exactly one identity"
-          )));
-        }
-      }
-      "proxyjump" => blocks.last_mut().expect("blocks starts with one").proxy_jump = true,
-      "identityagent" => blocks.last_mut().expect("blocks starts with one").identity_agent = true,
       _ => {}
     }
   }
-  Ok(blocks)
+  blocks
 }
 
 /// Where the real identity lives on the host: `~` expands, relative paths
 /// resolve against `~/.ssh` the way ssh itself resolves them.
-fn host_identity_path(identity: &str, host_home: &Path) -> PathBuf {
+pub(crate) fn host_identity_path(identity: &str, host_home: &Path) -> PathBuf {
   if let Some(rest) = identity.strip_prefix("~/") {
     host_home.join(rest)
   } else if Path::new(identity).is_absolute() {
@@ -204,7 +203,7 @@ fn host_identity_path(identity: &str, host_home: &Path) -> PathBuf {
 /// The container path the decoy identity mounts at, mirroring the source
 /// layout under the container home. `~`-relative and home-relative paths
 /// mirror; anything else off the host home does not.
-fn mirror_container_path(identity: &str, host_home: &Path, home: &str) -> Result<String, ()> {
+pub(crate) fn mirror_container_path(identity: &str, host_home: &Path, home: &str) -> Result<String, ()> {
   if let Some(rest) = identity.strip_prefix("~/") {
     return Ok(format!("{home}/{rest}"));
   }
@@ -302,33 +301,27 @@ mod tests {
   }
 
   #[test]
-  fn an_unreadable_identity_fails_closed() {
+  fn an_unreadable_identity_skips_the_block_not_the_source() {
     let (dir, _) = host_home_with_key();
-    let config = "Host broken.example\n  IdentityFile ~/.ssh/vanished\n";
-    let err = adapt(Path::new("/home/ivan/.ssh/config"), config.as_bytes(), "/home/agent", dir.path())
-      .unwrap_err()
-      .to_string();
-    assert!(err.contains("is unreadable"), "{err}");
+    let config = "Host broken.example\n IdentityFile ~/.ssh/vanished\nHost git.example\n IdentityFile ~/.ssh/id_ed25519\n";
+    let adapted = adapt_in(&dir, config);
+    assert_eq!(adapted.len(), 1, "the readable block still derives: {adapted:?}");
+    assert!(adapted[0].fragment.contains("ssh://git.example"), "{}", adapted[0].fragment);
   }
 
   #[test]
-  fn a_second_identity_in_one_block_fails_closed() {
+  fn a_second_identity_skips_the_block() {
     let (dir, _) = host_home_with_key();
-    let config = "Host git.example\n  IdentityFile ~/.ssh/id_ed25519\n  IdentityFile ~/.ssh/other\n";
-    let err = adapt(Path::new("/home/ivan/.ssh/config"), config.as_bytes(), "/home/agent", dir.path())
-      .unwrap_err()
-      .to_string();
-    assert!(err.contains("exactly one identity"), "{err}");
+    let config = "Host git.example\n IdentityFile ~/.ssh/id_ed25519\n IdentityFile ~/.ssh/other\n";
+    let adapted = adapt_in(&dir, config);
+    assert!(adapted.is_empty(), "{adapted:?}");
   }
 
   #[test]
-  fn include_and_match_cannot_be_derived() {
+  fn include_and_match_skip_their_block_not_the_source() {
     let (dir, _) = host_home_with_key();
-    for keyword in ["Include other", "Match final"] {
-      let err = adapt(Path::new("/home/ivan/.ssh/config"), keyword.as_bytes(), "/home/agent", dir.path())
-        .unwrap_err()
-        .to_string();
-      assert!(err.contains("cannot be derived"), "{err}");
-    }
+    let config = "Include other\nMatch final\nHost git.example\n IdentityFile ~/.ssh/id_ed25519\n";
+    let adapted = adapt_in(&dir, config);
+    assert_eq!(adapted.len(), 1, "the mappable block survives the directives: {adapted:?}");
   }
 }

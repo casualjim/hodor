@@ -167,6 +167,14 @@ pub enum Error {
     /// What fails to map.
     detail: String,
   },
+  /// An ambient derivation source does not map onto grants or a decoy twin.
+  #[error("derived source `{}`: {detail}", file.display())]
+  SourceInvalid {
+    /// The source file the derivation read.
+    file: PathBuf,
+    /// What fails to map.
+    detail: String,
+  },
   /// A mise file does not parse.
   #[error("parse mise.local.toml: {source}")]
   MiseParse {

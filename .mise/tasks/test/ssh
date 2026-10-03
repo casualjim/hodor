@@ -2,6 +2,7 @@
 
 #MISE description="Run the docker compose e2e scenarios per capture backend (tproxy, tun)"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
+#MISE depends=["build:debug"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
@@ -29,11 +30,10 @@ fi
 # the same scenarios over eBPF instead.
 backends=${HODOR_TEST_BACKENDS:-"tproxy tun"}
 
-# build:release carries no test dependency — test:_default reaching this
-# task through `test` must not cycle back into the suite.
-mise run build:release
+# The debug binary comes from the `build:debug` dependency; compose mounts
+# it from here (the image is runtime-only, no build stage).
 mkdir -p integration/docker
-cp target/release/hodor integration/docker/hodor
+cp target/debug/hodor integration/docker/hodor
 
 compose="docker compose -f integration/compose.yaml --env-file integration/.env"
 client=hodor-integration-client-1

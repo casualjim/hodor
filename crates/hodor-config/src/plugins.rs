@@ -111,6 +111,8 @@ mod tests {
       proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },

@@ -10,6 +10,7 @@ mod error;
 mod expand;
 mod kube;
 mod paths;
+mod ssh;
 mod stack;
 mod talos;
 

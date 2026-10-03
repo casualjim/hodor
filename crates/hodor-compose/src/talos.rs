@@ -189,8 +189,10 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       env,
       registry: false,
       allow: allows.clone(),
-      value,
+      value: Some(value),
+      if_missing: None,
       tls: allows.iter().map(|allow| (allow.clone(), tls.clone())).collect(),
+      ssh: BTreeMap::new(),
     },
   );
   let decoy = render_decoy(&DecoyDoc {
@@ -210,6 +212,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     fragment,
     decoy,
     materialized,
+    decoy_files: Vec::new(),
   })
 }
 

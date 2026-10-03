@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the docker compose e2e scenarios per capture backend (tproxy, tun)"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
+
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+set -euo pipefail
+
+if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+  echo "skip: test:ssh needs a docker daemon"
+  exit 0
+fi
+
+# The demo values are throwaways; seed a local .env from the example so a
+# fresh checkout runs the scenarios without manual setup (gitignored).
+if [ ! -f integration/.env ] && [ -f integration/.env.example ]; then
+  cp integration/.env.example integration/.env
+  echo "seeded integration/.env from the example"
+fi
+if [ ! -f integration/.env ]; then
+  echo "skip: test:ssh needs integration/.env"
+  exit 0
+fi
+
+# eBPF is not here: it captures by cgroup membership and compose cannot pin
+# a service's cgroup path — `HODOR_BACKEND=ebpf mise run demo:bwrap` runs
+# the same scenarios over eBPF instead.
+backends=${HODOR_TEST_BACKENDS:-"tproxy tun"}
+
+# build:release carries no test dependency — test:_default reaching this
+# task through `test` must not cycle back into the suite.
+mise run build:release
+mkdir -p integration/docker
+cp target/release/hodor integration/docker/hodor
+
+compose="docker compose -f integration/compose.yaml --env-file integration/.env"
+client=hodor-integration-client-1
+
+for backend in $backends; do
+  echo "=== backend: $backend ==="
+  # A leftover stack holds an old CA while the rerun rotates the volume, and
+  # the first handshake fails on the mismatch; every round starts clean.
+  $compose down --remove-orphans -v --timeout 3
+  HODOR_BACKEND="$backend" $compose up -d --build
+
+  state=running
+  for _ in $(seq 1 120); do
+    state=$(docker inspect -f '{{.State.Status}}' "$client" 2>/dev/null || echo missing)
+    [ "$state" = exited ] && break
+    [ "$state" = missing ] && break
+    sleep 1
+  done
+  code=$(docker inspect -f '{{.State.ExitCode}}' "$client" 2>/dev/null || echo 1)
+  if [ "$state" != exited ]; then
+    code=124
+  fi
+  docker logs "$client" || true
+  $compose down --remove-orphans -v --timeout 3
+  if [ "$code" != 0 ]; then
+    echo "=== backend $backend FAILED (exit $code) ==="
+    exit "$code"
+  fi
+  echo "=== backend $backend passed ==="
+done

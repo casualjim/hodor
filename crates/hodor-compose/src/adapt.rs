@@ -3,6 +3,7 @@
 //! Kubeconfig and talosconfig are the same idea — a tool's config file is a
 //! rule stated in another shape — so they share everything except parsing.
 
+use hodor_config::config::{HostSshCfg, HostTlsCfg, IfMissing};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(unix)]
@@ -12,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hodor_config::config::{HostTlsCfg, RewriteFormat};
+use hodor_config::config::RewriteFormat;
 use serde::Serialize;
 
 use crate::error::Error;
@@ -32,6 +33,21 @@ pub(crate) struct RewriteAdapted {
   pub(crate) decoy: String,
   /// Blobs to write beside the fragment: `(file name, bytes)`.
   pub(crate) materialized: Vec<(String, Vec<u8>)>,
+  /// Extra agent-side decoy files beyond the document (ssh: the decoy
+  /// private key and the decoy `known_hosts`), mounted read-only at their
+  /// container paths. Written under the rewrite files dir by `name`.
+  pub(crate) decoy_files: Vec<DecoyFile>,
+}
+
+/// One agent-side decoy file an adapter mounts itself.
+#[derive(Debug)]
+pub(crate) struct DecoyFile {
+  /// File name under the rewrite files dir.
+  pub(crate) name: String,
+  /// File contents as written.
+  pub(crate) bytes: Vec<u8>,
+  /// Absolute container path the file mounts at, read-only.
+  pub(crate) container: String,
 }
 
 /// A derived rule, minus the label: what both adapters hand the TOML
@@ -45,10 +61,19 @@ pub(crate) struct GrantFragment {
   pub(crate) registry: bool,
   /// Allow entries the derived rule grants.
   pub(crate) allow: Vec<String>,
-  /// Real credential, held inline.
-  pub(crate) value: String,
+  /// Real credential, held inline. Absent for kinds whose secret is key
+  /// material in `ssh` rather than a wire value.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) value: Option<String>,
+  /// What the rule does without a fnox value. Absent keeps the default.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) if_missing: Option<IfMissing>,
   /// Per-entry TLS identity.
+  #[serde(skip_serializing_if = "BTreeMap::is_empty")]
   pub(crate) tls: BTreeMap<String, HostTlsCfg>,
+  /// Per-entry SSH key material.
+  #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+  pub(crate) ssh: BTreeMap<String, HostSshCfg>,
 }
 
 /// Serialize one grant fragment under `[rules.{label}]`, with the generation
@@ -174,6 +199,7 @@ pub(crate) fn write_state(state_dir: &Path, adapted: &[RewriteAdapted]) -> Resul
     }
   }
   write_secret(&marker, toml.as_bytes())?;
+  let stale = |name: &str| (name.starts_with("kube-") || name.starts_with("talos-") || name.starts_with("ssh-")) && !current.contains(name);
   for entry in fs::read_dir(&rules_dir).map_err(|source| Error::ReadFile {
     path: rules_dir.clone(),
     source,
@@ -184,7 +210,6 @@ pub(crate) fn write_state(state_dir: &Path, adapted: &[RewriteAdapted]) -> Resul
         source,
       })?
       .path();
-    let stale = |name: &str| (name.starts_with("kube-") || name.starts_with("talos-")) && !current.contains(name);
     if path.is_file() && path.file_name().is_some_and(|name| stale(&name.to_string_lossy())) {
       fs::remove_file(&path).map_err(|source| Error::RemoveFile {
         path: path.clone(),
@@ -234,6 +259,7 @@ mod tests {
       fragment: "[rules.x]\n".to_string(),
       decoy: String::new(),
       materialized: vec![("kube-a.crt".to_string(), b"a".to_vec())],
+      decoy_files: Vec::new(),
     };
     write_state(&state, &[adapted]).unwrap();
     let rules = state.join("rules.d");

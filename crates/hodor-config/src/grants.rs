@@ -227,6 +227,9 @@ pub enum Scheme {
   Tcp,
   /// Postgres wire protocol. TLS comes from the `sslmode` query.
   Postgres,
+  /// SSH. The proxy terminates the protocol on both legs; port defaults
+  /// to 22 the way ssh itself defaults it.
+  Ssh,
 }
 
 /// Postgres TLS negotiation, read from the entry's `sslmode` query.
@@ -312,6 +315,23 @@ pub struct EndpointScope {
   pub guest_tls: GuestTlsMode,
 }
 
+/// Allow entry for an SSH identity mapping: the guest leg admits only the
+/// decoy public key, the upstream leg presents the real private key, and
+/// upstream host keys follow OpenSSH `accept-new` into hodor's own
+/// `known_hosts` — never a per-host pin here. The rule's `ssh` table names
+/// the two key blobs; both are required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshScope {
+  /// Entry host pattern.
+  pub host: HostPat,
+  /// Entry port.
+  pub port: u16,
+  /// Real private key (openssh format) the upstream leg presents.
+  pub identity: PathBuf,
+  /// Decoy public key (`authorized_keys` format) the guest leg admits.
+  pub guest_key: PathBuf,
+}
+
 /// Upstream trust anchor an entry names with `sslrootcert`: a PEM path, or
 /// libpq's `system` spelling for the platform trust store.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -394,6 +414,7 @@ impl FromStr for EndpointScope {
       "http" => Scheme::Http,
       "https" => Scheme::Https,
       "tcp" => Scheme::Tcp,
+      "ssh" => Scheme::Ssh,
       "postgres" => {
         return Err(format!(
           "bad allow entry `{entry}`: database rules state no allow entries — the connection string is the grant"
@@ -430,6 +451,7 @@ impl FromStr for EndpointScope {
       (None, Scheme::Https) => 443,
       (None, Scheme::Tcp) => return Err("tcp grant requires an explicit port".to_string()),
       (None, Scheme::Postgres) => 5432,
+      (None, Scheme::Ssh) => 22,
     };
     reject_endpoint_query(entry, &url)?;
     Ok(EndpointScope {
@@ -543,14 +565,22 @@ pub enum Grant {
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<DatabaseScope>,
   },
+  /// One SSH identity mapping: the guest presents the decoy key, hodor
+  /// presents the real key upstream. No wire substitution, so no credential.
+  Ssh {
+    /// Parsed ssh entries, each carrying its key material paths.
+    allow: Vec<SshScope>,
+  },
 }
 
 impl Grant {
-  /// The secret this grant swaps.
+  /// The secret this grant swaps, when the kind swaps one on the wire. SSH
+  /// grants swap keys at the protocol layer instead, so they carry none.
   #[must_use]
-  pub fn credential(&self) -> &Credential {
+  pub fn credential(&self) -> Option<&Credential> {
     match self {
-      Grant::Token { credential, .. } | Grant::Database { credential, .. } => credential,
+      Grant::Token { credential, .. } | Grant::Database { credential, .. } => Some(credential),
+      Grant::Ssh { .. } => None,
     }
   }
 
@@ -560,6 +590,7 @@ impl Grant {
     match self {
       Grant::Token { allow, .. } => allow.iter().any(|entry| endpoint_match(entry, scheme, host, port)),
       Grant::Database { scope, .. } => database_match(scope, scheme, host, port),
+      Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
   }
 
@@ -586,6 +617,18 @@ impl Grant {
     };
     (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
   }
+
+  /// The ssh scope whose port and host cover a destination, `host` optional
+  /// as above: transparent capture knows the port before it knows the host.
+  #[must_use]
+  pub fn ssh(&self, host: Option<&str>, port: u16) -> Option<&SshScope> {
+    let Grant::Ssh { allow } = self else {
+      return None;
+    };
+    allow
+      .iter()
+      .find(|entry| entry.port == port && host.is_none_or(|host| entry.host.matches(host)))
+  }
 }
 
 fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) -> bool {
@@ -594,6 +637,10 @@ fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) 
 
 fn database_match(scope: &DatabaseScope, scheme: Scheme, host: &str, port: u16) -> bool {
   scheme == Scheme::Postgres && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+}
+
+fn ssh_match(entry: &SshScope, scheme: Scheme, host: &str, port: u16) -> bool {
+  scheme == Scheme::Ssh && entry.port == port && entry.host.matches(host)
 }
 
 fn host_port_match(pat: &HostPat, entry_port: u16, host: &str, port: u16) -> bool {
@@ -677,13 +724,10 @@ pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
       });
       continue;
     }
-    // Endpoint rule: `value` is the real secret, `allow` names the hosts.
-    let Some(value) = rule.value.clone() else {
-      // `secrets::resolve` fills this before `serve`; a caller that skips
-      // resolution gets no grant rather than a rule that swaps in nothing.
-      tracing::warn!(label, env = %rule.env, "rule has no resolved value; no grant");
-      continue;
-    };
+    // Endpoint rule: `allow` names the hosts; `value` is the real secret.
+    // SSH rules are the exception: their real secret is key material in the
+    // `ssh` table, so the entries parse first and the value comes after the
+    // kind is settled.
     let mut parsed = Vec::with_capacity(rule.allow.len());
     for entry in &rule.allow {
       let mut scope: EndpointScope = entry.parse().map_err(|err| Error::BadAllow {
@@ -692,8 +736,15 @@ pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
         detail: err,
       })?;
       // Identity comes from the entry; hodor's own TLS configuration comes
-      // from the rule's `tls` table, keyed by the entry itself.
+      // from the rule's `tls` table, keyed by the entry itself. SSH entries
+      // pin their trust instead, so a `tls` row on one is a config error.
       if let Some(tls) = rule.tls.get(entry) {
+        if scope.scheme == Scheme::Ssh {
+          return Err(Error::SshTls {
+            label: label.clone(),
+            entry: (*entry).clone(),
+          });
+        }
         if tls.client_cert.is_some() != tls.client_key.is_some() {
           return Err(Error::CertKeyPair {
             label: label.clone(),
@@ -719,6 +770,63 @@ pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
       tracing::warn!(label, env = %rule.env, "rule has no allow entries; no grant");
       continue;
     }
+    // An ssh table that cannot apply — the rule's entries are not ssh —
+    // would vanish silently; that is a misspecified rule, fail closed.
+    if !rule.ssh.is_empty() && parsed.first().is_none_or(|(_, scope)| scope.scheme != Scheme::Ssh) {
+      return Err(Error::SshMisplaced { label: label.clone() });
+    }
+    // SSH rule: every entry ssh, key material from the `ssh` table, and no
+    // credential to resolve — the swap happens at the protocol layer.
+    if parsed.first().is_some_and(|(_, scope)| scope.scheme == Scheme::Ssh) {
+      if parsed.iter().any(|(_, scope)| scope.scheme != Scheme::Ssh) {
+        return Err(Error::SshMixedSchemes { label: label.clone() });
+      }
+      if rule.value.is_some() {
+        return Err(Error::SshValue { label: label.clone() });
+      }
+      for key in rule.ssh.keys() {
+        if !rule.allow.iter().any(|entry| entry == key) {
+          return Err(Error::SshUnknownEntry {
+            label: label.clone(),
+            key: key.clone(),
+          });
+        }
+      }
+      let mut allow = Vec::with_capacity(parsed.len());
+      for (entry, scope) in parsed {
+        let Some(ssh) = rule.ssh.get(entry) else {
+          return Err(Error::SshIdentity {
+            label: label.clone(),
+            entry: entry.clone(),
+            detail: "no ssh config for this entry".to_string(),
+          });
+        };
+        let identity = ssh.identity.clone().ok_or_else(|| Error::SshIdentity {
+          label: label.clone(),
+          entry: entry.clone(),
+          detail: "identity is required".to_string(),
+        })?;
+        let guest_key = ssh.guest_key.clone().ok_or_else(|| Error::SshIdentity {
+          label: label.clone(),
+          entry: entry.clone(),
+          detail: "guest_key is required".to_string(),
+        })?;
+        allow.push(SshScope {
+          host: scope.host,
+          port: scope.port,
+          identity,
+          guest_key,
+        });
+      }
+      grants.push(Grant::Ssh { allow });
+      continue;
+    }
+    let Some(value) = rule.value.clone() else {
+      // `secrets::resolve` fills this before `serve`; a caller that skips
+      // resolution gets no grant rather than a rule that swaps in nothing.
+      tracing::warn!(label, env = %rule.env, "rule has no resolved value; no grant");
+      continue;
+    };
     let allow: Vec<EndpointScope> = parsed.into_iter().map(|(_, scope)| scope).collect();
     // A decoy is a key the proxy maps back to the real value; its shape is a
     // prop for the observer. Raw TCP grants need the decoy at the real
@@ -772,7 +880,7 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
-  use crate::config::{HostTlsCfg, IfMissing, ProxyCfg, RuleCfg, WorkspaceCfg};
+  use crate::config::{HostSshCfg, HostTlsCfg, IfMissing, ProxyCfg, RuleCfg, WorkspaceCfg};
 
   fn endpoint_grant(entries: &[&str]) -> Grant {
     Grant::Token {
@@ -807,6 +915,7 @@ mod tests {
         registry: None,
         oauth2: None,
         tls: BTreeMap::new(),
+        ssh: BTreeMap::new(),
         if_missing: crate::config::IfMissing::default(),
       },
     );
@@ -816,6 +925,8 @@ mod tests {
         ca_file: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
       },
       workspace: WorkspaceCfg::default(),
       rules,
@@ -857,6 +968,7 @@ mod tests {
         pattern: None,
         registry: None,
         oauth2: None,
+        ssh: BTreeMap::new(),
         tls,
         if_missing: crate::config::IfMissing::default(),
       },
@@ -865,6 +977,8 @@ mod tests {
       proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
@@ -888,6 +1002,7 @@ mod tests {
         pattern: None,
         oauth2: None,
         registry: Some(false),
+        ssh: BTreeMap::new(),
         tls: BTreeMap::new(),
         if_missing: IfMissing::Error,
       },
@@ -896,6 +1011,8 @@ mod tests {
       proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
@@ -911,7 +1028,8 @@ mod tests {
     let config = config_with_rule("db", "PGPASSWORD", "twenty-char-password", vec!["tcp://10.0.0.8:5432"]);
     let resolved = resolve(&config).unwrap();
     let grant = &resolved.grants[0];
-    assert_eq!(grant.credential().fake.len(), 20, "decoy length equals the real value length");
+    let credential = grant.credential().expect("an endpoint rule carries a credential");
+    assert_eq!(credential.fake.len(), 20, "decoy length equals the real value length");
   }
 
   #[test]
@@ -919,8 +1037,9 @@ mod tests {
     let config = config_with_rule("gh", "GITHUB_TOKEN", "ghp_real", vec!["https://api.github.com"]);
     let resolved = resolve(&config).unwrap();
     let grant = &resolved.grants[0];
-    assert_eq!(grant.credential().fake, crate::config::fake_for("GITHUB_TOKEN", None));
-    assert_eq!(grant.credential().fake.len(), 32, "default pattern renders 32 hex characters");
+    let credential = grant.credential().expect("an endpoint rule carries a credential");
+    assert_eq!(credential.fake, crate::config::fake_for("GITHUB_TOKEN", None));
+    assert_eq!(credential.fake.len(), 32, "default pattern renders 32 hex characters");
   }
 
   #[test]
@@ -1179,7 +1298,8 @@ mod tests {
     let cfg = cfg_with_rule(&["https://api.github.com"]);
     let resolved = resolve(&cfg).unwrap();
     assert!(matches!(resolved.grants[0], Grant::Token { .. }));
-    assert_eq!(resolved.grants[0].credential().label, "t");
+    let credential = resolved.grants[0].credential().expect("an endpoint rule carries a credential");
+    assert_eq!(credential.label, "t");
 
     let cfg = cfg_with_db(
       "postgres://app:fake@db.internal:5432/main",
@@ -1230,5 +1350,177 @@ mod tests {
     cfg.rules.get_mut("t").unwrap().real = None;
     let resolved = resolve(&cfg).unwrap();
     assert!(resolved.grants.is_empty());
+  }
+
+  /// One ssh rule: entries plus per-entry key material, no value.
+  fn cfg_with_ssh(entries: &[&str], ssh: BTreeMap<String, HostSshCfg>) -> AppConfig {
+    let mut rules = BTreeMap::new();
+    rules.insert(
+      "t".to_string(),
+      RuleCfg {
+        env: "T".into(),
+        value: None,
+        real: None,
+        fnox_key: None,
+        allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
+        pattern: None,
+        oauth2: None,
+        registry: None,
+        if_missing: IfMissing::Error,
+        tls: BTreeMap::new(),
+        ssh,
+      },
+    );
+    AppConfig {
+      proxy: ProxyCfg {
+        listen: "127.0.0.1:8080".parse().unwrap(),
+        ca_file: None,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
+        root_certs: Vec::new(),
+        handshake_timeout_secs: 10,
+      },
+      workspace: WorkspaceCfg::default(),
+      rules,
+      plugins: BTreeMap::new(),
+      tools: BTreeMap::new(),
+    }
+  }
+
+  /// Complete per-entry ssh config pointing at state-side blobs.
+  fn ssh_material(entry: &str) -> BTreeMap<String, HostSshCfg> {
+    BTreeMap::from([(
+      entry.to_string(),
+      HostSshCfg {
+        identity: Some(PathBuf::from("/hodor/grants/rules.d/t.identity")),
+        guest_key: Some(PathBuf::from("/hodor/grants/rules.d/t.guest_key")),
+      },
+    )])
+  }
+
+  #[test]
+  fn ssh_entry_defaults_to_port_22() {
+    let scope: EndpointScope = "ssh://git.example".parse().unwrap();
+    assert_eq!(scope.scheme, Scheme::Ssh);
+    assert_eq!(scope.port, 22);
+    assert!(matches!(&scope.host, HostPat::Exact(host) if host == "git.example"));
+
+    let scope: EndpointScope = "ssh://git.example:2222".parse().unwrap();
+    assert_eq!(scope.port, 2222);
+
+    let err = "ssh://user@git.example".parse::<EndpointScope>().unwrap_err();
+    assert!(err.contains("userinfo is postgres-only"), "{err}");
+    let err = "ssh://git.example?sslmode=require".parse::<EndpointScope>().unwrap_err();
+    assert!(err.contains("postgres-only"), "{err}");
+  }
+
+  #[test]
+  fn ssh_rule_resolves_with_its_key_material() {
+    let cfg = cfg_with_ssh(&["ssh://git.example"], ssh_material("ssh://git.example"));
+    let resolved = resolve(&cfg).unwrap();
+    let Some(Grant::Ssh { allow }) = resolved.grants.first() else {
+      panic!("an ssh rule resolves to an ssh grant");
+    };
+    let scope = &allow[0];
+    assert_eq!(scope.port, 22);
+    assert_eq!(scope.identity, PathBuf::from("/hodor/grants/rules.d/t.identity"));
+    assert_eq!(scope.guest_key, PathBuf::from("/hodor/grants/rules.d/t.guest_key"));
+    assert!(resolved.grants[0].matches(Scheme::Ssh, "git.example", 22));
+    assert!(!resolved.grants[0].matches(Scheme::Tcp, "git.example", 22));
+    assert!(!resolved.grants[0].matches(Scheme::Ssh, "git.example", 2222));
+    assert!(resolved.grants[0].credential().is_none());
+  }
+
+  #[test]
+  fn transparent_capture_finds_the_ssh_scope_before_the_host_is_known() {
+    let cfg = cfg_with_ssh(&["ssh://git.example:2222"], ssh_material("ssh://git.example:2222"));
+    let resolved = resolve(&cfg).unwrap();
+    let grant = &resolved.grants[0];
+    let scope = grant.ssh(None, 2222).expect("the port alone narrows the scope");
+    assert!(matches!(&scope.host, HostPat::Exact(host) if host == "git.example"));
+    assert!(grant.ssh(Some("elsewhere.example"), 2222).is_none());
+    assert!(grant.ssh(None, 22).is_none());
+  }
+
+  #[test]
+  fn ssh_entry_without_key_material_fails_closed() {
+    let cfg = cfg_with_ssh(&["ssh://git.example"], BTreeMap::new());
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("no ssh config for this entry"), "{err}");
+  }
+
+  #[test]
+  fn ssh_config_missing_a_field_fails_closed() {
+    let mut ssh = ssh_material("ssh://git.example");
+    ssh.get_mut("ssh://git.example").unwrap().identity = None;
+    let cfg = cfg_with_ssh(&["ssh://git.example"], ssh);
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("identity is required"), "{err}");
+  }
+
+  #[test]
+  fn ssh_config_naming_an_ungranted_entry_fails_closed() {
+    let mut ssh = ssh_material("ssh://git.example");
+    ssh.insert(
+      "ssh://other.example".to_string(),
+      HostSshCfg {
+        identity: None,
+        guest_key: None,
+      },
+    );
+    let cfg = cfg_with_ssh(&["ssh://git.example"], ssh);
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("ssh config names entry `ssh://other.example`"), "{err}");
+  }
+
+  #[test]
+  fn ssh_rule_cannot_mix_schemes() {
+    let cfg = cfg_with_ssh(&["ssh://git.example", "https://git.example"], BTreeMap::new());
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("ssh entries cannot mix"), "{err}");
+  }
+
+  #[test]
+  fn ssh_rule_states_no_value() {
+    let mut cfg = cfg_with_ssh(&["ssh://git.example"], ssh_material("ssh://git.example"));
+    cfg.rules.get_mut("t").unwrap().value = Some(SecretString::from("nothing would swap it"));
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("an ssh rule states no `value`"), "{err}");
+  }
+
+  #[test]
+  fn ssh_entry_takes_no_tls_config() {
+    let mut cfg = cfg_with_ssh(&["ssh://git.example"], ssh_material("ssh://git.example"));
+    cfg.rules.get_mut("t").unwrap().tls.insert(
+      "ssh://git.example".to_string(),
+      HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls_mode: GuestTlsMode::default(),
+        guest_cert: None,
+        guest_key: None,
+      },
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("states no `tls` config"), "{err}");
+  }
+
+  #[test]
+  fn ssh_material_on_a_non_ssh_rule_fails_closed() {
+    // The demo lost its ssh grant exactly this way: the ssh table sat on a
+    // rule whose allow entries were https, resolve took the token arm, and
+    // the table vanished silently — ssh traffic spliced instead of
+    // terminating. A stated table that cannot apply is an error.
+    let mut cfg = cfg_with_ssh(&["https://api.example"], BTreeMap::new());
+    cfg.rules.get_mut("t").unwrap().ssh.insert(
+      "ssh://git.example".to_string(),
+      HostSshCfg {
+        identity: Some(PathBuf::from("/hodor/grants/rules.d/t.identity")),
+        guest_key: Some(PathBuf::from("/hodor/grants/rules.d/t.guest_key")),
+      },
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("ssh config on a rule with no ssh entry"), "{err}");
   }
 }

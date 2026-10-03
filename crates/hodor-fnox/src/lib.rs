@@ -278,6 +278,7 @@ pub async fn resolve(config: &mut AppConfig, registry: &Registry, fnox: Option<F
         registry: None,
         if_missing: IfMissing::Warn,
         tls: BTreeMap::new(),
+        ssh: BTreeMap::new(),
       });
     }
   }
@@ -298,6 +299,13 @@ pub async fn resolve(config: &mut AppConfig, registry: &Registry, fnox: Option<F
 
   let mut dropped = Vec::new();
   for (label, rule) in &mut config.rules {
+    if rule.is_ssh() {
+      // SSH rule: the secret is key material in the `ssh` table, stated in
+      // the config. Nothing resolves from fnox and no registry union may
+      // widen the entries — an ssh rule's allow list is all ssh.
+      tracing::info!(label, env = %rule.env, "ssh rule resolved: key material from the config");
+      continue;
+    }
     if rule.is_database() {
       // Database rule: `value` holds the stated fake string; the real
       // connection string comes from fnox and never overwrites it. No
@@ -512,6 +520,7 @@ mod tests {
       registry: None,
       if_missing: IfMissing::Error,
       tls: BTreeMap::new(),
+      ssh: BTreeMap::new(),
     }
   }
 
@@ -521,6 +530,8 @@ mod tests {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
         root_certs: Vec::new(),
+        ssh_host_key: None,
+        ssh_known_hosts: None,
         handshake_timeout_secs: 10,
       },
       workspace: WorkspaceCfg::default(),

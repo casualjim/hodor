@@ -25,6 +25,7 @@ use crate::error::Error;
 use crate::expand::{apply_rewrites, block_on, build_expander, expand_path, expand_value, resolution_env, rewrite_file_name};
 use crate::kube;
 use crate::paths::{Mount, covering, expand, translate};
+use crate::ssh;
 use crate::talos;
 
 /// Revision of the generated stack's shape. Bump whenever what
@@ -599,14 +600,32 @@ pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutput
             source,
           })?)
         };
-        let adapted = match format {
-          RewriteFormat::Kubeconfig => kube::adapt(&host, &content, ca, guests_dir)?,
-          RewriteFormat::Talos => Some(talos::adapt(&host, &content, ca, guests_dir)?),
+        let adapted: Vec<RewriteAdapted> = match format {
+          RewriteFormat::Kubeconfig => kube::adapt(&host, &content, ca, guests_dir)?.into_iter().collect(),
+          RewriteFormat::Talos => Vec::from([talos::adapt(&host, &content, ca, guests_dir)?]),
+          RewriteFormat::Ssh => {
+            let host_home = host_home.ok_or_else(|| Error::ConfigDir {
+              detail: "an ssh rewrite needs the host home to resolve identities".to_string(),
+            })?;
+            ssh::adapt(&host, &content, home, host_home)?
+          }
         };
-        match adapted {
-          Some(adapted) => {
-            let bytes = adapted.decoy.clone().into_bytes();
-            grants.push(adapted);
+        match adapted.first() {
+          Some(first) => {
+            let bytes = first.decoy.clone().into_bytes();
+            for file in &first.decoy_files {
+              let file_path = files_dir.join(&file.name);
+              fs::write(&file_path, &file.bytes).map_err(|source| Error::WriteFile {
+                path: file_path.clone(),
+                source,
+              })?;
+              mounts.push(Mount {
+                host: file_path,
+                container: PathBuf::from(&file.container),
+                ro: true,
+              });
+            }
+            grants.extend(adapted);
             bytes
           }
           None if rewrite.format.is_some() => {
@@ -1211,6 +1230,7 @@ mod tests {
       registry: None,
       oauth2: None,
       tls,
+      ssh: BTreeMap::new(),
       if_missing: IfMissing::default(),
     };
     let mut rules = BTreeMap::new();

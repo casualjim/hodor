@@ -6,7 +6,7 @@
 //! from the opening bytes of the protocol the config named, because a
 //! transparent capture destination is an IP.
 
-use hodor_config::grants::{DatabaseScope, Grant, Scheme};
+use hodor_config::grants::{DatabaseScope, Grant, Scheme, SshScope};
 use rama::tls::client::{ClientHello, ClientHelloHandshakePrefix, parse_client_hello_handshake_prefix};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
@@ -30,7 +30,8 @@ pub(crate) enum Expect<'a> {
   /// A `postgres://` scope: pgwire framing, over whatever transport the entry
   /// states for the far side and the guest asks for on this side.
   Postgres(&'a DatabaseScope),
-  /// No scope covers the destination: copy bytes unchanged.
+  /// An `ssh://` scope: the guest leg terminates here against a decoy key.
+  Ssh(&'a SshScope),
   Splice,
 }
 
@@ -48,6 +49,7 @@ impl PartialEq for Expect<'_> {
   fn eq(&self, other: &Self) -> bool {
     match (self, other) {
       (Expect::Postgres(a), Expect::Postgres(b)) => std::ptr::eq(*a, *b),
+      (Expect::Ssh(a), Expect::Ssh(b)) => std::ptr::eq(*a, *b),
       (Expect::Tls, Expect::Tls) | (Expect::Plain, Expect::Plain) | (Expect::Raw, Expect::Raw) | (Expect::Splice, Expect::Splice) => true,
       _ => false,
     }
@@ -60,6 +62,9 @@ impl Eq for Expect<'_> {}
 pub(crate) fn expect<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> Expect<'a> {
   if let Some(scope) = grants.iter().find_map(|grant| grant.database(host, port)) {
     return Expect::Postgres(scope);
+  }
+  if let Some(scope) = grants.iter().find_map(|grant| grant.ssh(host, port)) {
+    return Expect::Ssh(scope);
   }
   for (scheme, arm) in [
     (Scheme::Https, Expect::Tls),
@@ -337,6 +342,35 @@ mod tests {
     // inspected to reach this answer, and the entry that comes back is the
     // same one, so its sslmode and trust anchor travel with it.
     assert!(matches!(expect(&grants, None, 5432), Expect::Postgres(other) if std::ptr::eq(other, scope)));
+  }
+
+  #[test]
+  fn an_ssh_grant_routes_to_the_ssh_arm_and_only_its_port() {
+    // The demo spliced ssh traffic for a whole afternoon because nothing
+    // pinned the routing: an ssh grant must reach the ssh arm by host and
+    // by port alone (transparent capture), and nothing else may reach it.
+    let grants = vec![Grant::Ssh {
+      allow: vec![SshScope {
+        host: hodor_config::grants::HostPat::Exact("git.example".to_string()),
+        port: 22,
+        identity: std::path::PathBuf::from("/hodor/grants/rules.d/t.identity"),
+        guest_key: std::path::PathBuf::from("/hodor/grants/rules.d/t.guest_key"),
+      }],
+    }];
+    let Expect::Ssh(scope) = expect(&grants, Some("git.example"), 22) else {
+      panic!("an ssh grant resolves to the ssh arm")
+    };
+    assert_eq!(scope.port, 22);
+    assert!(
+      matches!(expect(&grants, None, 22), Expect::Ssh(other) if std::ptr::eq(other, scope)),
+      "port alone routes"
+    );
+    assert_eq!(expect(&grants, Some("git.example"), 2222), Expect::Splice, "another port does not");
+    assert_eq!(
+      expect(&grants, Some("elsewhere.example"), 22),
+      Expect::Splice,
+      "another host does not"
+    );
   }
   #[tokio::test]
   async fn a_complete_hello_without_sni_returns_unnamed_at_once() {

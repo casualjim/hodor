@@ -277,6 +277,8 @@ mod tests {
           listen: "127.0.0.1:0".parse().unwrap(),
           ca_file: None,
           root_certs: Vec::new(),
+          ssh_host_key: None,
+          ssh_known_hosts: None,
           handshake_timeout_secs: 10,
         },
         grants,
@@ -392,6 +394,8 @@ mod tests {
           proxy: hodor_config::config::ProxyCfg {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
+            ssh_host_key: None,
+            ssh_known_hosts: None,
             root_certs: Vec::new(),
             handshake_timeout_secs: 10,
           },

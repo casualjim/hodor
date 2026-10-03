@@ -8,26 +8,26 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
-thiserror = "2"
 futures-sink = "0.3"
-futures-util = "0.3.34"
-hodor-config = { path = "../hodor-config" }
-hodor-pki = { path = "../hodor-pki" }
-hodor-proxy = { path = "../hodor-proxy" }
-rtnetlink = "0.23.0"
-secrecy = { version = "0.10", features = ["serde"] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+futures-util = { workspace = true }
+hodor-config = { workspace = true }
+hodor-pki = { workspace = true }
+hodor-proxy = { workspace = true }
+rtnetlink = { workspace = true }
+rustls = { workspace = true }
+secrecy = { workspace = true }
 smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp", "std"] }
 socket2 = "0.6"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-rustls = "0.26"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-util = "0.7"
-tracing = "0.1"
+tracing = { workspace = true }
 tun = { version = "0.7", features = ["async"] }
 
 [dev-dependencies]
-pretty_assertions = "1"
-tempfile = "3"
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

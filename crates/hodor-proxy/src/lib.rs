@@ -32,7 +32,7 @@ use crate::connection::{GuestIo, PgTransport, Prefixed, PumpService, client_auth
 use crate::identity::{Expect, Hello, MintBucket, expect, hello_complete, read_client_hello, read_http_head};
 use crate::mint::{MintHandle, MintStore};
 use crate::protocol::{MAX_HEAD, PairCtx, http_pair, postgres_pair, raw_tcp_pair};
-use crate::wire::{GuestOpening, read_guest_opening, request_upstream_tls};
+use crate::wire::{GuestOpening, SshLegs, read_guest_opening, request_upstream_tls};
 use hodor_config::grants::{Grant, ResolvedConfig, Scheme, SslMode};
 use hodor_pki::ca::CertAuthority;
 pub(crate) use relay::relay_guarded;
@@ -626,6 +626,56 @@ where
         }
       }
     }
+    // Declared ssh: the guest leg terminates here, and the bytes never
+    // reach the upstream raw. Only a banner announcing SSH-2.0 enters the
+    // leg; anything else on the port splices verbatim, because the scope
+    // does not own those bytes.
+    Expect::Ssh(scope) => {
+      // The transparent capture arrives with nothing read yet; the banner
+      // is the first bytes every ssh client sends, so one budgeted read
+      // settles leg versus splice — an empty initial must not splice.
+      let mut banner = initial.to_vec();
+      if banner.is_empty() {
+        let mut buf = [0u8; 256];
+        let read = match tokio::time::timeout(budget, guest.read(&mut buf)).await {
+          Ok(Ok(read)) => read,
+          Ok(Err(source)) => return Err(source.into()),
+          // A peer that sends nothing within the budget is not ssh traffic.
+          Err(_) => return Ok(()),
+        };
+        if read == 0 {
+          return Ok(());
+        }
+        banner.extend_from_slice(&buf[..read]);
+      }
+      if !banner.starts_with(b"SSH-2.0-") {
+        return splice_replay(guest, dial_host, port, state.fwmark, &banner).await;
+      }
+      let name = host.unwrap_or(dial_host).to_string();
+      let host_key_path = snapshot
+        .proxy
+        .ssh_host_key
+        .clone()
+        .or_else(|| hodor_config::config::config_dir().map(|dir| dir.join("ssh_host_ed25519")))
+        .ok_or_else(|| Error::SshHostKeyUnset)?;
+      let known_hosts = snapshot
+        .proxy
+        .ssh_known_hosts
+        .clone()
+        .or_else(|| hodor_config::config::config_dir().map(|dir| dir.join("ssh_known_hosts")))
+        .expect("the host key resolution proved a config directory exists");
+      let legs = SshLegs::load(
+        &host_key_path,
+        &scope.identity,
+        &scope.guest_key,
+        &known_hosts,
+        dial_host,
+        port,
+        &name,
+        state.fwmark,
+      )?;
+      legs.serve(Prefixed::new(banner, guest), budget).await
+    }
   }
 }
 
@@ -796,6 +846,8 @@ mod tests {
           proxy: hodor_config::config::ProxyCfg {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
+            ssh_host_key: None,
+            ssh_known_hosts: None,
             root_certs: Vec::new(),
             handshake_timeout_secs,
           },
@@ -1595,6 +1647,8 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
             root_certs: vec![bundle],
+            ssh_host_key: None,
+            ssh_known_hosts: None,
             handshake_timeout_secs: 10,
           },
           grants,

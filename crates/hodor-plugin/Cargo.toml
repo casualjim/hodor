@@ -8,15 +8,15 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
-thiserror = "2"
-hodor-config = { path = "../hodor-config" }
-tracing = "0.1"
+thiserror = { workspace = true }
+hodor-config = { workspace = true }
+tracing = { workspace = true }
 wasmtime = { version = "48", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
 wasmtime-wasi = "48"
 
 [dev-dependencies]
-pretty_assertions = "1"
-tempfile = "3"
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

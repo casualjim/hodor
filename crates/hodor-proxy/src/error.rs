@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::connection::TrustAnchorsError;
 use httparse::Error as HttparseError;
+use russh::Error as RusshError;
 use rustls::Error as RustlsError;
 
 /// Every way proxy setup and connection serving can fail.
@@ -23,6 +24,21 @@ pub enum Error {
   /// A raw I/O failure with no extra context.
   #[error(transparent)]
   Io(#[from] IoError),
+  /// An ssh leg protocol failure.
+  #[error(transparent)]
+  Ssh(#[from] RusshError),
+  /// No ssh host key path is set or derivable for a granted ssh leg.
+  #[error("ssh host key path is unset")]
+  SshHostKeyUnset,
+  /// An ssh leg blob does not load.
+  #[error("ssh blob {path}: {source}")]
+  SshRead {
+    /// Blob path.
+    path: PathBuf,
+    /// Underlying read failure.
+    #[source]
+    source: IoError,
+  },
   /// A CONNECT head that does not parse.
   #[error(transparent)]
   HeadParse(#[from] HttparseError),

@@ -72,33 +72,68 @@ unneeded_field_pattern = "warn"
 unused_result_ok = "warn"
 
 [workspace.dependencies]
-toml = "0.8"
-
-[dependencies]
+# One declaration per external dependency so versions cannot drift between
+# crates. rama tracks main deliberately: its 0.5 line is unpublished.
+aya = "0.14"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 confique = { version = "0.4", features = ["toml"] }
 dirs = "6"
-eyre = "0.6"
+futures-util = "0.3.34"
 hodor-compose = { path = "crates/hodor-compose" }
 hodor-config = { path = "crates/hodor-config" }
+hodor-ebpf = { path = "crates/hodor-ebpf" }
 hodor-fnox = { path = "crates/hodor-fnox" }
 hodor-pki = { path = "crates/hodor-pki" }
+hodor-plugin = { path = "crates/hodor-plugin" }
 hodor-proxy = { path = "crates/hodor-proxy" }
+hodor-tproxy = { path = "crates/hodor-tproxy" }
+hodor-tun = { path = "crates/hodor-tun" }
 libc = "0.2"
 miette = { version = "7", features = ["fancy"] }
-mimalloc = "0.1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt-multi-thread", "sync", "time"] }
+pretty_assertions = "1"
+rama = { git = "https://github.com/plabayo/rama", branch = "main", default-features = false }
+rtnetlink = "0.23.0"
+russh = { version = "0.56", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+time = "0.3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
+toml = "0.8"
+toml_edit = { version = "0.25", features = ["serde"] }
 tracing = "0.1"
+url = "2"
+
+[dependencies]
+clap = { workspace = true }
+confique = { workspace = true }
+dirs = { workspace = true }
+eyre = "0.6"
+hodor-compose = { workspace = true }
+hodor-config = { workspace = true }
+hodor-fnox = { workspace = true }
+hodor-pki = { workspace = true }
+hodor-proxy = { workspace = true }
+libc = { workspace = true }
+miette = { workspace = true }
+mimalloc = "0.1"
+tokio = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-hodor-ebpf = { path = "crates/hodor-ebpf" }
-hodor-tproxy = { path = "crates/hodor-tproxy" }
-hodor-tun = { path = "crates/hodor-tun" }
+hodor-ebpf = { workspace = true }
+hodor-tproxy = { workspace = true }
+hodor-tun = { workspace = true }
 
 [dev-dependencies]
-pretty_assertions = "1"
-tempfile = "3"
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

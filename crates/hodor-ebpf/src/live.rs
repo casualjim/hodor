@@ -123,6 +123,8 @@ fn state_with(grants: Vec<Grant>, ca: &hodor_pki::ca::CertAuthority) -> Arc<Prox
         proxy: ProxyCfg {
           listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
           ca_file: None,
+          ssh_host_key: None,
+          ssh_known_hosts: None,
           root_certs: Vec::new(),
           handshake_timeout_secs: 10,
         },

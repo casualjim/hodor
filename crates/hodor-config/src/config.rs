@@ -193,8 +193,8 @@ pub struct FileRewrite {
   #[serde(default)]
   pub envs: Vec<String>,
   /// Declared format, skipping detection. Known formats: `kubeconfig`
-  /// (kubectl), `talos` (talosctl). More formats later; unknown files keep
-  /// the raw byte-swap when this is absent.
+  /// (kubectl), `talos` (talosctl), `ssh` (ssh config; never sniffed).
+  /// Unknown files keep the raw byte-swap when this is absent.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub format: Option<RewriteFormat>,
 }
@@ -207,6 +207,9 @@ pub enum RewriteFormat {
   Kubeconfig,
   /// Talos client config: structural grant derivation plus decoy twin.
   Talos,
+  /// SSH config: per-host identity grants plus decoy key and `known_hosts`.
+  /// Never sniffed; ssh configs carry no unambiguous markers.
+  Ssh,
 }
 
 impl fmt::Display for RewriteFormat {
@@ -214,6 +217,7 @@ impl fmt::Display for RewriteFormat {
     f.write_str(match self {
       Self::Kubeconfig => "kubeconfig",
       Self::Talos => "talos",
+      Self::Ssh => "ssh",
     })
   }
 }
@@ -231,6 +235,17 @@ pub struct ProxyCfg {
   #[config(layer_attr(arg(long = "ca-file", help = "CA PEM path (default <config-dir>/hodor/ca.pem)")))]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub ca_file: Option<PathBuf>,
+  /// SSH host key path (default `<config-dir>/hodor/ssh_host_ed25519`):
+  /// the key the guest leg presents, generated on first run.
+  #[config(env = "HODOR_SSH_HOST_KEY")]
+  #[config(layer_attr(arg(long = "ssh-host-key", help = "SSH host key path (default <config-dir>/hodor/ssh_host_ed25519)")))]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub ssh_host_key: Option<PathBuf>,
+  /// Hodor's own upstream `known_hosts`, OpenSSH `accept-new` semantics:
+  /// first-seen keys are recorded, a changed key on a known host fails.
+  #[config(env = "HODOR_SSH_KNOWN_HOSTS")]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub ssh_known_hosts: Option<PathBuf>,
   /// Extra upstream CA bundles trusted on egress, additive to webpki roots.
   /// Entries extend this further with their own `root_cert`. Config file
   /// only: one path per bundle.
@@ -286,6 +301,9 @@ pub struct RuleCfg {
   /// Per-entry TLS configuration keyed by the exact `allow` entry string.
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub tls: BTreeMap<String, HostTlsCfg>,
+  /// Per-entry SSH key material, keyed by the exact `allow` entry string.
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub ssh: BTreeMap<String, HostSshCfg>,
 }
 
 impl RuleCfg {
@@ -297,6 +315,14 @@ impl RuleCfg {
       .value
       .as_ref()
       .is_some_and(|value| value.expose_secret().starts_with("postgres://"))
+  }
+
+  /// An ssh rule's allow entries are all `ssh://` and its secret is key
+  /// material in the `ssh` table: nothing resolves from fnox, and no
+  /// registry union may touch the entry list.
+  #[must_use]
+  pub fn is_ssh(&self) -> bool {
+    !self.ssh.is_empty()
   }
 }
 
@@ -324,6 +350,21 @@ pub struct HostTlsCfg {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub guest_cert: Option<PathBuf>,
   /// Container-internal path the guest's minted key mounts at.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub guest_key: Option<PathBuf>,
+}
+
+/// Per-entry SSH key material, keyed by the rule's own `allow` entry string.
+/// All three paths are required for an `ssh://` entry: the resolve step
+/// fails closed when any is missing. Compose writes the blobs; the proxy
+/// reads them at startup.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSshCfg {
+  /// Real private key (openssh format) the upstream leg presents.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub identity: Option<PathBuf>,
+  /// Decoy public key (`authorized_keys` format) the guest leg admits.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub guest_key: Option<PathBuf>,
 }
@@ -912,6 +953,7 @@ pub fn reference_samples() -> String {
     allow: vec![
       "https://api.example".to_string(),
       "postgres://db.example:5432/app?sslmode=verify-full&sslrootcert=/certs/bundle.pem".to_string(),
+      "ssh://git.example".to_string(),
     ],
     pattern: Some("example_{hex:32}".to_string()),
     oauth2: Some(OAuthFlow {
@@ -925,6 +967,13 @@ pub fn reference_samples() -> String {
     registry: Some(true),
     if_missing: IfMissing::Warn,
     tls: rule_tls,
+    ssh: BTreeMap::from([(
+      "ssh://git.example".to_string(),
+      HostSshCfg {
+        identity: Some("/hodor/grants/rules.d/example.identity".into()),
+        guest_key: Some("/hodor/grants/rules.d/example.guest_key".into()),
+      },
+    )]),
   };
   let samples = Samples {
     rules: [("example", rule)].into_iter().collect(),
@@ -1310,6 +1359,39 @@ if_missing = "warn"
     assert_eq!(rule.fnox_key.as_deref(), Some("GH_PAT"));
     assert_eq!(rule.registry, Some(false));
     assert_eq!(rule.if_missing, IfMissing::Warn);
+    scrub_env();
+  }
+
+  #[test]
+  fn an_ssh_rule_loads_its_key_material_from_the_file() {
+    // Proven by the demo: an ssh rule stated in the config file vanished
+    // between the file and resolve, ssh traffic spliced. This test pins
+    // the whole file path — confique's pass and the label merge.
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(
+      &global,
+      r#"
+[rules.ssh]
+env = "SSH_KEY"
+registry = false
+if_missing = "ignore"
+allow = ["ssh://git.example"]
+
+[rules.ssh.ssh."ssh://git.example"]
+identity = "/hodor/grants/rules.d/t.identity"
+guest_key = "/hodor/grants/rules.d/t.guest_key"
+"#,
+    );
+    set_env("HODOR_CONFIG", &global);
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
+    let rule = &config.rules["ssh"];
+    assert_eq!(rule.allow, ["ssh://git.example"]);
+    let entry = &rule.ssh["ssh://git.example"];
+    assert_eq!(entry.identity, Some(PathBuf::from("/hodor/grants/rules.d/t.identity")));
+    assert_eq!(entry.guest_key, Some(PathBuf::from("/hodor/grants/rules.d/t.guest_key")));
     scrub_env();
   }
 

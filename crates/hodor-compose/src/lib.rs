@@ -29,7 +29,7 @@ mod tests {
   use std::slice::from_ref;
 
   use hodor_config::cli::{Cli, ProxyBackend};
-  use hodor_config::config::{FileRewrite, RewriteFormat, RuleCfg, ToolCfg};
+  use hodor_config::config::{FileRewrite, RewriteFormat, RuleCfg, ToolCfg, fake_for};
   use tempfile::tempdir;
 
   use crate::confine::*;
@@ -41,7 +41,7 @@ mod tests {
     vec![
       Decoy {
         env: "GITHUB_TOKEN".to_string(),
-        value: "ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3".to_string(),
+        value: fake_for("GITHUB_TOKEN", None),
       },
       Decoy {
         env: "ANTHROPIC_API_KEY".to_string(),
@@ -524,10 +524,7 @@ mod tests {
     assert!(yaml.contains(":/certs/ca.pem"), "the CA is mounted for hodor: {yaml}");
     assert!(!yaml.contains("/root/.config/fnox"), "no fnox mount without binds to mount: {yaml}");
     assert!(yaml.contains("init: true"), "{yaml}");
-    assert!(
-      yaml.contains("GITHUB_TOKEN: \"ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3\""),
-      "{yaml}"
-    );
+    assert!(yaml.contains(&format!("GITHUB_TOKEN: \"{}\"", decoys()[0].value)), "{yaml}");
   }
 
   #[test]

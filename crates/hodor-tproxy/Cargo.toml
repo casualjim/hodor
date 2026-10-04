@@ -13,9 +13,9 @@ hodor-config = { workspace = true }
 hodor-pki = { workspace = true }
 hodor-proxy = { workspace = true }
 libc = { workspace = true }
-netlink-packet-core = "0.9"
-netlink-packet-netfilter = "0.4"
-netlink-sys = "0.8"
+netlink-packet-core = { workspace = true }
+netlink-packet-netfilter = { workspace = true }
+netlink-sys = { workspace = true }
 rama = { workspace = true, features = ["tcp"] }
 rtnetlink = { workspace = true }
 rustls = { workspace = true }

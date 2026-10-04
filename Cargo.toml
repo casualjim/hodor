@@ -74,12 +74,27 @@ unused_result_ok = "warn"
 [workspace.dependencies]
 # One declaration per external dependency so versions cannot drift between
 # crates. rama tracks main deliberately: its 0.5 line is unpublished.
+async-trait = "0.1"
 aya = "0.14"
+aya-build = "0.2"
+aya-obj = "0.3"
+base62 = "2.0"
 base64 = "0.22"
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+code-workspace = "0.1.4"
 confique = { version = "0.4", features = ["toml"] }
+dashmap = "6"
 dirs = "6"
+eyre = "0.6"
+fnox-core = "1.33"
+futures = "0.3"
+futures-sink = "0.3"
 futures-util = "0.3.34"
+gix-config = { version = "0.61", features = ["sha1"] }
+gix-discover = { version = "0.56", features = ["sha1"] }
+h2 = "0.4"
+hex = "0.4"
 hodor-compose = { path = "crates/hodor-compose" }
 hodor-config = { path = "crates/hodor-config" }
 hodor-ebpf = { path = "crates/hodor-ebpf" }
@@ -89,31 +104,58 @@ hodor-plugin = { path = "crates/hodor-plugin" }
 hodor-proxy = { path = "crates/hodor-proxy" }
 hodor-tproxy = { path = "crates/hodor-tproxy" }
 hodor-tun = { path = "crates/hodor-tun" }
+httlib-hpack = "0.1.3"
+http-body-util = "0.1"
+httparse = "1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 miette = { version = "7", features = ["fancy"] }
+mimalloc = "0.1"
+netlink-packet-core = "0.9"
+netlink-packet-netfilter = "0.4"
+netlink-sys = "0.8"
+pgwire = { version = "0.41", default-features = false }
 pretty_assertions = "1"
+proptest = "1"
 rama = { git = "https://github.com/plabayo/rama", branch = "main", default-features = false }
+rand = "0.8"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rtnetlink = "0.23.0"
 russh = { version = "0.56", default-features = false, features = ["aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls-native-certs = "0.8"
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+shellexpand = "3"
+smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp", "std"] }
+socket2 = "0.6"
 tempfile = "3"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-postgres = "0.7"
 tokio-rustls = "0.26"
+tokio-util = "0.7"
 toml = "0.8"
 toml_edit = { version = "0.25", features = ["serde"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tun = { version = "0.7", features = ["async"] }
 url = "2"
+validator = { version = "0.20", features = ["derive"] }
+wasmtime = { version = "48", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
+wasmtime-wasi = "48"
+xpanda = "0.2"
 
 [dependencies]
 clap = { workspace = true }
 confique = { workspace = true }
 dirs = { workspace = true }
-eyre = "0.6"
+eyre = { workspace = true }
 hodor-compose = { workspace = true }
 hodor-config = { workspace = true }
 hodor-fnox = { workspace = true }
@@ -121,10 +163,10 @@ hodor-pki = { workspace = true }
 hodor-proxy = { workspace = true }
 libc = { workspace = true }
 miette = { workspace = true }
-mimalloc = "0.1"
+mimalloc = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hodor-ebpf = { workspace = true }

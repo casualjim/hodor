@@ -9,17 +9,17 @@ publish = false
 
 [dependencies]
 base64 = { workspace = true }
-bytes = "1"
+bytes = { workspace = true }
 hodor-config = { workspace = true }
 hodor-pki = { workspace = true }
 hodor-plugin = { workspace = true }
-httlib-hpack = "0.1.3"
-httparse = "1"
-pgwire = { version = "0.41", default-features = false }
+httlib-hpack = { workspace = true }
+httparse = { workspace = true }
+pgwire = { workspace = true }
 rama = { workspace = true, features = ["boring", "tcp"] }
 russh = { workspace = true }
 rustls = { workspace = true }
-rustls-native-certs = "0.8"
+rustls-native-certs = { workspace = true }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -29,19 +29,19 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-async-trait = "0.1"
-futures = "0.3"
-h2 = "0.4"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+h2 = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 # server-api-aws-lc-rs also turns on pgwire's TLS acceptor, which the
 # handshake tests drive with a real rustls server.
-pgwire = { version = "0.41", default-features = false, features = ["server-api-aws-lc-rs"] }
+pgwire = { workspace = true, features = ["server-api-aws-lc-rs"] }
 pretty_assertions = { workspace = true }
-proptest = "1"
+proptest = { workspace = true }
 tempfile = { workspace = true }
-tokio-postgres = "0.7"
+tokio-postgres = { workspace = true }
 
 [lints]
 workspace = true

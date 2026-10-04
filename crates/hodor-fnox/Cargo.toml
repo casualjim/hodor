@@ -8,7 +8,7 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
-fnox-core = "1.33"
+fnox-core = { workspace = true }
 hodor-config = { workspace = true }
 miette = { workspace = true }
 secrecy = { workspace = true }

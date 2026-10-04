@@ -346,7 +346,7 @@ fn hex_prefix(bytes: &[u8]) -> String {
 
 /// Flushes the capture table on drop (best-effort): rules and chains go
 /// with it. A stale TPROXY redirect would blackhole traffic after exit, so
-/// cleanup is load-bearing.
+/// cleanup must run.
 struct NftGuard {
   teardown: Option<NetlinkMessage<NetfilterMessage>>,
 }

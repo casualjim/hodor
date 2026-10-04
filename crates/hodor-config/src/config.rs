@@ -846,6 +846,10 @@ impl Encoding {
   }
 }
 
+/// Upper bound on one pattern segment's count. Patterns come from config
+/// and the bundled registry; real decoys are token-sized.
+const MAX_PATTERN_COUNT: usize = 4096;
+
 fn render_template(template: &str, seed: &str) -> String {
   let mut out = String::new();
   let mut rest = template;
@@ -867,7 +871,9 @@ fn render_template(template: &str, seed: &str) -> String {
     let validated = match body.split_once(':') {
       Some((kind, count_raw)) if !count_raw.is_empty() && count_raw.bytes().all(|b| b.is_ascii_digit()) => {
         match (Encoding::parse(kind), count_raw.parse::<usize>()) {
-          (Some(encoding), Ok(count)) => Some((encoding, count)),
+          // A count past the cap renders literally: an absurd pattern is a
+          // config mistake, not a multi-gigabyte decoy to grind out.
+          (Some(encoding), Ok(count)) if count <= MAX_PATTERN_COUNT => Some((encoding, count)),
           _ => None,
         }
       }
@@ -1419,6 +1425,13 @@ guest_key = "/hodor/grants/rules.d/t.guest_key"
     assert!(explicit.starts_with("sk_live_"), "{explicit}");
 
     assert_ne!(fake_for("GH_TOKEN", None), fake_for("GH_OTHER", None));
+  }
+
+  #[test]
+  fn absurd_pattern_counts_render_literally() {
+    assert_eq!(fake_for("X", Some("{hex:99999999}")), "{hex:99999999}");
+    assert_eq!(render_template("{hex:4097}", "seed"), "{hex:4097}");
+    assert_eq!(render_template("{hex:4096}", "seed").len(), 4096);
   }
 
   #[test]

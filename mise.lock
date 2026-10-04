@@ -123,6 +123,16 @@ url = "https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-d
 url_api = "https://api.github.com/repos/axodotdev/cargo-dist/releases/assets/556576987"
 provenance = "github-attestations"
 
+[[tools."cargo:cargo-audit"]]
+version = "0.22.2"
+backend = "cargo:cargo-audit"
+specifiers = ["latest"]
+
+[[tools."cargo:cargo-outdated"]]
+version = "0.19.0"
+backend = "cargo:cargo-outdated"
+specifiers = ["latest"]
+
 [[tools."cargo:cargo-sort"]]
 version = "2.1.4"
 backend = "cargo:cargo-sort"
@@ -207,6 +217,53 @@ url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788
 checksum = "sha256:0afb407265502082776c1abd24cbafad44e2ac469a9d91b8439ff9f6f80c1d70"
 url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-pc-windows-gnullvm.tar.zst"
 url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788745"
+
+[[tools."github:betterleaks/betterleaks"]]
+version = "1.9.0"
+backend = "github:betterleaks/betterleaks"
+specifiers = ["latest"]
+
+[tools."github:betterleaks/betterleaks"."platforms.linux-arm64"]
+checksum = "sha256:1d39116e0a58dc94574715e2aa12a2dbd5062f193eee3fec011fef6ba06bd13b"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108932"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.linux-arm64-musl"]
+checksum = "sha256:1d39116e0a58dc94574715e2aa12a2dbd5062f193eee3fec011fef6ba06bd13b"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108932"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.linux-x64"]
+checksum = "sha256:f8b185a39ffcece2a1ca82bf3a4e7435cd81963ffd16b7a9128daf75f35f6de7"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_linux_x64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108929"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.linux-x64-musl"]
+checksum = "sha256:f8b185a39ffcece2a1ca82bf3a4e7435cd81963ffd16b7a9128daf75f35f6de7"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_linux_x64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108929"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.macos-arm64"]
+checksum = "sha256:83dd7eaab13d44a1e8e347a17064cdef153a1478db473276d41b38d55613d3f2"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108927"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.macos-x64"]
+checksum = "sha256:68dfd83458d9e7f90663daa7a81c7f944083b170dae82e4f5f8d0581ed519ef1"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_darwin_x64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108931"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.windows-x64"]
+checksum = "sha256:b765daec9fda475b031b5a5159798cbe4294a3f2a50683cbc0471226e376d3da"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_windows_x64.zip"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108997"
+provenance = "github-attestations"
 
 [[tools."github:casualjim/remark"]]
 version = "0.6.2"

@@ -405,8 +405,8 @@ mod tests {
       },
       scope: Box::new(
         hodor_config::grants::DatabaseScope::from_strings(
-          "postgres://app:FAKEFAKE@db.internal:5432",
-          "postgres://app:REALREAL@db.internal:5432?sslmode=disable",
+          "postgres://app:FAKEFAKE@db.internal:5432",                 // betterleaks:allow
+          "postgres://app:REALREAL@db.internal:5432?sslmode=disable", // betterleaks:allow
         )
         .unwrap(),
       ),

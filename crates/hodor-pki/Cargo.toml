@@ -9,8 +9,8 @@ publish = false
 
 [dependencies]
 rama = { workspace = true, features = ["boring"] }
-rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
-rand = "0.8"
+rcgen = { workspace = true }
+rand = { workspace = true }
 russh = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }

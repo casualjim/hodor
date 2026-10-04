@@ -73,6 +73,8 @@ impl SshLegs {
   ///
   /// # Errors
   ///
+  /// Returns an error when the host key cannot be generated or loaded, or
+  /// when either key file cannot be read or parsed.
   pub(crate) fn load(
     host_key_path: &Path,
     scope_identity: &Path,
@@ -167,18 +169,16 @@ impl russh::server::Handler for Guest {
     Ok(Auth::reject())
   }
   async fn channel_open_session(&mut self, mut channel: Channel<ServerMsg>, session: &mut Session) -> Result<bool, Self::Error> {
-    eprintln!("TRACE channel open");
     let upstream = self.upstream().await?;
     let remote = upstream.channel_open_session().await?;
     let (mut read, write) = remote.split();
     let guest_id = channel.id();
     let guest_writer = session.handle();
-    eprintln!("TRACE upstream channel opened");
+
     let pump_writer = Arc::new(write);
     let bridge_writer = Arc::clone(&pump_writer);
     tokio::spawn(async move {
       while let Some(message) = channel.wait().await {
-        eprintln!("TRACE guest msg {message:?}");
         if !forward_guest_message(&bridge_writer, message).await {
           break;
         }
@@ -189,7 +189,7 @@ impl russh::server::Handler for Guest {
         let Some(message) = read.wait().await else {
           break;
         };
-        eprintln!("TRACE upstream msg {message:?}");
+
         match message {
           ChannelMsg::Data { data } => {
             if guest_writer.data(guest_id, data).await.is_err() {

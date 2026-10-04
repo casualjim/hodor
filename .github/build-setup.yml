@@ -7,7 +7,7 @@
 # Anything installed here by another route — apt, curl — is a second toolchain
 # that can drift from the one CI validated.
 #
-# Two dist constraints, both load-bearing:
+# Two dist constraints, both mandatory:
 # - every step with `uses:` must also carry `name:`; dist's template reads
 #   `step.id` on those steps and fails with `undefined value` otherwise.
 # - these steps are rendered through minijinja, so `${{ ... }}` expressions are

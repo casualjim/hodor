@@ -167,7 +167,7 @@ async fn apply_undo(handle: &rtnetlink::Handle, undo: &Undo) -> Result<(), Error
 /// Reverts routes/rules on drop (best-effort). Netlink is async, so cleanup
 /// runs on a throwaway thread+runtime — works inside runtimes during
 /// unwind. Stale capture routes would blackhole traffic after exit, so
-/// cleanup is load-bearing.
+/// cleanup must run.
 pub(crate) struct RouteGuard {
   undos: Vec<Undo>,
 }

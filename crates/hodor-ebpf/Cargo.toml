@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 aya = { workspace = true }
-dashmap = "6"
+dashmap = { workspace = true }
 thiserror = { workspace = true }
 hodor-config = { workspace = true }
 hodor-proxy = { workspace = true }
@@ -18,10 +18,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [build-dependencies]
-aya-build = "0.2"
+aya-build = { workspace = true }
 
 [dev-dependencies]
-aya-obj = "0.3"
+aya-obj = { workspace = true }
 hodor-pki = { workspace = true }
 rustls = { workspace = true }
 secrecy = { workspace = true }

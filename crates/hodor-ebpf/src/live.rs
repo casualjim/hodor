@@ -309,7 +309,7 @@ async fn ebpf_live_tcp_mitm_substitutes() {
 /// Connected UDP is relayed both ways, and the reply the client observes must
 /// carry the *original* destination as its source.
 ///
-/// That last part is the `recvmsg4` hook, and it is load-bearing: the reply
+/// That last part is the `recvmsg4` hook, and it is required: the reply
 /// physically arrives from hodor's loopback listener, while the client's socket
 /// is connected to TEST-NET-2, so without the rewrite the kernel would filter
 /// it as a source mismatch and the receive below would time out.

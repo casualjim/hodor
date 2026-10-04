@@ -1126,8 +1126,8 @@ mod tests {
     // libpq's own grammar carries the client identity on the real string —
     // the upstream leg's policy; endpoint URLs carry nothing of the kind.
     let pg = database_scope(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=require&sslcert=/c.pem&sslkey=/c.key",
+      "postgres://app:fake@db.internal:5432/main", // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=require&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
     );
     assert_eq!(pg.client_cert, Some(PathBuf::from("/c.pem")));
     assert_eq!(pg.client_key, Some(PathBuf::from("/c.key")));
@@ -1164,8 +1164,8 @@ mod tests {
   #[test]
   fn rule_table_for_a_database_rule_keys_by_its_env() {
     let mut cfg = cfg_with_db(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=require",
+      "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=require", // betterleaks:allow
     );
     let entry = || HostTlsCfg {
       client_cert: None,
@@ -1223,13 +1223,13 @@ mod tests {
   #[test]
   fn system_names_the_platform_trust_store() {
     let pg = database_scope(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=system",
+      "postgres://app:fake@db.internal:5432/main",                         // betterleaks:allow
+      "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=system", // betterleaks:allow
     );
     assert_eq!(pg.root_cert, Some(RootCert::System));
     let path = database_scope(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=/ca.pem",
+      "postgres://app:fake@db.internal:5432/main",                          // betterleaks:allow
+      "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=/ca.pem", // betterleaks:allow
     );
     assert_eq!(path.root_cert, Some(RootCert::Path(PathBuf::from("/ca.pem"))));
   }
@@ -1255,8 +1255,8 @@ mod tests {
   #[test]
   fn a_database_rule_maps_two_connection_strings() {
     let scope = database_scope(
-      "postgres://app:fake@fake.internal:5433/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=verify-full&sslrootcert=/ca.pem",
+      "postgres://app:fake@fake.internal:5433/main", // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=verify-full&sslrootcert=/ca.pem", // betterleaks:allow
     );
     // The fake string states the guest's leg; its port is the match key.
     assert_eq!(scope.downstream.host, "fake.internal");
@@ -1277,8 +1277,8 @@ mod tests {
   #[test]
   fn database_grant_answers_only_for_postgres() {
     let grant = database_grant(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=require",
+      "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=require", // betterleaks:allow
     );
     assert!(grant.matches(Scheme::Postgres, "db.internal", 5432));
     assert!(!grant.matches(Scheme::Https, "db.internal", 5432));
@@ -1302,8 +1302,8 @@ mod tests {
     assert_eq!(credential.label, "t");
 
     let cfg = cfg_with_db(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=disable",
+      "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=disable", // betterleaks:allow
     );
     let resolved = resolve(&cfg).unwrap();
     let Grant::Database { scope, .. } = &resolved.grants[0] else {
@@ -1317,8 +1317,8 @@ mod tests {
   #[test]
   fn a_database_rule_states_no_allow_entries() {
     let mut cfg = cfg_with_db(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=require",
+      "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=require", // betterleaks:allow
     );
     cfg.rules.get_mut("t").unwrap().allow = vec!["https://api.github.com".to_string()];
     let err = resolve(&cfg).unwrap_err().to_string();
@@ -1330,22 +1330,22 @@ mod tests {
   fn database_strings_need_their_credentials() {
     // Both strings carry a password: a string with no credential maps
     // nothing.
-    let cfg = cfg_with_db("postgres://app@db.internal:5432/main", "postgres://app:real@db.internal:5432/main");
+    let cfg = cfg_with_db("postgres://app@db.internal:5432/main", "postgres://app:real@db.internal:5432/main"); // betterleaks:allow
     let err = resolve(&cfg).unwrap_err().to_string();
     assert!(err.contains("the password is required"), "{err}");
-    let cfg = cfg_with_db("postgres://app:fake@db.internal:5432/main", "postgres://app@db.internal:5432/main");
+    let cfg = cfg_with_db("postgres://app:fake@db.internal:5432/main", "postgres://app@db.internal:5432/main"); // betterleaks:allow
     let err = resolve(&cfg).unwrap_err().to_string();
     assert!(err.contains("the password is required"), "{err}");
     // A schemed value that is not a connection string fails: the URL
     // mandate is enforced at parse. A bare token is a different kind of
     // rule, not a database rule at all.
-    let cfg = cfg_with_db("postgres://app:fake@/main", "postgres://app:real@db.internal:5432/main");
+    let cfg = cfg_with_db("postgres://app:fake@/main", "postgres://app:real@db.internal:5432/main"); // betterleaks:allow
     let err = resolve(&cfg).unwrap_err().to_string();
     assert!(err.contains("empty host"), "{err}");
     // Without the secret-source real string there is no grant at all.
     let mut cfg = cfg_with_db(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main",
+      "postgres://app:fake@db.internal:5432/main", // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main", // betterleaks:allow
     );
     cfg.rules.get_mut("t").unwrap().real = None;
     let resolved = resolve(&cfg).unwrap();

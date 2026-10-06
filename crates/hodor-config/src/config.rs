@@ -635,11 +635,6 @@ fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) 
 ///
 /// Returns an error on an inheritance cycle, an invalid parent name, a
 /// parent no layer holds, or a parent on the shared base.
-///
-/// # Panics
-///
-/// Never panics: the chain starts at one element and the loop only appends,
-/// so `chain.last()` always finds a name.
 pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &str) -> Result<Vec<String>, Error> {
   if !valid_profile(selected) {
     return Err(Error::BadProfileName {
@@ -647,8 +642,8 @@ pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &s
     });
   }
   let mut chain = vec![selected.to_string()];
+  let mut name = selected.to_string();
   loop {
-    let name = chain.last().expect("the chain never empties").clone();
     if name == SHARED_PROFILE {
       profile_parent(project, global, &name)?;
       break;
@@ -664,7 +659,8 @@ pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &s
         parent: parent.clone(),
       });
     }
-    chain.push(parent);
+    chain.push(parent.clone());
+    name = parent;
   }
   let held = [project, global].into_iter().flatten().any(|layer| layer.join(selected).is_dir());
   if !held && selected != SHARED_PROFILE {
@@ -899,11 +895,14 @@ fn fill_encoding(seed: &str, encoding: Encoding, count: usize) -> String {
     match encoding {
       Encoding::Hex => out.push_str(&hex::encode(digest)),
       Encoding::Decimal => {
-        let word = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
-        out.push_str(&word.to_string());
+        let head: [u8; 4] = digest.get(..4).and_then(|bytes| bytes.try_into().ok()).unwrap_or([0; 4]);
+        out.push_str(&u32::from_be_bytes(head).to_string());
       }
       Encoding::Base62 => {
-        let word: [u8; 16] = digest[0..16].try_into().expect("16 digest bytes");
+        let mut word = [0u8; 16];
+        if let (Some(bytes), Some(slot)) = (digest.get(..16), word.get_mut(..16)) {
+          slot.copy_from_slice(bytes);
+        }
         out.push_str(&base62::encode(u128::from_be_bytes(word)));
       }
     }
@@ -920,11 +919,10 @@ fn fill_encoding(seed: &str, encoding: Encoding, count: usize) -> String {
 /// `reference_samples_name_every_setting` fails when the serializer then
 /// hides one. No production type carries reference-only baggage.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Only on serialization of in-repo literals, which the suite catches.
-#[must_use]
-pub fn reference_samples() -> String {
+/// Returns an error when the in-repo sample literals fail to serialize.
+pub fn reference_samples() -> Result<String, Error> {
   #[derive(Serialize)]
   struct Samples<'a> {
     rules: BTreeMap<&'a str, RuleCfg>,
@@ -1009,8 +1007,8 @@ pub fn reference_samples() -> String {
   };
   let mut out = String::from("\n# ── Map-valued tables: one sample entry each; copy and rename the key ──\n\n");
   out.push_str("# `value` and `real` never serialize (secrets): `value` is the inline\n# real secret (or the database rule's FAKE postgres:// URL), `real` is the\n# database rule's REAL string, resolved from the secret source.\n\n");
-  out.push_str(&toml::to_string_pretty(&samples).expect("in-repo literals always serialize"));
-  out
+  out.push_str(&toml::to_string_pretty(&samples).map_err(|source| Error::SerializeSamples { source })?);
+  Ok(out)
 }
 
 #[cfg(test)]
@@ -1576,7 +1574,7 @@ allow = ["https://b.example"]
   /// there; this test then fails if a skip attribute hides it anyway.
   #[test]
   fn reference_samples_name_every_setting() {
-    let samples = reference_samples();
+    let samples = reference_samples().expect("in-repo literals serialize");
     for name in [
       "[rules.example]",
       "env",

@@ -7,6 +7,7 @@ use hodor_config::Error as ConfigError;
 use hodor_config::config::RewriteFormat;
 use hodor_fnox::Error as FnoxError;
 use serde_yaml::Error as YamlError;
+use toml::ser::Error as TomlSerializeError;
 use toml_edit::TomlError;
 
 /// Every way stack generation and workspace commands can fail.
@@ -86,6 +87,20 @@ pub enum Error {
     /// Underlying I/O failure.
     #[source]
     source: IoError,
+  },
+  /// A grant fragment fails to serialize.
+  #[error("serializing a grant fragment: {source}")]
+  SerializeFragment {
+    /// Underlying serialization failure.
+    #[source]
+    source: TomlSerializeError,
+  },
+  /// A decoy document fails to serialize.
+  #[error("serializing a decoy document: {source}")]
+  SerializeDecoy {
+    /// Underlying serialization failure.
+    #[source]
+    source: YamlError,
   },
   /// A config value does not expand.
   #[error("failed to expand config value: {detail}")]

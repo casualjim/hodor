@@ -65,7 +65,7 @@ pub async fn run_tproxy(state: Arc<ProxyState>, allow_root_netns: bool) -> Resul
   .await
 }
 
-/// Test seams over [`run_tproxy`].
+/// Test overrides over [`run_tproxy`].
 #[derive(Debug, Default)]
 pub(crate) struct Options {
   /// Restrict the OUTPUT mark rule to one exact destination address, so

@@ -862,7 +862,12 @@ fn ambient_ca(owned: &mut Option<CertAuthority>) -> Result<&CertAuthority, Error
     let ca = load_or_generate(&ca_path).map_err(|source| Error::GuestCa { path: ca_path, source })?;
     *owned = Some(ca);
   }
-  Ok(owned.as_ref().expect("just inserted"))
+  match owned.as_ref() {
+    Some(ca) => Ok(ca),
+    None => Err(Error::ConfigDir {
+      detail: "the ambient CA slot is empty after the ambient pass filled it".to_string(),
+    }),
+  }
 }
 
 /// The source path one `KUBECONFIG`-style override names, or the default

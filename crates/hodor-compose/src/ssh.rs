@@ -108,7 +108,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
           },
         )]),
       },
-    );
+    )?;
     let decoy_key = decoy.to_openssh()?;
     let container = if let Ok(container) = mirror_container_path(identity, host_home, home) {
       container

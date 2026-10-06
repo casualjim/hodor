@@ -194,7 +194,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       tls: allows.iter().map(|allow| (allow.clone(), tls.clone())).collect(),
       ssh: BTreeMap::new(),
     },
-  );
+  )?;
   let decoy = render_decoy(&DecoyDoc {
     context: doc.context.clone(),
     contexts: BTreeMap::from([(
@@ -207,7 +207,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
         key: STANDARD.encode(&guest_key),
       },
     )]),
-  });
+  })?;
   Ok(RewriteAdapted {
     fragment,
     decoy,

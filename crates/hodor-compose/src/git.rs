@@ -372,7 +372,7 @@ fn ssh_mint(source: &Path, config: &GitConfig, endpoint: &ForgeEndpoint, home: &
         },
       )]),
     },
-  );
+  )?;
   let decoy_key = decoy.to_openssh()?;
   let container = if let Ok(container) = mirror_container_path(&identity, host_home, home) {
     container

@@ -256,7 +256,7 @@ impl CliCommand for ConfigArgs {
     print!(
       "{}{}",
       confique::toml::template::<AppConfig>(FormatOptions::default()),
-      reference_samples()
+      reference_samples().map_err(Report::from)?
     );
     Ok(())
   }

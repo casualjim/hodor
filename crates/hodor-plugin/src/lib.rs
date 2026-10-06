@@ -66,8 +66,9 @@ pub enum Verdict {
 /// Universal stage interface for one rewrite direction of one connection.
 ///
 /// The in-core value swap is stage 0; a plugin hook runs after it. This
-/// change wires WASM plugins through the trait; the swap can migrate behind
-/// it later without touching call sites again.
+/// trait is the plugin boundary: the relay depends on the interface, never
+/// on the wasmtime-backed implementation, so guests stay boxed behind the
+/// sandbox host.
 pub trait RewriteHook: Send {
   /// Rewrite one message head in place.
   fn rewrite_head<'a>(&'a mut self, head: &'a mut Head) -> BoxFuture<'a, Verdict>;
@@ -186,7 +187,11 @@ fn world_supports(support: WorldSupport, leg: Direction) -> bool {
 /// Fresh store with fuel-independent sandbox limits, fuel, and epoch armed.
 ///
 /// Per-call `arm` refreshes fuel and deadline before every guest call.
-fn scratch_store(engine: &Engine) -> Store<PluginStoreData> {
+///
+/// # Errors
+///
+/// Returns an error when the engine rejects the initial fuel allocation.
+fn scratch_store(engine: &Engine) -> Result<Store<PluginStoreData>, Error> {
   let limits = StoreLimitsBuilder::new()
     .memory_size(GUEST_MEMORY_BYTES)
     .table_elements(GUEST_TABLE_ELEMENTS)
@@ -206,9 +211,9 @@ fn scratch_store(engine: &Engine) -> Store<PluginStoreData> {
   store.limiter(|data| &mut data.limits);
   // Instantiation itself burns fuel and runs under the epoch: arm both
   // here; per-call `arm` refreshes them before every guest call.
-  store.set_fuel(FUEL_PER_CALL).expect("fuel metering is configured on the engine");
+  store.set_fuel(FUEL_PER_CALL).map_err(|origin| Error::FuelArm { origin })?;
   store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
-  store
+  Ok(store)
 }
 
 /// Probe which rewrite world(s) a component implements.
@@ -228,8 +233,8 @@ fn probe_world(engine: &Engine, component: &Component, name: &str) -> Result<Wor
     name: name.to_string(),
     origin: err,
   })?;
-  let request = bindings::request::Request::instantiate(&mut scratch_store(engine), component, &linker);
-  let response = bindings::response::Response::instantiate(&mut scratch_store(engine), component, &linker);
+  let request = bindings::request::Request::instantiate(&mut scratch_store(engine)?, component, &linker);
+  let response = bindings::response::Response::instantiate(&mut scratch_store(engine)?, component, &linker);
   match (&request, &response) {
     (Ok(_), Ok(_)) => Ok(WorldSupport::Both),
     (Ok(_), Err(_)) => Ok(WorldSupport::Request),
@@ -381,37 +386,38 @@ impl PluginInstance {
   ///
   /// Returns an error when the component does not implement the selected
   /// leg's world or instantiation traps.
-  async fn ensure_running(&mut self) -> Result<&mut Running, Error> {
-    if self.running.is_none() {
-      let mut store = scratch_store(&self.engine);
-      let mut linker = Linker::new(&self.engine);
-      wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|err| Error::WasiLinker {
-        name: self.name.clone(),
-        origin: err,
-      })?;
-      let running = match self.leg {
-        Direction::Request => {
-          let instance = RunningRequest::instantiate_async(&mut store, &self.component, &linker)
-            .await
-            .map_err(|err| Error::RequestInstantiate {
-              name: self.name.clone(),
-              origin: err,
-            })?;
-          Running::Request { store, instance }
-        }
-        Direction::Response => {
-          let instance = RunningResponse::instantiate_async(&mut store, &self.component, &linker)
-            .await
-            .map_err(|err| Error::ResponseInstantiate {
-              name: self.name.clone(),
-              origin: err,
-            })?;
-          Running::Response { store, instance }
-        }
-      };
-      self.running = Some(running);
+  async fn ensure_running(&mut self) -> Result<(), Error> {
+    if self.running.is_some() {
+      return Ok(());
     }
-    Ok(self.running.as_mut().expect("guest installed above"))
+    let mut store = scratch_store(&self.engine)?;
+    let mut linker = Linker::new(&self.engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|err| Error::WasiLinker {
+      name: self.name.clone(),
+      origin: err,
+    })?;
+    let running = match self.leg {
+      Direction::Request => {
+        let instance = RunningRequest::instantiate_async(&mut store, &self.component, &linker)
+          .await
+          .map_err(|err| Error::RequestInstantiate {
+            name: self.name.clone(),
+            origin: err,
+          })?;
+        Running::Request { store, instance }
+      }
+      Direction::Response => {
+        let instance = RunningResponse::instantiate_async(&mut store, &self.component, &linker)
+          .await
+          .map_err(|err| Error::ResponseInstantiate {
+            name: self.name.clone(),
+            origin: err,
+          })?;
+        Running::Response { store, instance }
+      }
+    };
+    self.running = Some(running);
+    Ok(())
   }
   /// Arm per-call budgets: fresh fuel and epoch deadline every call.
   /// `false` means fuel metering is off, which must never happen; the
@@ -457,7 +463,12 @@ impl RewriteHook for PluginInstance {
   fn rewrite_head<'a>(&'a mut self, head: &'a mut Head) -> BoxFuture<'a, Verdict> {
     Box::pin(async move {
       let name = self.name.clone();
-      let Ok(running) = self.ensure_running().await else {
+      if self.ensure_running().await.is_err() {
+        return fail_closed(&name);
+      }
+      // The slot was filled just above; an empty read still fails closed
+      // rather than panicking.
+      let Some(running) = self.running.as_mut() else {
         return fail_closed(&name);
       };
       match (running, &mut *head) {
@@ -512,7 +523,10 @@ impl RewriteHook for PluginInstance {
   fn rewrite_trailers<'a>(&'a mut self, headers: &'a mut Vec<Header>) -> BoxFuture<'a, Verdict> {
     Box::pin(async move {
       let name = self.name.clone();
-      let Ok(running) = self.ensure_running().await else {
+      if self.ensure_running().await.is_err() {
+        return fail_closed(&name);
+      }
+      let Some(running) = self.running.as_mut() else {
         return fail_closed(&name);
       };
       match running {
@@ -549,7 +563,10 @@ impl RewriteHook for PluginInstance {
   fn rewrite_chunk<'a>(&'a mut self, data: &'a mut Vec<u8>, eof: bool) -> BoxFuture<'a, Verdict> {
     Box::pin(async move {
       let name = self.name.clone();
-      let Ok(running) = self.ensure_running().await else {
+      if self.ensure_running().await.is_err() {
+        return fail_closed(&name);
+      }
+      let Some(running) = self.running.as_mut() else {
         return fail_closed(&name);
       };
       match running {

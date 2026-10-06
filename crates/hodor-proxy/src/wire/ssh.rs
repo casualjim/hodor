@@ -26,15 +26,22 @@ use russh::server::Config as ServerConfig;
 use russh::server::Msg as ServerMsg;
 use russh::server::Session;
 use russh::server::run_stream;
+use std::io::Error as IoError;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 
 use crate::Error;
 use crate::connection::dial_marked;
+
+/// Inactivity timeout for both legs, as a multiple of the handshake budget:
+/// an agent session idles far longer than a handshake takes, so the window
+/// has to outlive the budget or long-lived sessions die mid-thought.
+const INACTIVITY_BUDGET_MULTIPLE: u32 = 60;
 
 /// Everything one guest connection bridges between: the guest leg's trust,
 /// the upstream leg's identity, and where the upstream session dials.
@@ -122,7 +129,7 @@ impl SshLegs {
   {
     let config = Arc::new(ServerConfig {
       keys: vec![(*self.host_key).clone()],
-      inactivity_timeout: Some(budget * 60),
+      inactivity_timeout: Some(budget * INACTIVITY_BUDGET_MULTIPLE),
       ..ServerConfig::default()
     });
     let handler = Guest {
@@ -169,7 +176,15 @@ impl russh::server::Handler for Guest {
     Ok(Auth::reject())
   }
   async fn channel_open_session(&mut self, mut channel: Channel<ServerMsg>, session: &mut Session) -> Result<bool, Self::Error> {
-    let upstream = self.upstream().await?;
+    if self.upstream.is_none() {
+      let handle = self.dial_upstream().await?;
+      self.upstream = Some(handle);
+    }
+    // The slot was filled just above; an empty read still closes the
+    // channel quietly instead of panicking.
+    let Some(upstream) = self.upstream.as_ref() else {
+      return Ok(false);
+    };
     let remote = upstream.channel_open_session().await?;
     let (mut read, write) = remote.split();
     let guest_id = channel.id();
@@ -231,38 +246,34 @@ impl russh::server::Handler for Guest {
 }
 
 impl Guest {
-  /// The upstream session, dialed and authenticated on first use: the real
-  /// identity presented, the server verified against the pinned host keys.
-  async fn upstream(&mut self) -> Result<&Handle<UpstreamLeg>, RusshError> {
-    if self.upstream.is_none() {
-      let legs = self.legs.clone();
-      let budget = self.budget;
-      let user = self.user.clone();
-      let handle = tokio::time::timeout(budget, async move {
-        let stream = dial_marked(&legs.upstream.host, legs.upstream.port, legs.upstream.fwmark)
-          .await
-          .map_err(|source| RusshError::IO(std::io::Error::other(source.to_string())))?;
-        let config = Arc::new(ClientConfig {
-          inactivity_timeout: Some(budget * 60),
-          ..ClientConfig::default()
-        });
-        let handler = UpstreamLeg {
-          known_hosts: legs.known_hosts.clone(),
-          name: legs.upstream.name.clone(),
-          port: legs.upstream.port,
-        };
-        let mut handle = connect_stream(config, stream, handler).await?;
-        let auth = PrivateKeyWithHashAlg::new(legs.identity, None);
-        if !handle.authenticate_publickey(user, auth).await?.success() {
-          return Err(RusshError::UnknownKey);
-        }
-        Ok(handle)
-      })
-      .await
-      .map_err(RusshError::Elapsed)??;
-      self.upstream = Some(handle);
-    }
-    Ok(self.upstream.as_ref().expect("just set"))
+  /// Dial and authenticate the upstream session once per guest connection:
+  /// the real identity presented, the server verified against the pinned
+  /// host keys, the whole dial under the handshake budget.
+  async fn dial_upstream(&self) -> Result<Handle<UpstreamLeg>, RusshError> {
+    let legs = self.legs.clone();
+    let budget = self.budget;
+    let user = self.user.clone();
+    let dial = async move {
+      let stream = dial_marked(&legs.upstream.host, legs.upstream.port, legs.upstream.fwmark)
+        .await
+        .map_err(russh_io)?;
+      let config = Arc::new(ClientConfig {
+        inactivity_timeout: Some(budget * INACTIVITY_BUDGET_MULTIPLE),
+        ..ClientConfig::default()
+      });
+      let handler = UpstreamLeg {
+        known_hosts: legs.known_hosts.clone(),
+        name: legs.upstream.name.clone(),
+        port: legs.upstream.port,
+      };
+      let mut handle = connect_stream(config, stream, handler).await?;
+      let auth = PrivateKeyWithHashAlg::new(legs.identity, None);
+      if !handle.authenticate_publickey(user, auth).await?.success() {
+        return Err(RusshError::UnknownKey);
+      }
+      Ok(handle)
+    };
+    tokio::time::timeout(budget, dial).await.map_err(RusshError::Elapsed)?
   }
 }
 
@@ -311,6 +322,13 @@ async fn forward_guest_message(upstream: &ChannelWriteHalf<ClientMsg>, message: 
   };
   !closed && !failed
 }
+/// Russh's handler traits fix their error type; `IO` is the only carrier
+/// that reaches the caller with a message. One wrapper keeps the erasure
+/// deliberate instead of scattering it.
+fn russh_io(source: impl std::fmt::Display) -> RusshError {
+  RusshError::IO(IoError::other(source.to_string()))
+}
+
 /// The upstream leg: OpenSSH `accept-new`. A first-seen host key is
 /// recorded in hodor's own `known_hosts` — ssh's mechanism is the allowlist —
 /// a matching pin verifies, and a changed key on a known host fails.
@@ -324,11 +342,9 @@ impl russh::client::Handler for UpstreamLeg {
   type Error = RusshError;
 
   async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
-    let pinned = pinned_host_keys(&self.name, self.port, &self.known_hosts)
-      .map_err(|source| RusshError::IO(std::io::Error::other(source.to_string())))?;
+    let pinned = pinned_host_keys(&self.name, self.port, &self.known_hosts).map_err(russh_io)?;
     if pinned.is_empty() {
-      append_known_host(&self.name, self.port, server_public_key, &self.known_hosts)
-        .map_err(|source| RusshError::IO(std::io::Error::other(source.to_string())))?;
+      append_known_host(&self.name, self.port, server_public_key, &self.known_hosts).map_err(russh_io)?;
       return Ok(true);
     }
     Ok(pinned.iter().any(|(_, known)| known == server_public_key))

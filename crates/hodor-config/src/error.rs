@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use confique::Error as ConfiqueError;
 use serde_json::Error as JsonError;
 use toml::de::Error as TomlError;
+use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 
 /// Every way config loading, validation, and grant resolution can fail.
@@ -71,6 +72,13 @@ pub enum Error {
   /// A rule states an empty inline value.
   #[error("rule `{label}`: `value` must not be empty")]
   EmptyValue {
+    /// Rule label.
+    label: String,
+  },
+  /// A database rule states no fake `value` string; the connection string
+  /// is the grant and one side cannot be missing.
+  #[error("rule `{label}`: a database rule states no `value` string")]
+  DatabaseValueMissing {
     /// Rule label.
     label: String,
   },
@@ -251,16 +259,15 @@ pub enum Error {
     provider: String,
   },
   /// An `oauth2` URL does not parse.
-  #[error("{origin}: `{name}`: bad oauth2 url `{url}`: {detail}")]
+  #[error("{origin}: `{name}`: {source}")]
   BadOAuthUrl {
     /// Config origin.
     origin: String,
     /// Entry name.
     name: String,
-    /// Offending URL.
-    url: String,
-    /// Parse failure.
-    detail: String,
+    /// Why the URL is unusable.
+    #[source]
+    source: Box<Error>,
   },
   /// An `authorization_code` flow lacks its `authorize_url`.
   #[error("{origin}: `{name}`: `authorization_code` flow needs an `authorize_url`")]
@@ -410,5 +417,12 @@ pub enum Error {
     label: String,
     /// Offending key.
     key: String,
+  },
+  /// The in-repo reference samples fail to serialize.
+  #[error("serializing the reference samples: {source}")]
+  SerializeSamples {
+    /// Underlying serialization failure.
+    #[source]
+    source: TomlSerializeError,
   },
 }

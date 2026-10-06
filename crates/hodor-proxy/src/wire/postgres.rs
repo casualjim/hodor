@@ -42,10 +42,6 @@ enum PgState {
 pub(crate) struct Postgres {
   state: PgState,
   inner: Raw,
-  #[cfg_attr(not(test), allow(dead_code, reason = "read once two-phase startup identity matching lands"))]
-  user: Option<String>,
-  #[cfg_attr(not(test), allow(dead_code, reason = "read once two-phase startup identity matching lands"))]
-  database: Option<String>,
   reply: Option<Vec<u8>>,
   /// The upstream user, when the two legs of the rule name different users:
   /// the startup's `user` parameter is rewritten to it northbound.
@@ -64,8 +60,6 @@ impl Postgres {
     Self {
       state,
       inner: Raw::new(grants, Scheme::Postgres, host, port, dir),
-      user: None,
-      database: None,
       reply: None,
       user_rewrite: grants.iter().find_map(|grant| grant.database(Some(host), port)).and_then(|scope| {
         if scope.upstream.user.is_some() && scope.upstream.user != scope.downstream.user {
@@ -76,18 +70,6 @@ impl Postgres {
       }),
       closed: false,
     }
-  }
-
-  /// Startup `user` parameter, once a v3 greeting completes.
-  #[cfg(test)]
-  fn user(&self) -> Option<&str> {
-    self.user.as_deref()
-  }
-
-  /// Startup `database` parameter, once a v3 greeting completes.
-  #[cfg(test)]
-  fn database(&self) -> Option<&str> {
-    self.database.as_deref()
   }
 
   /// Feed one request-leg chunk through the greeting parser. Upstream-bound
@@ -119,7 +101,7 @@ impl Postgres {
         continue;
       }
       let mut msg = self.take_greeting(len);
-      if !self.read_startup(&msg) {
+      if !Self::read_startup(&msg) {
         self.closed = true;
         return (Cow::Borrowed(&[]), Vec::new());
       }
@@ -188,24 +170,15 @@ impl Postgres {
     std::mem::take(buf)
   }
 
-  /// Decode one `StartupMessage` with pgwire and keep user/database.
-  /// `false` is undecodable: fail closed. Non-v3 majors relay untouched
-  /// with no identity extracted; only v3 shares the parameter layout.
-  fn read_startup(&mut self, msg: &[u8]) -> bool {
-    if msg.len() < 8 {
-      return false;
-    }
-    let mut body = BytesMut::from(&msg[4..]);
-    let ctx = DecodeContext::default();
-    let Ok(startup) = Startup::decode_body(&mut body, msg.len() - 4, &ctx) else {
+  /// Decode one `StartupMessage` with pgwire; `false` is undecodable, so the
+  /// connection fails closed. Any protocol major that decodes relays: the
+  /// parameter block is framed from here, never re-parsed.
+  fn read_startup(msg: &[u8]) -> bool {
+    let Some(tail) = msg.get(4..) else {
       return false;
     };
-    if startup.protocol_number_major != Startup::PG_PROTOCOL_LATEST {
-      return true;
-    }
-    self.user = startup.parameters.get("user").cloned();
-    self.database = startup.parameters.get("database").cloned();
-    true
+    let mut body = BytesMut::from(tail);
+    Startup::decode_body(&mut body, tail.len(), &DecodeContext::default()).is_ok()
   }
 }
 
@@ -434,13 +407,11 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn greeting_extracts_identity_and_relays() {
+  async fn greeting_decodes_and_relays_untouched() {
     let mut machine = request_leg();
     let msg = startup("app", "main");
     let (out, _) = cow_feed(&mut machine, &msg).await;
     assert_eq!(out.as_ref(), msg.as_slice());
-    assert_eq!(machine.user(), Some("app"));
-    assert_eq!(machine.database(), Some("main"));
     assert!(!machine.must_close());
   }
 
@@ -453,7 +424,6 @@ mod tests {
     assert!(!machine.must_close());
     let (out, _) = cow_feed(&mut machine, &msg[5..]).await;
     assert_eq!(out.as_ref(), msg.as_slice());
-    assert_eq!(machine.user(), Some("app"));
   }
 
   #[tokio::test]
@@ -466,7 +436,6 @@ mod tests {
     let (out, _) = cow_feed(&mut machine, &hello).await;
     assert_eq!(out.as_ref(), greeting.as_slice());
     assert_eq!(machine.take_reply(), Some(b"N".to_vec()));
-    assert_eq!(machine.user(), Some("app"));
   }
 
   #[tokio::test]
@@ -510,6 +479,5 @@ mod tests {
     let mut machine = Postgres::new(&[pg_grant()], "db.internal", 5432, Direction::Upstream);
     let (out, _) = cow_feed(&mut machine, b"R................").await;
     assert_eq!(out.as_ref(), b"R................");
-    assert!(machine.user().is_none());
   }
 }

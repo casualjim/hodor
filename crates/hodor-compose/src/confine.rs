@@ -78,7 +78,7 @@ pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> Result<Vec<(Pa
     Ok(_) => files.push((ca, created)),
     // A read-only or unwritable config directory only warns: the stack still
     // starts when a compose layer mounts a CA made with `hodor ca`.
-    Err(err) => println!("warning: could not prepare {}: {err}", dir.join("ca.pem").display()),
+    Err(err) => tracing::warn!(path = %ca.display(), %err, "could not prepare the CA"),
   }
   files.push((entrypoint.clone(), write_entrypoint(&entrypoint)?));
   // The agent's inner container storage — see the generated compose file for
@@ -86,7 +86,7 @@ pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> Result<Vec<(Pa
   let storage_created = !storage.exists();
   match fs::create_dir_all(storage) {
     Ok(()) => files.push((storage.to_path_buf(), storage_created)),
-    Err(err) => println!("warning: could not prepare {}: {err}", storage.display()),
+    Err(err) => tracing::warn!(path = %storage.display(), %err, "could not prepare the agent storage directory"),
   }
   Ok(files)
 }

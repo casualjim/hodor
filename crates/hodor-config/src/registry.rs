@@ -399,8 +399,7 @@ pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> Result<(), E
     let authority = flow_authority(url).map_err(|err| Error::BadOAuthUrl {
       origin: source.to_string(),
       name: name.to_string(),
-      url: url.clone(),
-      detail: err,
+      source: Box::new(err),
     })?;
     if matches!(authority, HostPat::Any) {
       tracing::warn!(
@@ -439,15 +438,21 @@ pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> Result<(), E
 
 /// Endpoint URLs are full URLs; grants are authority-only. Parse the URL,
 /// then reduce it to its host pattern for the exfil-risk warning.
-fn flow_authority(url: &str) -> Result<HostPat, String> {
-  let parsed = Url::parse(url).map_err(|err| err.to_string())?;
+fn flow_authority(url: &str) -> Result<HostPat, Error> {
+  let parsed = Url::parse(url).map_err(|source| Error::BadUrlParse {
+    url: url.to_string(),
+    source,
+  })?;
   let host = match parsed.host() {
     Some(Host::Domain("*")) => HostPat::Any,
-    Some(Host::Domain(domain)) if domain.starts_with("*.") => HostPat::Wildcard(domain[1..].to_string()),
+    Some(Host::Domain(domain)) if domain.starts_with("*.") => match domain.get(1..) {
+      Some(pattern) => HostPat::Wildcard(pattern.to_string()),
+      None => HostPat::Exact(domain.to_string()),
+    },
     Some(Host::Domain(domain)) => HostPat::Exact(domain.to_string()),
     Some(Host::Ipv4(addr)) => HostPat::Exact(addr.to_string()),
     Some(Host::Ipv6(addr)) => HostPat::Exact(addr.to_string()),
-    None => return Err("empty host".to_string()),
+    None => return Err(Error::BadUrlHost { url: url.to_string() }),
   };
   Ok(host)
 }

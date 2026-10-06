@@ -666,11 +666,6 @@ pub struct ResolvedConfig {
 ///
 /// Returns an error when an `allow` entry is not a valid URI grant, or when
 /// one rule mixes endpoint and database entries.
-///
-/// # Panics
-///
-/// Panics when a database rule states no value; [`crate::config::Rule::is_database`]
-/// guarantees one, so this is a programmer error, not a config error.
 pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
   let mut grants = Vec::with_capacity(cfg.rules.len());
   for (label, rule) in &cfg.rules {
@@ -687,7 +682,10 @@ pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
         tracing::warn!(label, env = %rule.env, "rule has no resolved real connection string; no grant");
         continue;
       };
-      let fake = rule.value.as_ref().expect("is_database checked a value").expose_secret();
+      let Some(fake) = rule.value.as_ref() else {
+        return Err(Error::DatabaseValueMissing { label: label.clone() });
+      };
+      let fake = fake.expose_secret();
       let mut scope = DatabaseScope::from_strings(fake, real.expose_secret()).map_err(|err| Error::DatabaseScope {
         label: label.clone(),
         detail: err,

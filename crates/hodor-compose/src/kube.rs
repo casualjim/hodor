@@ -302,7 +302,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       tls: BTreeMap::from([(cluster.cluster.server.clone(), blobs.tls)]),
       ssh: BTreeMap::new(),
     },
-  );
+  )?;
   let decoy = render_decoy(&DecoyDoc::kube(
     &doc.current_context,
     cluster,
@@ -311,7 +311,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     token.map(|_| decoy_token.as_str()),
     &blobs.guest_cert,
     &blobs.guest_key,
-  ));
+  ))?;
   Ok(Some(RewriteAdapted {
     fragment,
     decoy,

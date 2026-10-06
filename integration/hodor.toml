@@ -27,6 +27,18 @@ root_cert = "/certs/ca.crt"
 [rules.demo.tls."https://api:9443"]
 root_cert = "/certs/ca.crt"
 
+# SSH: its own rule — an ssh rule's allow entries are all ssh, the two key
+# blobs ride the entry, and host keys are accept-new on both legs, so
+[rules.ssh]
+env = "SSH_KEY"
+registry = false
+if_missing = "ignore"
+allow = ["ssh://10.202.0.40:22"]
+
+[rules.ssh.ssh."ssh://10.202.0.40:22"]
+identity = "/certs/ssh/identity"
+guest_key = "/certs/ssh/decoy.pub"
+
 # Real PostgreSQL on the server net, as a connection-string rule: the rule
 # states only the fake — a proper `postgres://` URL, so the env var the
 # guest reads holds a URL — and the real connection string lives in the

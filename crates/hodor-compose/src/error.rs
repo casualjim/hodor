@@ -7,6 +7,7 @@ use hodor_config::Error as ConfigError;
 use hodor_config::config::RewriteFormat;
 use hodor_fnox::Error as FnoxError;
 use serde_yaml::Error as YamlError;
+use toml::ser::Error as TomlSerializeError;
 use toml_edit::TomlError;
 
 /// Every way stack generation and workspace commands can fail.
@@ -86,6 +87,20 @@ pub enum Error {
     /// Underlying I/O failure.
     #[source]
     source: IoError,
+  },
+  /// A grant fragment fails to serialize.
+  #[error("serializing a grant fragment: {source}")]
+  SerializeFragment {
+    /// Underlying serialization failure.
+    #[source]
+    source: TomlSerializeError,
+  },
+  /// A decoy document fails to serialize.
+  #[error("serializing a decoy document: {source}")]
+  SerializeDecoy {
+    /// Underlying serialization failure.
+    #[source]
+    source: YamlError,
   },
   /// A config value does not expand.
   #[error("failed to expand config value: {detail}")]
@@ -167,6 +182,14 @@ pub enum Error {
     /// What fails to map.
     detail: String,
   },
+  /// An ambient derivation source does not map onto grants or a decoy twin.
+  #[error("derived source `{}`: {detail}", file.display())]
+  SourceInvalid {
+    /// The source file the derivation read.
+    file: PathBuf,
+    /// What fails to map.
+    detail: String,
+  },
   /// A mise file does not parse.
   #[error("parse mise.local.toml: {source}")]
   MiseParse {
@@ -207,13 +230,6 @@ pub enum Error {
   ComposeFailed {
     /// Exit status.
     status: String,
-  },
-  /// The workspace rules do not generate.
-  #[error("generate the workspace rules: {source}")]
-  GenerateRules {
-    /// Underlying generation failure.
-    #[source]
-    source: Box<Error>,
   },
   /// A file mode cannot be set.
   #[error("chmod {}: {source}", path.display())]

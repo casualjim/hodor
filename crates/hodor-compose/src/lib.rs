@@ -8,8 +8,11 @@ mod adapt;
 mod confine;
 mod error;
 mod expand;
+mod git;
+mod jj;
 mod kube;
 mod paths;
+mod ssh;
 mod stack;
 mod talos;
 
@@ -26,7 +29,7 @@ mod tests {
   use std::slice::from_ref;
 
   use hodor_config::cli::{Cli, ProxyBackend};
-  use hodor_config::config::{FileRewrite, RewriteFormat, ToolCfg};
+  use hodor_config::config::{FileRewrite, RewriteFormat, RuleCfg, ToolCfg, fake_for};
   use tempfile::tempdir;
 
   use crate::confine::*;
@@ -38,7 +41,7 @@ mod tests {
     vec![
       Decoy {
         env: "GITHUB_TOKEN".to_string(),
-        value: "ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3".to_string(),
+        value: fake_for("GITHUB_TOKEN", None),
       },
       Decoy {
         env: "ANTHROPIC_API_KEY".to_string(),
@@ -101,13 +104,12 @@ mod tests {
   }
 
   #[test]
-  fn rules_toml_lists_every_env_without_values() {
+  fn rules_toml_lists_what_derives_automatically() {
     let toml = rules_toml(&decoys(), &[], &[]);
-    assert!(toml.contains("[rules.github_token]"), "{toml}");
-    assert!(toml.contains("env = \"GITHUB_TOKEN\""), "{toml}");
-    assert!(toml.contains("[rules.anthropic_api_key]"), "{toml}");
-    assert!(toml.contains("#   allow = [\"https://api.internal.example.com\"]"), "{toml}");
+    assert!(toml.contains("#   GITHUB_TOKEN"), "{toml}");
+    assert!(toml.contains("#   ANTHROPIC_API_KEY"), "{toml}");
     assert!(!toml.contains("value ="), "{toml}");
+    assert!(!toml.contains("\n[rules."), "{toml}");
   }
 
   #[test]
@@ -140,7 +142,6 @@ mod tests {
     assert!(toml.contains("# [rules.argo_cd_token]"), "{toml}");
     assert!(toml.contains("# env = \"ARGO_CD_TOKEN\""), "{toml}");
     assert!(toml.contains("# allow = [\"https://<your-host>\"]"), "{toml}");
-    assert!(!toml.contains("\n[rules.argo_cd_token]"), "{toml}");
     assert!(toml.contains("# TAVILY_API_KEY"), "{toml}");
   }
 
@@ -523,10 +524,7 @@ mod tests {
     assert!(yaml.contains(":/certs/ca.pem"), "the CA is mounted for hodor: {yaml}");
     assert!(!yaml.contains("/root/.config/fnox"), "no fnox mount without binds to mount: {yaml}");
     assert!(yaml.contains("init: true"), "{yaml}");
-    assert!(
-      yaml.contains("GITHUB_TOKEN: \"ghp_2641386f5e0c6b9ea7b79c738a1015a9bc3a9ae3\""),
-      "{yaml}"
-    );
+    assert!(yaml.contains(&format!("GITHUB_TOKEN: \"{}\"", decoys()[0].value)), "{yaml}");
   }
 
   #[test]
@@ -629,6 +627,30 @@ mod tests {
       Some(value) => set_env(key, value),
       None => unset_env(key),
     }
+  }
+
+  #[test]
+  fn rules_d_overrides_mount_into_the_hodor_service() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let rules_d = config_dir.path().join("rules.d");
+    std::fs::create_dir_all(&rules_d).unwrap();
+    std::fs::write(
+      rules_d.join("gitea.toml"),
+      "[names.GITEA_TOKEN]\nhosts = [\"https://code.lotsa.ai\"]\n",
+    )
+    .unwrap();
+
+    let binds = fnox_binds(None, Some(config_dir.path()));
+    let rendered: Vec<String> = binds
+      .mounts
+      .iter()
+      .map(|entry| format!("{}:{}:ro", entry.host.display(), entry.container.display()))
+      .collect();
+    assert_eq!(
+      rendered,
+      vec![format!("{}:/root/.config/hodor/rules.d:ro", rules_d.display())],
+      "serve derives rules from the registry in-container, so the global rules.d must be in view"
+    );
   }
 
   #[test]
@@ -941,22 +963,23 @@ mod tests {
     );
   }
 
-  /// Zero rules is the state that answers every provider with a decoy: it has
-  /// to be said out loud rather than served silently.
+  /// Zero rules with nothing derivable answers every provider with a decoy:
+  /// it has to be said out loud rather than served silently. A derivable
+  /// name substitutes on its own, so it silences the warning.
   #[test]
-  fn serving_no_rules_is_announced() {
-    let config_file = Path::new("/ws/.config/hodor/config.toml");
-    let warning = rules_warning(&BTreeMap::new(), config_file).expect("no rules is worth a warning");
-    assert!(
-      warning.contains("no [rules.*]") && warning.contains("/ws/.config/hodor/config.toml"),
-      "{warning}"
-    );
+  fn serving_no_rules_and_nothing_derivable_is_announced() {
+    let warning = rules_warning(&BTreeMap::new(), &[]).expect("no rules and nothing derivable is worth a warning");
+    assert!(warning.contains("no [rules.*]") && warning.contains("nothing derives"), "{warning}");
 
     let rules = BTreeMap::from([(
       "github".to_string(),
-      toml_edit::de::from_str::<hodor_config::config::RuleCfg>("env = \"GH_TOKEN\"\n").unwrap(),
+      toml_edit::de::from_str::<RuleCfg>("env = \"GH_TOKEN\"\n").unwrap(),
     )]);
-    assert!(rules_warning(&rules, config_file).is_none(), "one rule is enough not to warn");
+    assert!(rules_warning(&rules, &[]).is_none(), "one rule is enough not to warn");
+    assert!(
+      rules_warning(&BTreeMap::new(), &["GITEA_TOKEN".to_string()]).is_none(),
+      "a derivable name substitutes without any config rule"
+    );
   }
 
   #[test]
@@ -1313,6 +1336,187 @@ users:
     .unwrap_err()
     .to_string();
     assert!(error.contains("drop `envs`"), "{error}");
+  }
+
+  /// The automatic pass maps the default-path sources onto decoy twins at
+  /// their default container paths and mints grants, with no declaration.
+  #[test]
+  fn derive_sources_maps_default_paths_to_twins_and_grants() {
+    use hodor_config::registry::Registry;
+    use hodor_pki::ssh::SshKey;
+    use std::collections::HashMap;
+    use std::env;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    let host = tempdir().unwrap();
+    let gitconfig = host.path().join(".gitconfig");
+    fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
+    let key = SshKey::generate().unwrap().to_openssh().unwrap();
+    fs::create_dir_all(host.path().join(".ssh")).unwrap();
+    fs::write(host.path().join(".ssh").join("forge"), key).unwrap();
+    fs::write(
+      host.path().join(".ssh").join("config"),
+      "Host git.internal\n\tIdentityFile ~/.ssh/forge\n",
+    )
+    .unwrap();
+    let work = tempdir().unwrap();
+    let git = work.path().join(".git");
+    fs::create_dir_all(git.join("objects")).unwrap();
+    fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(
+      git.join("config"),
+      "[remote \"origin\"]\n\turl = https://github.com/casualjim/hodor.git\n[remote \"internal\"]\n\turl = git@git.internal:org/repo.git\n",
+    )
+    .unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let saved: Vec<(&str, Option<OsString>)> = [
+      "KUBECONFIG",
+      "TALOSCONFIG",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_NOSYSTEM",
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "JJ_CONFIG",
+    ]
+    .map(|name| (name, env::var_os(name)))
+    .to_vec();
+    unset_env("KUBECONFIG");
+    unset_env("TALOSCONFIG");
+    unset_env("JJ_CONFIG");
+    set_env("GIT_CONFIG_GLOBAL", &gitconfig);
+    set_env("GIT_CONFIG_NOSYSTEM", "1");
+    set_env("HOME", host.path());
+    set_env("XDG_CONFIG_HOME", empty_xdg.path());
+    let files = work.path().join("files");
+    let decoys = vec![Decoy {
+      env: "GITHUB_TOKEN".to_string(),
+      value: "ghp_decoy_decoy_decoy_decoy_decoy".to_string(),
+    }];
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &files,
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &decoys,
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    for (name, value) in saved {
+      match value {
+        Some(value) => set_env(name, value),
+        None => unset_env(name),
+      }
+    }
+    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
+    for expected in [
+      "/home/eng/.gitconfig",
+      "/home/eng/.ssh/config",
+      "/home/eng/.ssh/forge",
+      "/home/eng/.ssh/known_hosts",
+    ] {
+      assert!(containers.contains(&expected.to_string()), "{expected} missing from {containers:?}");
+    }
+    assert!(
+      !containers.iter().any(|path| path.ends_with(".config/jj/config.toml")),
+      "no jj chain, no jj twin"
+    );
+    let gitconfig_mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.gitconfig"))
+      .unwrap();
+    let twin = fs::read_to_string(&gitconfig_mount.host).unwrap();
+    assert!(twin.contains("extraHeader"), "{twin}");
+    assert!(twin.contains("casualjim"), "{twin}");
+    assert!(
+      outputs.grants.iter().any(|grant| grant.fragment.contains("ssh://git.internal")),
+      "the ssh config source minted the identity grant: {:?}",
+      outputs.grants.iter().map(|grant| grant.fragment.clone()).collect::<Vec<_>>()
+    );
+  }
+
+  /// Broken ambient sources warn and skip; the healthy ones still map.
+  #[test]
+  fn broken_ambient_sources_skip_without_failing() {
+    use hodor_config::registry::Registry;
+    use std::collections::HashMap;
+    use std::env;
+
+    let host = tempdir().unwrap();
+    let gitconfig = host.path().join(".gitconfig");
+    fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
+    fs::create_dir_all(host.path().join(".ssh")).unwrap();
+    fs::write(host.path().join(".ssh").join("config"), "Include work-stuff\nMatch final all\n").unwrap();
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(host.path().join(".kube").join("config"), "not: [valid: yaml\n").unwrap();
+    let work = tempdir().unwrap();
+    let git = work.path().join(".git");
+    fs::create_dir_all(git.join("objects")).unwrap();
+    fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(
+      git.join("config"),
+      "[remote \"origin\"]\n\turl = https://github.com/casualjim/hodor.git\n",
+    )
+    .unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let saved: Vec<(&str, Option<OsString>)> = [
+      "KUBECONFIG",
+      "TALOSCONFIG",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_NOSYSTEM",
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "JJ_CONFIG",
+    ]
+    .map(|name| (name, env::var_os(name)))
+    .to_vec();
+    unset_env("KUBECONFIG");
+    unset_env("TALOSCONFIG");
+    unset_env("JJ_CONFIG");
+    set_env("GIT_CONFIG_GLOBAL", &gitconfig);
+    set_env("GIT_CONFIG_NOSYSTEM", "1");
+    set_env("HOME", host.path());
+    set_env("XDG_CONFIG_HOME", empty_xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[Decoy {
+        env: "GITHUB_TOKEN".to_string(),
+        value: "ghp_decoy_decoy_decoy_decoy_decoy".to_string(),
+      }],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    for (name, value) in saved {
+      match value {
+        Some(value) => set_env(name, value),
+        None => unset_env(name),
+      }
+    }
+    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
+    assert!(
+      containers.contains(&"/home/eng/.gitconfig".to_string()),
+      "the healthy source still maps: {containers:?}"
+    );
+    assert!(
+      !containers.contains(&"/home/eng/.ssh/config".to_string()),
+      "the Include-only ssh config derives nothing: {containers:?}"
+    );
+    assert!(
+      !containers.contains(&"/home/eng/.kube/config".to_string()),
+      "the broken kubeconfig derives nothing: {containers:?}"
+    );
   }
 
   /// Home prefixes move to the container home; URLs, relative paths, and

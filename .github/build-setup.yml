@@ -7,7 +7,7 @@
 # Anything installed here by another route — apt, curl — is a second toolchain
 # that can drift from the one CI validated.
 #
-# Two dist constraints, both load-bearing:
+# Two dist constraints, both mandatory:
 # - every step with `uses:` must also carry `name:`; dist's template reads
 #   `step.id` on those steps and fails with `undefined value` otherwise.
 # - these steps are rendered through minijinja, so `${{ ... }}` expressions are
@@ -17,14 +17,17 @@
   run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold
 
 # The linker is `clang` (`.cargo/config.toml`) and must match the LLVM major
-# of the mise-installed rustc, same as ci.yml does.
-- name: Install clang matching rustc's LLVM major
+# of the mise-installed rustc, same as ci.yml. Pinned by hand to 23 (rustc
+# 1.99 = LLVM 23): rustc is NOT installed yet when this step runs, so probing
+# `rustc -Vv` here reads the runner's stale preinstall and installs the wrong
+# clang. The guard after the mise step fails loudly when the pairing drifts;
+# bump the pin together with rustc and `.cargo/config.toml`.
+- name: Install clang 23 (rustc 1.99 = LLVM 23)
   if: ${{ runner.os == 'Linux' }}
   run: |-
     set -euxo pipefail
-    llvm_major="$(rustc -Vv | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
-    curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- "$llvm_major"
-    sudo apt-get install -y --no-install-recommends "clang-${llvm_major}"
+    curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- 23
+    sudo apt-get install -y --no-install-recommends clang-23
 
 # Tools (rust, cmake, bpf-linker, nextest, hk, ...) come from mise.toml,
 # resolved to exact versions by mise.lock. cmake is one of them, so it is not
@@ -35,6 +38,21 @@
     experimental: true
     install: true
     cache: true
+
+# With the pinned rustc now on PATH, assert it still ships the LLVM major
+# the clang pin above and `.cargo/config.toml`'s `linker` were written for.
+# Same guard as ci.yml; a rust bump that skips the pin fails here instead
+# of as a missing linker halfway through the release build.
+- name: Verify the clang pin matches rustc's LLVM major
+  if: ${{ runner.os == 'Linux' }}
+  run: |-
+    set -euxo pipefail
+    llvm_major="$(rustc -vV | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
+    if [ "$llvm_major" != 23 ]; then
+      echo "rustc reports LLVM ${llvm_major} but the pinned clang is 23." >&2
+      echo "Bump the clang pin here, in ci.yml, and the linker in .cargo/config.toml." >&2
+      exit 1
+    fi
 
 # Keyed by target: the matrix builds amd64 and arm64 on different runners, and
 # a shared key would let one architecture's cached artifacts satisfy the other.

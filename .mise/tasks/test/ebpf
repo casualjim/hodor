@@ -13,7 +13,7 @@ set -euo pipefail
 # Build the test binary as the current user so target/ stays user-owned.
 # Building this package is also what runs its `build.rs`, and therefore
 # `aya-build`, so the BPF programs are compiled here.
-cargo nextest run --no-run --cargo-quiet --package hodor-ebpf
+cargo nextest run --locked --no-run --cargo-quiet --package hodor-ebpf
 
 # Locate `hodor-ebpf`'s own test binary: the workspace has many, so the package
 # filter is what makes the "exactly one" assertion meaningful.

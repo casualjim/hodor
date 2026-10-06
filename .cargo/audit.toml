@@ -1,0 +1,30 @@
+# cargo-audit gate policy. Vulnerabilities fail `mise run format`; entries
+# below are accepted debt, each with the blocker that keeps it pinned. Delete
+# an entry the moment its blocker moves.
+[advisories]
+ignore = [
+  # aws-smithy-http-client 1.5.0 (the whole aws-sdk chain under fnox-core
+  # and the compose SSM/KMS leg) requires h2 0.3; >=0.4.16 is semver-
+  # incompatible. Unblock when the aws-sdk releases on h2 0.4.
+  "RUSTSEC-2026-0258",
+
+  # russh is pinned to 0.56.x for the rama-quic/fnox-core conflict; 0.56
+  # pulls libcrux 0.0.4. Unblock with russh >=0.60.3.
+  "RUSTSEC-2026-0154",
+  "RUSTSEC-2026-0153",
+  "RUSTSEC-2026-0212",
+  "RUSTSEC-2026-0208",
+  "RUSTSEC-2026-0207",
+  "RUSTSEC-2026-0074",
+
+  # rustls-webpki 0.101 rides rustls 0.21 under hyper-rustls 0.24 in the
+  # aws-sdk egress leg; fixes land in webpki 0.103. Unblock when
+  # aws-smithy-http-client drops the hyper 0.14 stack.
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
+
+  # Marvinattack on rsa; no fixed release exists upstream, both locked
+  # versions are affected. Revisit when a fix ships.
+  "RUSTSEC-2023-0071",
+]

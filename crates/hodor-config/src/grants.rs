@@ -8,7 +8,7 @@ use std::str::FromStr;
 use secrecy::{ExposeSecret as _, SecretString};
 use url::{Host, Url};
 
-use crate::config::{AppConfig, fake_for};
+use crate::config::{AppConfig, RuleCfg, fake_for};
 use crate::error::Error;
 use crate::plugins::resolve_plugins;
 
@@ -227,6 +227,9 @@ pub enum Scheme {
   Tcp,
   /// Postgres wire protocol. TLS comes from the `sslmode` query.
   Postgres,
+  /// SSH. The proxy terminates the protocol on both legs; port defaults
+  /// to 22 the way ssh itself defaults it.
+  Ssh,
 }
 
 /// Postgres TLS negotiation, read from the entry's `sslmode` query.
@@ -312,6 +315,23 @@ pub struct EndpointScope {
   pub guest_tls: GuestTlsMode,
 }
 
+/// Allow entry for an SSH identity mapping: the guest leg admits only the
+/// decoy public key, the upstream leg presents the real private key, and
+/// upstream host keys follow OpenSSH `accept-new` into hodor's own
+/// `known_hosts` — never a per-host pin here. The rule's `ssh` table names
+/// the two key blobs; both are required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshScope {
+  /// Entry host pattern.
+  pub host: HostPat,
+  /// Entry port.
+  pub port: u16,
+  /// Real private key (openssh format) the upstream leg presents.
+  pub identity: PathBuf,
+  /// Decoy public key (`authorized_keys` format) the guest leg admits.
+  pub guest_key: PathBuf,
+}
+
 /// Upstream trust anchor an entry names with `sslrootcert`: a PEM path, or
 /// libpq's `system` spelling for the platform trust store.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -394,6 +414,7 @@ impl FromStr for EndpointScope {
       "http" => Scheme::Http,
       "https" => Scheme::Https,
       "tcp" => Scheme::Tcp,
+      "ssh" => Scheme::Ssh,
       "postgres" => {
         return Err(format!(
           "bad allow entry `{entry}`: database rules state no allow entries — the connection string is the grant"
@@ -430,6 +451,7 @@ impl FromStr for EndpointScope {
       (None, Scheme::Https) => 443,
       (None, Scheme::Tcp) => return Err("tcp grant requires an explicit port".to_string()),
       (None, Scheme::Postgres) => 5432,
+      (None, Scheme::Ssh) => 22,
     };
     reject_endpoint_query(entry, &url)?;
     Ok(EndpointScope {
@@ -543,14 +565,22 @@ pub enum Grant {
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<DatabaseScope>,
   },
+  /// One SSH identity mapping: the guest presents the decoy key, hodor
+  /// presents the real key upstream. No wire substitution, so no credential.
+  Ssh {
+    /// Parsed ssh entries, each carrying its key material paths.
+    allow: Vec<SshScope>,
+  },
 }
 
 impl Grant {
-  /// The secret this grant swaps.
+  /// The secret this grant swaps, when the kind swaps one on the wire. SSH
+  /// grants swap keys at the protocol layer instead, so they carry none.
   #[must_use]
-  pub fn credential(&self) -> &Credential {
+  pub fn credential(&self) -> Option<&Credential> {
     match self {
-      Grant::Token { credential, .. } | Grant::Database { credential, .. } => credential,
+      Grant::Token { credential, .. } | Grant::Database { credential, .. } => Some(credential),
+      Grant::Ssh { .. } => None,
     }
   }
 
@@ -560,6 +590,7 @@ impl Grant {
     match self {
       Grant::Token { allow, .. } => allow.iter().any(|entry| endpoint_match(entry, scheme, host, port)),
       Grant::Database { scope, .. } => database_match(scope, scheme, host, port),
+      Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
   }
 
@@ -586,6 +617,18 @@ impl Grant {
     };
     (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
   }
+
+  /// The ssh scope whose port and host cover a destination, `host` optional
+  /// as above: transparent capture knows the port before it knows the host.
+  #[must_use]
+  pub fn ssh(&self, host: Option<&str>, port: u16) -> Option<&SshScope> {
+    let Grant::Ssh { allow } = self else {
+      return None;
+    };
+    allow
+      .iter()
+      .find(|entry| entry.port == port && host.is_none_or(|host| entry.host.matches(host)))
+  }
 }
 
 fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) -> bool {
@@ -594,6 +637,10 @@ fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) 
 
 fn database_match(scope: &DatabaseScope, scheme: Scheme, host: &str, port: u16) -> bool {
   scheme == Scheme::Postgres && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+}
+
+fn ssh_match(entry: &SshScope, scheme: Scheme, host: &str, port: u16) -> bool {
+  scheme == Scheme::Ssh && entry.port == port && entry.host.matches(host)
 }
 
 fn host_port_match(pat: &HostPat, entry_port: u16, host: &str, port: u16) -> bool {
@@ -619,85 +666,73 @@ pub struct ResolvedConfig {
 ///
 /// Returns an error when an `allow` entry is not a valid URI grant, or when
 /// one rule mixes endpoint and database entries.
-///
-/// # Panics
-///
-/// Panics when a database rule states no value; [`crate::config::Rule::is_database`]
-/// guarantees one, so this is a programmer error, not a config error.
 pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
-  let mut grants = Vec::with_capacity(cfg.rules.len());
+  let mut collector = GrantCollector::default();
   for (label, rule) in &cfg.rules {
+    collector.collect(label, rule)?;
+  }
+  Ok(ResolvedConfig {
+    proxy: cfg.proxy.clone(),
+    grants: collector.grants,
+    plugins: resolve_plugins(cfg)?,
+  })
+}
+
+/// One rule table's grants, collected kind by kind. Each method owns one
+/// rule kind's validation and grant shape; a warn-and-skip outcome stays a
+/// plain `Ok(())` so the entrypoint remains a fold over the rule table.
+#[derive(Debug, Default)]
+struct GrantCollector {
+  grants: Vec<Grant>,
+}
+
+impl GrantCollector {
+  /// Fold one rule into the set, dispatching on the rule's kind.
+  fn collect(&mut self, label: &str, rule: &RuleCfg) -> Result<(), Error> {
     if rule.is_database() {
-      // Database rule: the rule states the fake connection string in
-      // `value`; the real one resolved from the secret source into `real`.
-      // No allow entries — the connection string is the grant.
-      if !rule.allow.is_empty() {
-        return Err(Error::DatabaseAllow { label: label.clone() });
-      }
-      let Some(real) = rule.real.clone() else {
-        // The secret source did not resolve this name; no grant rather than
-        // a rule that swaps in nothing.
-        tracing::warn!(label, env = %rule.env, "rule has no resolved real connection string; no grant");
-        continue;
-      };
-      let fake = rule.value.as_ref().expect("is_database checked a value").expose_secret();
-      let mut scope = DatabaseScope::from_strings(fake, real.expose_secret()).map_err(|err| Error::DatabaseScope {
-        label: label.clone(),
-        detail: err,
-      })?;
-      // The rule table states the guest leg only; the upstream identity
-      // lives in the real string's libpq URL.
-      for (key, tls) in &rule.tls {
-        if key != &rule.env {
-          return Err(Error::TlsEnvMismatch {
-            label: label.clone(),
-            key: key.clone(),
-            env: rule.env.clone(),
-          });
-        }
-        if tls.client_cert.is_some() || tls.client_key.is_some() {
-          return Err(Error::PostgresIdentity { label: label.clone() });
-        }
-        if tls.root_cert.is_some() {
-          return Err(Error::PostgresTrust { label: label.clone() });
-        }
-        scope.guest_tls = tls.guest_tls_mode;
-      }
-      // The wire needles are the credentials: fake password in, real
-      // password out; the legs' users swap when they differ (the wire
-      // machine rewrites the startup's `user` parameter).
-      let credential = Credential {
-        label: label.clone(),
-        fake: scope.downstream.password.expose_secret().to_string(),
-        value: scope.upstream.password.clone(),
-      };
-      grants.push(Grant::Database {
-        credential,
-        scope: Box::new(scope),
-      });
-      continue;
+      return self.database(label, rule);
     }
-    // Endpoint rule: `value` is the real secret, `allow` names the hosts.
-    let Some(value) = rule.value.clone() else {
-      // `secrets::resolve` fills this before `serve`; a caller that skips
-      // resolution gets no grant rather than a rule that swaps in nothing.
-      tracing::warn!(label, env = %rule.env, "rule has no resolved value; no grant");
-      continue;
-    };
+    let parsed = Self::parse_entries(label, rule)?;
+    if parsed.is_empty() {
+      tracing::warn!(label, env = %rule.env, "rule has no allow entries; no grant");
+      return Ok(());
+    }
+    // An ssh table that cannot apply — the rule's entries are not ssh —
+    // would vanish silently; that is a misspecified rule, fail closed.
+    if !rule.ssh.is_empty() && parsed.first().is_none_or(|(_, scope)| scope.scheme != Scheme::Ssh) {
+      return Err(Error::SshMisplaced { label: label.to_string() });
+    }
+    if parsed.first().is_some_and(|(_, scope)| scope.scheme == Scheme::Ssh) {
+      return self.ssh(label, rule, parsed);
+    }
+    self.token(label, rule, parsed);
+    Ok(())
+  }
+
+  /// Parse a rule's `allow` entries with their `tls` overlay applied, and
+  /// reject `tls` rows no entry claims.
+  fn parse_entries(label: &str, rule: &RuleCfg) -> Result<Vec<(String, EndpointScope)>, Error> {
     let mut parsed = Vec::with_capacity(rule.allow.len());
     for entry in &rule.allow {
       let mut scope: EndpointScope = entry.parse().map_err(|err| Error::BadAllow {
-        label: label.clone(),
+        label: label.to_string(),
         entry: entry.clone(),
         detail: err,
       })?;
       // Identity comes from the entry; hodor's own TLS configuration comes
-      // from the rule's `tls` table, keyed by the entry itself.
+      // from the rule's `tls` table, keyed by the entry itself. SSH entries
+      // pin their trust instead, so a `tls` row on one is a config error.
       if let Some(tls) = rule.tls.get(entry) {
+        if scope.scheme == Scheme::Ssh {
+          return Err(Error::SshTls {
+            label: label.to_string(),
+            entry: entry.clone(),
+          });
+        }
         if tls.client_cert.is_some() != tls.client_key.is_some() {
           return Err(Error::CertKeyPair {
-            label: label.clone(),
-            entry: (*entry).clone(),
+            label: label.to_string(),
+            entry: entry.clone(),
           });
         }
         scope.client_cert.clone_from(&tls.client_cert);
@@ -705,44 +740,145 @@ pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
         scope.root_cert.clone_from(&tls.root_cert);
         scope.guest_tls = tls.guest_tls_mode;
       }
-      parsed.push((entry, scope));
+      parsed.push((entry.clone(), scope));
     }
     for key in rule.tls.keys() {
       if !rule.allow.iter().any(|entry| entry == key) {
         return Err(Error::TlsUnknownEntry {
-          label: label.clone(),
+          label: label.to_string(),
           key: key.clone(),
         });
       }
     }
-    if parsed.is_empty() {
-      tracing::warn!(label, env = %rule.env, "rule has no allow entries; no grant");
-      continue;
+    Ok(parsed)
+  }
+
+  /// Database rule: the rule states the fake connection string in `value`;
+  /// the real one resolved from the secret source into `real`. No allow
+  /// entries — the connection string is the grant.
+  fn database(&mut self, label: &str, rule: &RuleCfg) -> Result<(), Error> {
+    if !rule.allow.is_empty() {
+      return Err(Error::DatabaseAllow { label: label.to_string() });
     }
+    let Some(real) = rule.real.clone() else {
+      // The secret source did not resolve this name; no grant rather than
+      // a rule that swaps in nothing.
+      tracing::warn!(label, env = %rule.env, "rule has no resolved real connection string; no grant");
+      return Ok(());
+    };
+    let Some(fake) = rule.value.as_ref() else {
+      return Err(Error::DatabaseValueMissing { label: label.to_string() });
+    };
+    let fake = fake.expose_secret();
+    let mut scope = DatabaseScope::from_strings(fake, real.expose_secret()).map_err(|err| Error::DatabaseScope {
+      label: label.to_string(),
+      detail: err,
+    })?;
+    // The rule table states the guest leg only; the upstream identity
+    // lives in the real string's libpq URL.
+    for (key, tls) in &rule.tls {
+      if key != &rule.env {
+        return Err(Error::TlsEnvMismatch {
+          label: label.to_string(),
+          key: key.clone(),
+          env: rule.env.clone(),
+        });
+      }
+      if tls.client_cert.is_some() || tls.client_key.is_some() {
+        return Err(Error::PostgresIdentity { label: label.to_string() });
+      }
+      if tls.root_cert.is_some() {
+        return Err(Error::PostgresTrust { label: label.to_string() });
+      }
+      scope.guest_tls = tls.guest_tls_mode;
+    }
+    // The wire needles are the credentials: fake password in, real
+    // password out; the legs' users swap when they differ (the wire
+    // machine rewrites the startup's `user` parameter).
+    let credential = Credential {
+      label: label.to_string(),
+      fake: scope.downstream.password.expose_secret().to_string(),
+      value: scope.upstream.password.clone(),
+    };
+    self.grants.push(Grant::Database {
+      credential,
+      scope: Box::new(scope),
+    });
+    Ok(())
+  }
+
+  /// SSH rule: every entry ssh, key material from the `ssh` table, and no
+  /// credential to resolve — the swap happens at the protocol layer.
+  fn ssh(&mut self, label: &str, rule: &RuleCfg, parsed: Vec<(String, EndpointScope)>) -> Result<(), Error> {
+    if parsed.iter().any(|(_, scope)| scope.scheme != Scheme::Ssh) {
+      return Err(Error::SshMixedSchemes { label: label.to_string() });
+    }
+    if rule.value.is_some() {
+      return Err(Error::SshValue { label: label.to_string() });
+    }
+    for key in rule.ssh.keys() {
+      if !rule.allow.iter().any(|entry| entry == key) {
+        return Err(Error::SshUnknownEntry {
+          label: label.to_string(),
+          key: key.clone(),
+        });
+      }
+    }
+    let mut allow = Vec::with_capacity(parsed.len());
+    for (entry, scope) in parsed {
+      let Some(ssh) = rule.ssh.get(&entry) else {
+        return Err(Error::SshIdentity {
+          label: label.to_string(),
+          entry,
+          detail: "no ssh config for this entry".to_string(),
+        });
+      };
+      let identity = ssh.identity.clone().ok_or_else(|| Error::SshIdentity {
+        label: label.to_string(),
+        entry: entry.clone(),
+        detail: "identity is required".to_string(),
+      })?;
+      let guest_key = ssh.guest_key.clone().ok_or_else(|| Error::SshIdentity {
+        label: label.to_string(),
+        entry: entry.clone(),
+        detail: "guest_key is required".to_string(),
+      })?;
+      allow.push(SshScope {
+        host: scope.host,
+        port: scope.port,
+        identity,
+        guest_key,
+      });
+    }
+    self.grants.push(Grant::Ssh { allow });
+    Ok(())
+  }
+
+  /// Token rule: `allow` names the hosts and `value` is the real secret.
+  fn token(&mut self, label: &str, rule: &RuleCfg, parsed: Vec<(String, EndpointScope)>) {
+    let Some(value) = rule.value.clone() else {
+      // `secrets::resolve` fills this before `serve`; a caller that skips
+      // resolution gets no grant rather than a rule that swaps in nothing.
+      tracing::warn!(label, env = %rule.env, "rule has no resolved value; no grant");
+      return;
+    };
     let allow: Vec<EndpointScope> = parsed.into_iter().map(|(_, scope)| scope).collect();
-    // A decoy is a key the proxy maps back to the real value; its shape is a
-    // prop for the observer. Raw TCP grants need the decoy at the real
+    // A decoy is a key the proxy maps back to the real value; its shape is
+    // a prop for the observer. Raw TCP grants need the decoy at the real
     // value's length (the raw swap is equal-length only), so the decoy
     // falls back to a length-matched render there.
     let (fake, _) = decoy_for_rule(&rule.env, rule.pattern.as_deref(), &allow, value.expose_secret().len());
-    let credential = Credential {
-      label: label.clone(),
-      fake,
-      value,
-    };
-    grants.push(Grant::Token {
-      credential,
+    self.grants.push(Grant::Token {
+      credential: Credential {
+        label: label.to_string(),
+        fake,
+        value,
+      },
       allow,
       pattern: rule.pattern.clone(),
       oauth2: rule.oauth2.clone(),
     });
   }
-  let plugins = resolve_plugins(cfg)?;
-  Ok(ResolvedConfig {
-    proxy: cfg.proxy.clone(),
-    grants,
-    plugins,
-  })
 }
 
 /// The decoy a rule's grant will use: the shaped decoy, falling back to a
@@ -772,7 +908,7 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
-  use crate::config::{HostTlsCfg, IfMissing, ProxyCfg, RuleCfg, WorkspaceCfg};
+  use crate::config::{HostSshCfg, HostTlsCfg, IfMissing, ProxyCfg, WorkspaceCfg};
 
   fn endpoint_grant(entries: &[&str]) -> Grant {
     Grant::Token {
@@ -807,6 +943,7 @@ mod tests {
         registry: None,
         oauth2: None,
         tls: BTreeMap::new(),
+        ssh: BTreeMap::new(),
         if_missing: crate::config::IfMissing::default(),
       },
     );
@@ -816,6 +953,8 @@ mod tests {
         ca_file: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
       },
       workspace: WorkspaceCfg::default(),
       rules,
@@ -857,6 +996,7 @@ mod tests {
         pattern: None,
         registry: None,
         oauth2: None,
+        ssh: BTreeMap::new(),
         tls,
         if_missing: crate::config::IfMissing::default(),
       },
@@ -865,6 +1005,8 @@ mod tests {
       proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
@@ -888,6 +1030,7 @@ mod tests {
         pattern: None,
         oauth2: None,
         registry: Some(false),
+        ssh: BTreeMap::new(),
         tls: BTreeMap::new(),
         if_missing: IfMissing::Error,
       },
@@ -896,6 +1039,8 @@ mod tests {
       proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
         ca_file: None,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
         root_certs: Vec::new(),
         handshake_timeout_secs: 10,
       },
@@ -911,7 +1056,8 @@ mod tests {
     let config = config_with_rule("db", "PGPASSWORD", "twenty-char-password", vec!["tcp://10.0.0.8:5432"]);
     let resolved = resolve(&config).unwrap();
     let grant = &resolved.grants[0];
-    assert_eq!(grant.credential().fake.len(), 20, "decoy length equals the real value length");
+    let credential = grant.credential().expect("an endpoint rule carries a credential");
+    assert_eq!(credential.fake.len(), 20, "decoy length equals the real value length");
   }
 
   #[test]
@@ -919,8 +1065,9 @@ mod tests {
     let config = config_with_rule("gh", "GITHUB_TOKEN", "ghp_real", vec!["https://api.github.com"]);
     let resolved = resolve(&config).unwrap();
     let grant = &resolved.grants[0];
-    assert_eq!(grant.credential().fake, crate::config::fake_for("GITHUB_TOKEN", None));
-    assert_eq!(grant.credential().fake.len(), 32, "default pattern renders 32 hex characters");
+    let credential = grant.credential().expect("an endpoint rule carries a credential");
+    assert_eq!(credential.fake, crate::config::fake_for("GITHUB_TOKEN", None));
+    assert_eq!(credential.fake.len(), 32, "default pattern renders 32 hex characters");
   }
 
   #[test]
@@ -1007,8 +1154,8 @@ mod tests {
     // libpq's own grammar carries the client identity on the real string —
     // the upstream leg's policy; endpoint URLs carry nothing of the kind.
     let pg = database_scope(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=require&sslcert=/c.pem&sslkey=/c.key",
+      "postgres://app:fake@db.internal:5432/main", // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=require&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
     );
     assert_eq!(pg.client_cert, Some(PathBuf::from("/c.pem")));
     assert_eq!(pg.client_key, Some(PathBuf::from("/c.key")));
@@ -1045,8 +1192,8 @@ mod tests {
   #[test]
   fn rule_table_for_a_database_rule_keys_by_its_env() {
     let mut cfg = cfg_with_db(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=require",
+      "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=require", // betterleaks:allow
     );
     let entry = || HostTlsCfg {
       client_cert: None,
@@ -1104,13 +1251,13 @@ mod tests {
   #[test]
   fn system_names_the_platform_trust_store() {
     let pg = database_scope(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=system",
+      "postgres://app:fake@db.internal:5432/main",                         // betterleaks:allow
+      "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=system", // betterleaks:allow
     );
     assert_eq!(pg.root_cert, Some(RootCert::System));
     let path = database_scope(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=/ca.pem",
+      "postgres://app:fake@db.internal:5432/main",                          // betterleaks:allow
+      "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=/ca.pem", // betterleaks:allow
     );
     assert_eq!(path.root_cert, Some(RootCert::Path(PathBuf::from("/ca.pem"))));
   }
@@ -1136,8 +1283,8 @@ mod tests {
   #[test]
   fn a_database_rule_maps_two_connection_strings() {
     let scope = database_scope(
-      "postgres://app:fake@fake.internal:5433/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=verify-full&sslrootcert=/ca.pem",
+      "postgres://app:fake@fake.internal:5433/main", // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=verify-full&sslrootcert=/ca.pem", // betterleaks:allow
     );
     // The fake string states the guest's leg; its port is the match key.
     assert_eq!(scope.downstream.host, "fake.internal");
@@ -1158,8 +1305,8 @@ mod tests {
   #[test]
   fn database_grant_answers_only_for_postgres() {
     let grant = database_grant(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=require",
+      "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=require", // betterleaks:allow
     );
     assert!(grant.matches(Scheme::Postgres, "db.internal", 5432));
     assert!(!grant.matches(Scheme::Https, "db.internal", 5432));
@@ -1179,11 +1326,12 @@ mod tests {
     let cfg = cfg_with_rule(&["https://api.github.com"]);
     let resolved = resolve(&cfg).unwrap();
     assert!(matches!(resolved.grants[0], Grant::Token { .. }));
-    assert_eq!(resolved.grants[0].credential().label, "t");
+    let credential = resolved.grants[0].credential().expect("an endpoint rule carries a credential");
+    assert_eq!(credential.label, "t");
 
     let cfg = cfg_with_db(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=disable",
+      "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=disable", // betterleaks:allow
     );
     let resolved = resolve(&cfg).unwrap();
     let Grant::Database { scope, .. } = &resolved.grants[0] else {
@@ -1197,8 +1345,8 @@ mod tests {
   #[test]
   fn a_database_rule_states_no_allow_entries() {
     let mut cfg = cfg_with_db(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main?sslmode=require",
+      "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main?sslmode=require", // betterleaks:allow
     );
     cfg.rules.get_mut("t").unwrap().allow = vec!["https://api.github.com".to_string()];
     let err = resolve(&cfg).unwrap_err().to_string();
@@ -1210,25 +1358,197 @@ mod tests {
   fn database_strings_need_their_credentials() {
     // Both strings carry a password: a string with no credential maps
     // nothing.
-    let cfg = cfg_with_db("postgres://app@db.internal:5432/main", "postgres://app:real@db.internal:5432/main");
+    let cfg = cfg_with_db("postgres://app@db.internal:5432/main", "postgres://app:real@db.internal:5432/main"); // betterleaks:allow
     let err = resolve(&cfg).unwrap_err().to_string();
     assert!(err.contains("the password is required"), "{err}");
-    let cfg = cfg_with_db("postgres://app:fake@db.internal:5432/main", "postgres://app@db.internal:5432/main");
+    let cfg = cfg_with_db("postgres://app:fake@db.internal:5432/main", "postgres://app@db.internal:5432/main"); // betterleaks:allow
     let err = resolve(&cfg).unwrap_err().to_string();
     assert!(err.contains("the password is required"), "{err}");
     // A schemed value that is not a connection string fails: the URL
     // mandate is enforced at parse. A bare token is a different kind of
     // rule, not a database rule at all.
-    let cfg = cfg_with_db("postgres://app:fake@/main", "postgres://app:real@db.internal:5432/main");
+    let cfg = cfg_with_db("postgres://app:fake@/main", "postgres://app:real@db.internal:5432/main"); // betterleaks:allow
     let err = resolve(&cfg).unwrap_err().to_string();
     assert!(err.contains("empty host"), "{err}");
     // Without the secret-source real string there is no grant at all.
     let mut cfg = cfg_with_db(
-      "postgres://app:fake@db.internal:5432/main",
-      "postgres://app:real@db.internal:5432/main",
+      "postgres://app:fake@db.internal:5432/main", // betterleaks:allow
+      "postgres://app:real@db.internal:5432/main", // betterleaks:allow
     );
     cfg.rules.get_mut("t").unwrap().real = None;
     let resolved = resolve(&cfg).unwrap();
     assert!(resolved.grants.is_empty());
+  }
+
+  /// One ssh rule: entries plus per-entry key material, no value.
+  fn cfg_with_ssh(entries: &[&str], ssh: BTreeMap<String, HostSshCfg>) -> AppConfig {
+    let mut rules = BTreeMap::new();
+    rules.insert(
+      "t".to_string(),
+      RuleCfg {
+        env: "T".into(),
+        value: None,
+        real: None,
+        fnox_key: None,
+        allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
+        pattern: None,
+        oauth2: None,
+        registry: None,
+        if_missing: IfMissing::Error,
+        tls: BTreeMap::new(),
+        ssh,
+      },
+    );
+    AppConfig {
+      proxy: ProxyCfg {
+        listen: "127.0.0.1:8080".parse().unwrap(),
+        ca_file: None,
+        ssh_host_key: None,
+        ssh_known_hosts: None,
+        root_certs: Vec::new(),
+        handshake_timeout_secs: 10,
+      },
+      workspace: WorkspaceCfg::default(),
+      rules,
+      plugins: BTreeMap::new(),
+      tools: BTreeMap::new(),
+    }
+  }
+
+  /// Complete per-entry ssh config pointing at state-side blobs.
+  fn ssh_material(entry: &str) -> BTreeMap<String, HostSshCfg> {
+    BTreeMap::from([(
+      entry.to_string(),
+      HostSshCfg {
+        identity: Some(PathBuf::from("/hodor/grants/rules.d/t.identity")),
+        guest_key: Some(PathBuf::from("/hodor/grants/rules.d/t.guest_key")),
+      },
+    )])
+  }
+
+  #[test]
+  fn ssh_entry_defaults_to_port_22() {
+    let scope: EndpointScope = "ssh://git.example".parse().unwrap();
+    assert_eq!(scope.scheme, Scheme::Ssh);
+    assert_eq!(scope.port, 22);
+    assert!(matches!(&scope.host, HostPat::Exact(host) if host == "git.example"));
+
+    let scope: EndpointScope = "ssh://git.example:2222".parse().unwrap();
+    assert_eq!(scope.port, 2222);
+
+    let err = "ssh://user@git.example".parse::<EndpointScope>().unwrap_err();
+    assert!(err.contains("userinfo is postgres-only"), "{err}");
+    let err = "ssh://git.example?sslmode=require".parse::<EndpointScope>().unwrap_err();
+    assert!(err.contains("postgres-only"), "{err}");
+  }
+
+  #[test]
+  fn ssh_rule_resolves_with_its_key_material() {
+    let cfg = cfg_with_ssh(&["ssh://git.example"], ssh_material("ssh://git.example"));
+    let resolved = resolve(&cfg).unwrap();
+    let Some(Grant::Ssh { allow }) = resolved.grants.first() else {
+      panic!("an ssh rule resolves to an ssh grant");
+    };
+    let scope = &allow[0];
+    assert_eq!(scope.port, 22);
+    assert_eq!(scope.identity, PathBuf::from("/hodor/grants/rules.d/t.identity"));
+    assert_eq!(scope.guest_key, PathBuf::from("/hodor/grants/rules.d/t.guest_key"));
+    assert!(resolved.grants[0].matches(Scheme::Ssh, "git.example", 22));
+    assert!(!resolved.grants[0].matches(Scheme::Tcp, "git.example", 22));
+    assert!(!resolved.grants[0].matches(Scheme::Ssh, "git.example", 2222));
+    assert!(resolved.grants[0].credential().is_none());
+  }
+
+  #[test]
+  fn transparent_capture_finds_the_ssh_scope_before_the_host_is_known() {
+    let cfg = cfg_with_ssh(&["ssh://git.example:2222"], ssh_material("ssh://git.example:2222"));
+    let resolved = resolve(&cfg).unwrap();
+    let grant = &resolved.grants[0];
+    let scope = grant.ssh(None, 2222).expect("the port alone narrows the scope");
+    assert!(matches!(&scope.host, HostPat::Exact(host) if host == "git.example"));
+    assert!(grant.ssh(Some("elsewhere.example"), 2222).is_none());
+    assert!(grant.ssh(None, 22).is_none());
+  }
+
+  #[test]
+  fn ssh_entry_without_key_material_fails_closed() {
+    let cfg = cfg_with_ssh(&["ssh://git.example"], BTreeMap::new());
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("no ssh config for this entry"), "{err}");
+  }
+
+  #[test]
+  fn ssh_config_missing_a_field_fails_closed() {
+    let mut ssh = ssh_material("ssh://git.example");
+    ssh.get_mut("ssh://git.example").unwrap().identity = None;
+    let cfg = cfg_with_ssh(&["ssh://git.example"], ssh);
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("identity is required"), "{err}");
+  }
+
+  #[test]
+  fn ssh_config_naming_an_ungranted_entry_fails_closed() {
+    let mut ssh = ssh_material("ssh://git.example");
+    ssh.insert(
+      "ssh://other.example".to_string(),
+      HostSshCfg {
+        identity: None,
+        guest_key: None,
+      },
+    );
+    let cfg = cfg_with_ssh(&["ssh://git.example"], ssh);
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("ssh config names entry `ssh://other.example`"), "{err}");
+  }
+
+  #[test]
+  fn ssh_rule_cannot_mix_schemes() {
+    let cfg = cfg_with_ssh(&["ssh://git.example", "https://git.example"], BTreeMap::new());
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("ssh entries cannot mix"), "{err}");
+  }
+
+  #[test]
+  fn ssh_rule_states_no_value() {
+    let mut cfg = cfg_with_ssh(&["ssh://git.example"], ssh_material("ssh://git.example"));
+    cfg.rules.get_mut("t").unwrap().value = Some(SecretString::from("nothing would swap it"));
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("an ssh rule states no `value`"), "{err}");
+  }
+
+  #[test]
+  fn ssh_entry_takes_no_tls_config() {
+    let mut cfg = cfg_with_ssh(&["ssh://git.example"], ssh_material("ssh://git.example"));
+    cfg.rules.get_mut("t").unwrap().tls.insert(
+      "ssh://git.example".to_string(),
+      HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls_mode: GuestTlsMode::default(),
+        guest_cert: None,
+        guest_key: None,
+      },
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("states no `tls` config"), "{err}");
+  }
+
+  #[test]
+  fn ssh_material_on_a_non_ssh_rule_fails_closed() {
+    // The demo lost its ssh grant exactly this way: the ssh table sat on a
+    // rule whose allow entries were https, resolve took the token arm, and
+    // the table vanished silently — ssh traffic spliced instead of
+    // terminating. A stated table that cannot apply is an error.
+    let mut cfg = cfg_with_ssh(&["https://api.example"], BTreeMap::new());
+    cfg.rules.get_mut("t").unwrap().ssh.insert(
+      "ssh://git.example".to_string(),
+      HostSshCfg {
+        identity: Some(PathBuf::from("/hodor/grants/rules.d/t.identity")),
+        guest_key: Some(PathBuf::from("/hodor/grants/rules.d/t.guest_key")),
+      },
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("ssh config on a rule with no ssh entry"), "{err}");
   }
 }

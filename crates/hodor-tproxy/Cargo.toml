@@ -8,26 +8,26 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
-futures-util = "0.3.34"
-hodor-config = { path = "../hodor-config" }
-hodor-pki = { path = "../hodor-pki" }
-hodor-proxy = { path = "../hodor-proxy" }
-libc = "0.2"
-netlink-packet-core = "0.9"
-netlink-packet-netfilter = "0.4"
-netlink-sys = "0.8"
-rama = { git = "https://github.com/plabayo/rama", rev = "4f4a221bdaa931c75160a955a90a502ff5c4c4e2", default-features = false, features = ["tcp"] }
-rtnetlink = "0.23.0"
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
-secrecy = { version = "0.10", features = ["serde"] }
-thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-rustls = "0.26"
-tracing = "0.1"
+futures-util = { workspace = true }
+hodor-config = { workspace = true }
+hodor-pki = { workspace = true }
+hodor-proxy = { workspace = true }
+libc = { workspace = true }
+netlink-packet-core = { workspace = true }
+netlink-packet-netfilter = { workspace = true }
+netlink-sys = { workspace = true }
+rama = { workspace = true, features = ["tcp"] }
+rtnetlink = { workspace = true }
+rustls = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-pretty_assertions = "1"
-tempfile = "3"
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

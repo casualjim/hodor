@@ -283,5 +283,54 @@ await retry("oauth2 token endpoint mints and the minted decoy substitutes", asyn
   return badResp.status === 401;
 });
 
+// 8. SSH: a plain openssh binary, the decoy identity, and nothing else.
+// Options inline (no config file): strict checking with accept-new and a
+// writable known_hosts of its own, so the first connection records hodor's
+// host key — ssh's mechanism is the allowlist, hodor adds no pins.
+const SSH_DST = process.env.SSH_DST ?? "";
+const SSH_KNOWN_HOSTS = "/tmp/known_hosts";
+const sshCommand = [
+  "ssh",
+  "-i",
+  "/certs/ssh/decoy",
+  "-o",
+  "IdentitiesOnly=yes",
+  "-o",
+  "StrictHostKeyChecking=accept-new",
+  "-o",
+  `UserKnownHostsFile=${SSH_KNOWN_HOSTS}`,
+  "-o",
+  "GlobalKnownHostsFile=/dev/null",
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "ConnectTimeout=5",
+  `agent@${SSH_DST}`,
+  "echo",
+  "ssh-ok",
+];
+if (SSH_DST) {
+  await retry("ssh decoy in, real key out", async () => {
+    const proc = Bun.spawn(sshCommand, { stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    stage(`ssh reply: ${JSON.stringify({ code, out, err })}`);
+    if (code !== 0 || out.trim() !== "ssh-ok") {
+      return false;
+    }
+    // Debian hashes known_hosts entries, so assert on the recorded key
+    // blob: it must be hodor's host key, proving the client verified and
+    // stored it via its own accept-new — never a pre-mounted pin.
+    const [known, hodorHost] = await Promise.all([
+      readFile(SSH_KNOWN_HOSTS, "utf8"),
+      readFile("/certs/ssh/hodor_host.pub", "utf8"),
+    ]);
+    return known.includes(hodorHost.trim().split(" ")[1] ?? "");
+  });
+} else {
+  stage("ssh scenario skipped: no SSH_DST (bwrap)");
+}
+
 console.log("all scenarios passed");
 process.exit(0);

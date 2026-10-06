@@ -8,25 +8,25 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
-aya = "0.14"
-dashmap = "6"
-thiserror = "2"
-hodor-config = { path = "../hodor-config" }
-hodor-proxy = { path = "../hodor-proxy" }
-libc = "0.2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tracing = "0.1"
+aya = { workspace = true }
+dashmap = { workspace = true }
+thiserror = { workspace = true }
+hodor-config = { workspace = true }
+hodor-proxy = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [build-dependencies]
-aya-build = "0.2"
+aya-build = { workspace = true }
 
 [dev-dependencies]
-aya-obj = "0.3"
-hodor-pki = { path = "../hodor-pki" }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
-secrecy = { version = "0.10", features = ["serde"] }
-tempfile = "3"
-tokio-rustls = "0.26"
+aya-obj = { workspace = true }
+hodor-pki = { workspace = true }
+rustls = { workspace = true }
+secrecy = { workspace = true }
+tempfile = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [lints]
 workspace = true

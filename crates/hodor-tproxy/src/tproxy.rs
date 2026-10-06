@@ -65,7 +65,7 @@ pub async fn run_tproxy(state: Arc<ProxyState>, allow_root_netns: bool) -> Resul
   .await
 }
 
-/// Test seams over [`run_tproxy`].
+/// Test overrides over [`run_tproxy`].
 #[derive(Debug, Default)]
 pub(crate) struct Options {
   /// Restrict the OUTPUT mark rule to one exact destination address, so
@@ -346,7 +346,7 @@ fn hex_prefix(bytes: &[u8]) -> String {
 
 /// Flushes the capture table on drop (best-effort): rules and chains go
 /// with it. A stale TPROXY redirect would blackhole traffic after exit, so
-/// cleanup is load-bearing.
+/// cleanup must run.
 struct NftGuard {
   teardown: Option<NetlinkMessage<NetfilterMessage>>,
 }
@@ -445,6 +445,8 @@ mod tests {
           proxy: hodor_config::config::ProxyCfg {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
+            ssh_host_key: None,
+            ssh_known_hosts: None,
             root_certs: Vec::new(),
             handshake_timeout_secs: 10,
           },

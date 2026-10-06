@@ -10,4 +10,4 @@ set -euo pipefail
 
 # `HODOR_PLUGIN_FIXTURES` activates the plugin_e2e_ tests (built by the
 # build:plugins dependency); without it each prints a skip line and passes.
-HODOR_PLUGIN_FIXTURES="$proj_dir/target/plugins" cargo nextest run --cargo-quiet --workspace --exclude hodor-ebpf-programs --show-progress=bar --status-level=slow "$@"
+HODOR_PLUGIN_FIXTURES="$proj_dir/target/plugins" cargo nextest run --locked --cargo-quiet --workspace --exclude hodor-ebpf-programs --show-progress=bar --status-level=slow "$@"

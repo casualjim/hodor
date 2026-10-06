@@ -93,6 +93,8 @@ fn synthetic_config(names: &[String]) -> AppConfig {
     proxy: ProxyCfg {
       listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
       ca_file: None,
+      ssh_host_key: None,
+      ssh_known_hosts: None,
       root_certs: Vec::new(),
       handshake_timeout_secs: 10,
     },
@@ -113,6 +115,7 @@ fn synthetic_config(names: &[String]) -> AppConfig {
             registry: None,
             if_missing: IfMissing::Error,
             tls: BTreeMap::new(),
+            ssh: BTreeMap::new(),
           },
         )
       })

@@ -123,50 +123,60 @@ url = "https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-d
 url_api = "https://api.github.com/repos/axodotdev/cargo-dist/releases/assets/556576987"
 provenance = "github-attestations"
 
+[[tools."cargo:cargo-audit"]]
+version = "0.22.2"
+backend = "cargo:cargo-audit"
+specifiers = ["latest"]
+
+[[tools."cargo:cargo-outdated"]]
+version = "0.19.0"
+backend = "cargo:cargo-outdated"
+specifiers = ["latest"]
+
 [[tools."cargo:cargo-sort"]]
 version = "2.1.4"
 backend = "cargo:cargo-sort"
 specifiers = ["latest"]
 
 [[tools.cmake]]
-version = "4.4.3"
+version = "4.4.4"
 backend = "aqua:Kitware/CMake"
 specifiers = ["latest"]
 
 [tools.cmake."platforms.linux-arm64"]
-checksum = "sha256:2efc974dbd63b4444c0e8494b92f2e80c2d7e635b4b80eac2916985ddd8f72a6"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-aarch64.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577299"
+checksum = "sha256:a1b6cc63636a0e55c63257cf3315a8a5f129e42fade25db1afea4ff8ab06f25e"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-linux-aarch64.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/605992024"
 
 [tools.cmake."platforms.linux-arm64-musl"]
-checksum = "sha256:2efc974dbd63b4444c0e8494b92f2e80c2d7e635b4b80eac2916985ddd8f72a6"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-aarch64.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577299"
+checksum = "sha256:a1b6cc63636a0e55c63257cf3315a8a5f129e42fade25db1afea4ff8ab06f25e"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-linux-aarch64.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/605992024"
 
 [tools.cmake."platforms.linux-x64"]
-checksum = "sha256:d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-x86_64.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577408"
+checksum = "sha256:e5bb807f7728cb60cd8b27ebc97a2edb469b68655f21e844a600c3575b76f5bb"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-linux-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/605992585"
 
 [tools.cmake."platforms.linux-x64-musl"]
-checksum = "sha256:d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-x86_64.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577408"
+checksum = "sha256:e5bb807f7728cb60cd8b27ebc97a2edb469b68655f21e844a600c3575b76f5bb"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-linux-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/605992585"
 
 [tools.cmake."platforms.macos-arm64"]
-checksum = "sha256:0c5d65251c14cc884bfa16bdbed3c263ce5bffe2e21c0d0d00962cb0610464fa"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-macos-universal.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577557"
+checksum = "sha256:4b7b73704b1db9b374e5c9ab8e17ac6148b817b6396ee75cd94a852cbac9d305"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-macos-universal.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/605993514"
 
 [tools.cmake."platforms.macos-x64"]
-checksum = "sha256:0c5d65251c14cc884bfa16bdbed3c263ce5bffe2e21c0d0d00962cb0610464fa"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-macos-universal.tar.gz"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529577557"
+checksum = "sha256:4b7b73704b1db9b374e5c9ab8e17ac6148b817b6396ee75cd94a852cbac9d305"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-macos-universal.tar.gz"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/605993514"
 
 [tools.cmake."platforms.windows-x64"]
-checksum = "sha256:4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab"
-url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip"
-url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/529578311"
+checksum = "sha256:bace36e94b31c68ab6fa295f26dfa11219e0701cf7c94b0284a7d1cb13dac536"
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip"
+url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/605998125"
 
 [[tools."github:aya-rs/bpf-linker"]]
 version = "0.11.1"
@@ -207,6 +217,53 @@ url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788
 checksum = "sha256:0afb407265502082776c1abd24cbafad44e2ac469a9d91b8439ff9f6f80c1d70"
 url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-pc-windows-gnullvm.tar.zst"
 url_api = "https://api.github.com/repos/aya-rs/bpf-linker/releases/assets/548788745"
+
+[[tools."github:betterleaks/betterleaks"]]
+version = "1.9.0"
+backend = "github:betterleaks/betterleaks"
+specifiers = ["latest"]
+
+[tools."github:betterleaks/betterleaks"."platforms.linux-arm64"]
+checksum = "sha256:1d39116e0a58dc94574715e2aa12a2dbd5062f193eee3fec011fef6ba06bd13b"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108932"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.linux-arm64-musl"]
+checksum = "sha256:1d39116e0a58dc94574715e2aa12a2dbd5062f193eee3fec011fef6ba06bd13b"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108932"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.linux-x64"]
+checksum = "sha256:f8b185a39ffcece2a1ca82bf3a4e7435cd81963ffd16b7a9128daf75f35f6de7"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_linux_x64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108929"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.linux-x64-musl"]
+checksum = "sha256:f8b185a39ffcece2a1ca82bf3a4e7435cd81963ffd16b7a9128daf75f35f6de7"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_linux_x64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108929"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.macos-arm64"]
+checksum = "sha256:83dd7eaab13d44a1e8e347a17064cdef153a1478db473276d41b38d55613d3f2"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108927"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.macos-x64"]
+checksum = "sha256:68dfd83458d9e7f90663daa7a81c7f944083b170dae82e4f5f8d0581ed519ef1"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_darwin_x64.tar.gz"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108931"
+provenance = "github-attestations"
+
+[tools."github:betterleaks/betterleaks"."platforms.windows-x64"]
+checksum = "sha256:b765daec9fda475b031b5a5159798cbe4294a3f2a50683cbc0471226e376d3da"
+url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_windows_x64.zip"
+url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108997"
+provenance = "github-attestations"
 
 [[tools."github:casualjim/remark"]]
 version = "0.6.2"
@@ -343,38 +400,38 @@ url_api = "https://api.github.com/repos/hadolint/hadolint/releases/assets/496546
 provenance = "github-attestations"
 
 [[tools.hk]]
-version = "2.2.0"
+version = "2.5.0"
 backend = "packslip:github.com/jdx/hk"
 specifiers = ["latest"]
 
 [tools.hk."platforms.linux-arm64"]
-checksum = "sha256:8f6f86adae8d9b40ce47815af1b7a2f43a5b02d8abda7a831c8fcb9d5619e878"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-aarch64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:c800091c414e1c8e8628137275d88c257bcfe0c35dd31d2762923a71dae7df7f"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
 
 [tools.hk."platforms.linux-arm64-musl"]
-checksum = "sha256:7914940ab8ebbdfcda2a4315e9efbc419d1c65828d26be04310362649aa47162"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-aarch64-unknown-linux-musl.tar.gz"
+checksum = "sha256:1e839b96defad21b5118d9554f2146811a2ce8d8eef90b3da1d592834969b717"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
 
 [tools.hk."platforms.linux-x64"]
-checksum = "sha256:ffb90603d1aeb6c545ff64087372c136d46bb6d820164d63b352b1c189f40053"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:449b83c35ac3a460f80a4c9a41ad99430add8cf6caa6ceadc27e810feac3647d"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-x86_64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
 
 [tools.hk."platforms.linux-x64-musl"]
-checksum = "sha256:bf359f72335b99c872d7de28ccdd51cea2e5311c9200414a2409d5bfcd06c595"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:55b349ed8ebbb9cc11e3ff7f741230035061e45621c0b2c87fffeeb37fadcfd0"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-x86_64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
 
 [tools.hk."platforms.macos-arm64"]
-checksum = "sha256:82da7ae00554222568ea4115939e13fca640c2fae426ea828176b5b08ea45f68"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-aarch64-apple-darwin.tar.gz"
+checksum = "sha256:fabbed3a44e72c601759fa81d56f3c9403ca466853bdf77e87cc69d986cb151a"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-apple-darwin.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
 
 [tools.hk."platforms.windows-x64"]
-checksum = "sha256:f265c9cadfbb2ded37328f7248dc5879804b5e460746bab5039765ee0e23eaf2"
-url = "https://github.com/jdx/hk/releases/download/v2.2.0/hk-x86_64-pc-windows-msvc.zip"
+checksum = "sha256:9d3063f0eadb316415dc2aaea51608f436eb6ffe44e00c2e460294c66f269a54"
+url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-x86_64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
 
 [[tools.k3d]]

@@ -11,7 +11,7 @@ use url::{Host, Url};
 
 use crate::config::{RuleCfg, validate_pattern};
 use crate::error::Error;
-use crate::grants::{EndpointScope, HostPat};
+use crate::grants::{EndpointScope, HostPat, Scheme, uri_match};
 
 /// Bundled registry: environment names, API hosts, and token shapes.
 const BUNDLED: &str = include_str!("../../../rules/registry.toml");
@@ -319,6 +319,26 @@ impl Registry {
     self.names.get(&env.to_ascii_uppercase())
   }
 
+  /// Environment names whose registry hosts cover one endpoint, sorted by
+  /// name. The reverse of [`Registry::lookup`]: the join a derived-rule
+  /// source runs when it knows a host (a git remote) and needs the names
+  /// that could substitute credentials for it.
+  #[must_use]
+  pub fn envs_for_host(&self, scheme: Scheme, host: &str, port: u16) -> Vec<String> {
+    self
+      .names
+      .iter()
+      .filter(|(_, known)| {
+        known.hosts.iter().any(|entry| {
+          entry
+            .parse::<EndpointScope>()
+            .is_ok_and(|scope| uri_match(std::slice::from_ref(&scope), scheme, host, port))
+        })
+      })
+      .map(|(env, _)| env.clone())
+      .collect()
+  }
+
   /// Decoy template for one environment name: explicit, then registry, then default.
   #[must_use]
   pub fn template<'a>(&'a self, env: &str, explicit: Option<&'a str>) -> Cow<'a, str> {
@@ -379,8 +399,7 @@ pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> Result<(), E
     let authority = flow_authority(url).map_err(|err| Error::BadOAuthUrl {
       origin: source.to_string(),
       name: name.to_string(),
-      url: url.clone(),
-      detail: err,
+      source: Box::new(err),
     })?;
     if matches!(authority, HostPat::Any) {
       tracing::warn!(
@@ -419,15 +438,21 @@ pub fn validate_flow(flow: &OAuthFlow, source: &str, name: &str) -> Result<(), E
 
 /// Endpoint URLs are full URLs; grants are authority-only. Parse the URL,
 /// then reduce it to its host pattern for the exfil-risk warning.
-fn flow_authority(url: &str) -> Result<HostPat, String> {
-  let parsed = Url::parse(url).map_err(|err| err.to_string())?;
+fn flow_authority(url: &str) -> Result<HostPat, Error> {
+  let parsed = Url::parse(url).map_err(|source| Error::BadUrlParse {
+    url: url.to_string(),
+    source,
+  })?;
   let host = match parsed.host() {
     Some(Host::Domain("*")) => HostPat::Any,
-    Some(Host::Domain(domain)) if domain.starts_with("*.") => HostPat::Wildcard(domain[1..].to_string()),
+    Some(Host::Domain(domain)) if domain.starts_with("*.") => match domain.get(1..) {
+      Some(pattern) => HostPat::Wildcard(pattern.to_string()),
+      None => HostPat::Exact(domain.to_string()),
+    },
     Some(Host::Domain(domain)) => HostPat::Exact(domain.to_string()),
     Some(Host::Ipv4(addr)) => HostPat::Exact(addr.to_string()),
     Some(Host::Ipv6(addr)) => HostPat::Exact(addr.to_string()),
-    None => return Err("empty host".to_string()),
+    None => return Err(Error::BadUrlHost { url: url.to_string() }),
   };
   Ok(host)
 }
@@ -578,6 +603,24 @@ mod tests {
   fn lookup_is_case_insensitive() {
     let registry = Registry::load(None).unwrap();
     assert_eq!(registry.lookup("github_token"), registry.lookup("GITHUB_TOKEN"));
+  }
+
+  #[test]
+  fn envs_for_host_names_every_env_covering_an_endpoint() {
+    let registry = Registry::load(None).unwrap();
+    let covered = registry.envs_for_host(Scheme::Https, "github.com", 443);
+    for expected in ["GH_TOKEN", "GITHUB_API_TOKEN", "GITHUB_PAT", "GITHUB_TOKEN"] {
+      assert!(covered.contains(&expected.to_string()), "{expected} missing from {covered:?}");
+    }
+    assert!(covered.is_sorted(), "names come sorted for a deterministic pick: {covered:?}");
+    assert_eq!(
+      registry.envs_for_host(Scheme::Http, "github.com", 80),
+      [] as [std::string::String; 0]
+    );
+    assert_eq!(
+      registry.envs_for_host(Scheme::Https, "unknown.example", 443),
+      [] as [std::string::String; 0]
+    );
   }
 
   #[test]

@@ -12,13 +12,14 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use hodor_config::cli::{Cli, CliCommand, ProxyBackend};
+use hodor_fnox::FnoxSource;
 
 use commands::{CaArgs, ConfigArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, ServeArgs};
 use hodor_compose::{AgentArgs, DownArgs, InitArgs, LogsArgs, UpArgs};
 
 /// Command-line interface: global flags plus a subcommand.
 #[derive(Parser, Debug)]
-#[command(name = "hodor", about = "grant-scoped MITM proxy")]
+#[command(name = "hodor", about = "grant-scoped MITM proxy", version)]
 struct HodorCli {
   /// Global flags: the highest-precedence config layer.
   #[command(flatten)]
@@ -44,7 +45,8 @@ enum Command {
   /// The printed PEM is the trust anchor to install into workload
   /// containers; the private key stays in the CA file and in `ca.key`.
   Ca(CaArgs),
-  /// Print `[rules.*]` for the secrets this workspace can get (fnox ∩ registry).
+  /// Print what this workspace's proxy substitutes (fnox ∩ registry): derived
+  /// rules, names still needing a host, and uncovered fnox declarations.
   Rules(RulesArgs),
   /// Print a reference config: every setting, its default, and the doc
   /// comment explaining it. Load errors surface first, so this doubles as a
@@ -55,10 +57,10 @@ enum Command {
   /// document. Reads a local file; prints TOML to stdout. Never touches
   /// the bundled registry or runtime config.
   Registry(RegistryArgs),
-  /// Generate this workspace's stack as an editable file: the workspace
-  /// `[rules.*]` config when it has none, the CA, the agent entrypoint, and
-  /// the compose file. Existing files are left untouched; the stack is
-  /// regenerated when the workspace config changed since it was generated.
+  /// Generate this workspace's stack as an editable file: a stub workspace
+  /// config when it has none (rules derive at serve time), the CA, the agent
+  /// entrypoint, and the compose file. Existing files are left untouched; the
+  /// stack is regenerated when the workspace config changed since it was generated.
   Init(InitArgs),
   /// Enter the confined agent environment in one go: generate what is missing,
   /// start the stack, then run the configured shell (or the command after
@@ -148,11 +150,12 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   }
   let (mut config, workspace) = hodor_config::config::load(cli, Some(&args.proxy))?;
   let registry = generation_registry()?;
-  // fnox is needed exactly when a rule has no inline value: every
-  // credential the proxy runs with resolves from fnox, age-encrypted secrets
-  // included — never from the environment that started this process.
-  let needs_fnox = config.rules.values().any(|rule| rule.value.is_none() || rule.is_database());
-  let fnox = if needs_fnox { hodor_fnox::FnoxSource::open()? } else { None };
+  // fnox always opens: it is the value source and the rule catalog —
+  // derivation needs the declared names even with no config rule — and
+  // `open()` is `None` when no fnox configuration exists. Every credential
+  // resolves from fnox, age-encrypted secrets included, never from the
+  // environment that started this process.
+  let fnox = FnoxSource::open()?;
   if let Some(source) = &fnox {
     for name in hodor_fnox::export_provider_env(source).await {
       tracing::debug!(name, "provider credential taken from fnox");

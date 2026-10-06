@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -192,8 +193,9 @@ pub struct FileRewrite {
   #[serde(default)]
   pub envs: Vec<String>,
   /// Declared format, skipping detection. Known formats: `kubeconfig`
-  /// (kubectl), `talos` (talosctl). More formats later; unknown files keep
-  /// the raw byte-swap when this is absent.
+  /// (kubectl), `talos` (talosctl). The git, jj, and ssh configs are not
+  /// declared: hodor reads them as ambient sources from their default
+  /// locations. Unknown files keep the raw byte-swap when this is absent.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub format: Option<RewriteFormat>,
 }
@@ -230,6 +232,17 @@ pub struct ProxyCfg {
   #[config(layer_attr(arg(long = "ca-file", help = "CA PEM path (default <config-dir>/hodor/ca.pem)")))]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub ca_file: Option<PathBuf>,
+  /// SSH host key path (default `<config-dir>/hodor/ssh_host_ed25519`):
+  /// the key the guest leg presents, generated on first run.
+  #[config(env = "HODOR_SSH_HOST_KEY")]
+  #[config(layer_attr(arg(long = "ssh-host-key", help = "SSH host key path (default <config-dir>/hodor/ssh_host_ed25519)")))]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub ssh_host_key: Option<PathBuf>,
+  /// Hodor's own upstream `known_hosts`, OpenSSH `accept-new` semantics:
+  /// first-seen keys are recorded, a changed key on a known host fails.
+  #[config(env = "HODOR_SSH_KNOWN_HOSTS")]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub ssh_known_hosts: Option<PathBuf>,
   /// Extra upstream CA bundles trusted on egress, additive to webpki roots.
   /// Entries extend this further with their own `root_cert`. Config file
   /// only: one path per bundle.
@@ -285,6 +298,9 @@ pub struct RuleCfg {
   /// Per-entry TLS configuration keyed by the exact `allow` entry string.
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub tls: BTreeMap<String, HostTlsCfg>,
+  /// Per-entry SSH key material, keyed by the exact `allow` entry string.
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub ssh: BTreeMap<String, HostSshCfg>,
 }
 
 impl RuleCfg {
@@ -296,6 +312,14 @@ impl RuleCfg {
       .value
       .as_ref()
       .is_some_and(|value| value.expose_secret().starts_with("postgres://"))
+  }
+
+  /// An ssh rule's allow entries are all `ssh://` and its secret is key
+  /// material in the `ssh` table: nothing resolves from fnox, and no
+  /// registry union may touch the entry list.
+  #[must_use]
+  pub fn is_ssh(&self) -> bool {
+    !self.ssh.is_empty()
   }
 }
 
@@ -323,6 +347,21 @@ pub struct HostTlsCfg {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub guest_cert: Option<PathBuf>,
   /// Container-internal path the guest's minted key mounts at.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub guest_key: Option<PathBuf>,
+}
+
+/// Per-entry SSH key material, keyed by the rule's own `allow` entry string.
+/// All three paths are required for an `ssh://` entry: the resolve step
+/// fails closed when any is missing. Compose writes the blobs; the proxy
+/// reads them at startup.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSshCfg {
+  /// Real private key (openssh format) the upstream leg presents.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub identity: Option<PathBuf>,
+  /// Decoy public key (`authorized_keys` format) the guest leg admits.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub guest_key: Option<PathBuf>,
 }
@@ -421,14 +460,22 @@ pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
 }
 
 /// Merge `[rules]` tables by label: global first, project wins wholesale
-/// per label. Errors name the file + label.
+/// per label. Errors name the file + label. A file that does not exist is
+/// no layer at all: generation names the project path even when the
+/// workspace has no config yet.
 fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> Result<BTreeMap<String, RuleCfg>, Error> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = fs::read_to_string(path).map_err(|source| Error::ReadFile {
-      path: path.to_path_buf(),
-      source,
-    })?;
+    let text = match fs::read_to_string(path) {
+      Ok(text) => text,
+      Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+      Err(source) => {
+        return Err(Error::ReadFile {
+          path: path.to_path_buf(),
+          source,
+        });
+      }
+    };
     let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
       path: path.to_path_buf(),
       source: Box::new(source),
@@ -450,13 +497,21 @@ fn load_merged_rules(project: Option<&Path>, global: Option<&Path>) -> Result<BT
 }
 
 /// Merge `[tools]` tables by name: global first, project wins per name.
+/// A file that does not exist is no layer at all, as in
+/// [`load_merged_rules`].
 fn load_merged_tools(project: Option<&Path>, global: Option<&Path>) -> Result<BTreeMap<String, ToolCfg>, Error> {
   let mut merged = BTreeMap::new();
   for path in [global, project].into_iter().flatten() {
-    let text = std::fs::read_to_string(path).map_err(|source| Error::ReadFile {
-      path: path.to_path_buf(),
-      source,
-    })?;
+    let text = match std::fs::read_to_string(path) {
+      Ok(text) => text,
+      Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+      Err(source) => {
+        return Err(Error::ReadFile {
+          path: path.to_path_buf(),
+          source,
+        });
+      }
+    };
     let doc: toml::Table = toml::from_str(&text).map_err(|source| Error::ParseFile {
       path: path.to_path_buf(),
       source: Box::new(source),
@@ -580,11 +635,6 @@ fn profile_parent(project: Option<&Path>, global: Option<&Path>, profile: &str) 
 ///
 /// Returns an error on an inheritance cycle, an invalid parent name, a
 /// parent no layer holds, or a parent on the shared base.
-///
-/// # Panics
-///
-/// Never panics: the chain starts at one element and the loop only appends,
-/// so `chain.last()` always finds a name.
 pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &str) -> Result<Vec<String>, Error> {
   if !valid_profile(selected) {
     return Err(Error::BadProfileName {
@@ -592,8 +642,8 @@ pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &s
     });
   }
   let mut chain = vec![selected.to_string()];
+  let mut name = selected.to_string();
   loop {
-    let name = chain.last().expect("the chain never empties").clone();
     if name == SHARED_PROFILE {
       profile_parent(project, global, &name)?;
       break;
@@ -609,7 +659,8 @@ pub fn profile_chain(project: Option<&Path>, global: Option<&Path>, selected: &s
         parent: parent.clone(),
       });
     }
-    chain.push(parent);
+    chain.push(parent.clone());
+    name = parent;
   }
   let held = [project, global].into_iter().flatten().any(|layer| layer.join(selected).is_dir());
   if !held && selected != SHARED_PROFILE {
@@ -791,6 +842,10 @@ impl Encoding {
   }
 }
 
+/// Upper bound on one pattern segment's count. Patterns come from config
+/// and the bundled registry; real decoys are token-sized.
+const MAX_PATTERN_COUNT: usize = 4096;
+
 fn render_template(template: &str, seed: &str) -> String {
   let mut out = String::new();
   let mut rest = template;
@@ -812,7 +867,9 @@ fn render_template(template: &str, seed: &str) -> String {
     let validated = match body.split_once(':') {
       Some((kind, count_raw)) if !count_raw.is_empty() && count_raw.bytes().all(|b| b.is_ascii_digit()) => {
         match (Encoding::parse(kind), count_raw.parse::<usize>()) {
-          (Some(encoding), Ok(count)) => Some((encoding, count)),
+          // A count past the cap renders literally: an absurd pattern is a
+          // config mistake, not a multi-gigabyte decoy to grind out.
+          (Some(encoding), Ok(count)) if count <= MAX_PATTERN_COUNT => Some((encoding, count)),
           _ => None,
         }
       }
@@ -838,11 +895,14 @@ fn fill_encoding(seed: &str, encoding: Encoding, count: usize) -> String {
     match encoding {
       Encoding::Hex => out.push_str(&hex::encode(digest)),
       Encoding::Decimal => {
-        let word = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
-        out.push_str(&word.to_string());
+        let head: [u8; 4] = digest.get(..4).and_then(|bytes| bytes.try_into().ok()).unwrap_or([0; 4]);
+        out.push_str(&u32::from_be_bytes(head).to_string());
       }
       Encoding::Base62 => {
-        let word: [u8; 16] = digest[0..16].try_into().expect("16 digest bytes");
+        let mut word = [0u8; 16];
+        if let (Some(bytes), Some(slot)) = (digest.get(..16), word.get_mut(..16)) {
+          slot.copy_from_slice(bytes);
+        }
         out.push_str(&base62::encode(u128::from_be_bytes(word)));
       }
     }
@@ -859,11 +919,10 @@ fn fill_encoding(seed: &str, encoding: Encoding, count: usize) -> String {
 /// `reference_samples_name_every_setting` fails when the serializer then
 /// hides one. No production type carries reference-only baggage.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Only on serialization of in-repo literals, which the suite catches.
-#[must_use]
-pub fn reference_samples() -> String {
+/// Returns an error when the in-repo sample literals fail to serialize.
+pub fn reference_samples() -> Result<String, Error> {
   #[derive(Serialize)]
   struct Samples<'a> {
     rules: BTreeMap<&'a str, RuleCfg>,
@@ -895,6 +954,7 @@ pub fn reference_samples() -> String {
     allow: vec![
       "https://api.example".to_string(),
       "postgres://db.example:5432/app?sslmode=verify-full&sslrootcert=/certs/bundle.pem".to_string(),
+      "ssh://git.example".to_string(),
     ],
     pattern: Some("example_{hex:32}".to_string()),
     oauth2: Some(OAuthFlow {
@@ -908,6 +968,13 @@ pub fn reference_samples() -> String {
     registry: Some(true),
     if_missing: IfMissing::Warn,
     tls: rule_tls,
+    ssh: BTreeMap::from([(
+      "ssh://git.example".to_string(),
+      HostSshCfg {
+        identity: Some("/hodor/grants/rules.d/example.identity".into()),
+        guest_key: Some("/hodor/grants/rules.d/example.guest_key".into()),
+      },
+    )]),
   };
   let samples = Samples {
     rules: [("example", rule)].into_iter().collect(),
@@ -940,8 +1007,8 @@ pub fn reference_samples() -> String {
   };
   let mut out = String::from("\n# ── Map-valued tables: one sample entry each; copy and rename the key ──\n\n");
   out.push_str("# `value` and `real` never serialize (secrets): `value` is the inline\n# real secret (or the database rule's FAKE postgres:// URL), `real` is the\n# database rule's REAL string, resolved from the secret source.\n\n");
-  out.push_str(&toml::to_string_pretty(&samples).expect("in-repo literals always serialize"));
-  out
+  out.push_str(&toml::to_string_pretty(&samples).map_err(|source| Error::SerializeSamples { source })?);
+  Ok(out)
 }
 
 #[cfg(test)]
@@ -1056,6 +1123,34 @@ allow = ["https://c.example"]
     assert_eq!(config.rules["a"].value.as_ref().unwrap().expose_secret(), "global-a");
     assert_eq!(config.rules["b"].value.as_ref().unwrap().expose_secret(), "project-b");
     assert_eq!(config.rules["c"].value.as_ref().unwrap().expose_secret(), "project-c");
+    scrub_env();
+  }
+
+  #[test]
+  fn a_config_flag_pointing_at_nothing_yields_the_global_layer_alone() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(
+      &global,
+      r#"
+[rules.a]
+env = "A_TOKEN"
+value = "global-a"
+allow = ["https://a.example"]
+"#,
+    );
+    set_env("HODOR_CONFIG", &global);
+    let missing = dir.path().join("fresh").join(".config").join("hodor").join("config.toml");
+    let cli = cli_for(&["hodor", "--config", missing.to_str().unwrap()]);
+    let (config, _) = load(&cli, None).unwrap();
+    assert_eq!(config.rules["a"].value.as_ref().unwrap().expose_secret(), "global-a");
+    assert_eq!(
+      config.rules.len(),
+      1,
+      "a project file that does not exist is no project layer at all"
+    );
     scrub_env();
   }
 
@@ -1269,6 +1364,39 @@ if_missing = "warn"
   }
 
   #[test]
+  fn an_ssh_rule_loads_its_key_material_from_the_file() {
+    // Proven by the demo: an ssh rule stated in the config file vanished
+    // between the file and resolve, ssh traffic spliced. This test pins
+    // the whole file path — confique's pass and the label merge.
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(
+      &global,
+      r#"
+[rules.ssh]
+env = "SSH_KEY"
+registry = false
+if_missing = "ignore"
+allow = ["ssh://git.example"]
+
+[rules.ssh.ssh."ssh://git.example"]
+identity = "/hodor/grants/rules.d/t.identity"
+guest_key = "/hodor/grants/rules.d/t.guest_key"
+"#,
+    );
+    set_env("HODOR_CONFIG", &global);
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
+    let rule = &config.rules["ssh"];
+    assert_eq!(rule.allow, ["ssh://git.example"]);
+    let entry = &rule.ssh["ssh://git.example"];
+    assert_eq!(entry.identity, Some(PathBuf::from("/hodor/grants/rules.d/t.identity")));
+    assert_eq!(entry.guest_key, Some(PathBuf::from("/hodor/grants/rules.d/t.guest_key")));
+    scrub_env();
+  }
+
+  #[test]
   fn rules_dir_sits_beside_the_config_file() {
     let _guard = lock_env();
     scrub_env();
@@ -1295,6 +1423,13 @@ if_missing = "warn"
     assert!(explicit.starts_with("sk_live_"), "{explicit}");
 
     assert_ne!(fake_for("GH_TOKEN", None), fake_for("GH_OTHER", None));
+  }
+
+  #[test]
+  fn absurd_pattern_counts_render_literally() {
+    assert_eq!(fake_for("X", Some("{hex:99999999}")), "{hex:99999999}");
+    assert_eq!(render_template("{hex:4097}", "seed"), "{hex:4097}");
+    assert_eq!(render_template("{hex:4096}", "seed").len(), 4096);
   }
 
   #[test]
@@ -1439,7 +1574,7 @@ allow = ["https://b.example"]
   /// there; this test then fails if a skip attribute hides it anyway.
   #[test]
   fn reference_samples_name_every_setting() {
-    let samples = reference_samples();
+    let samples = reference_samples().expect("in-repo literals serialize");
     for name in [
       "[rules.example]",
       "env",

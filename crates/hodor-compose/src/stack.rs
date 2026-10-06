@@ -11,7 +11,7 @@ use dirs::{config_dir as dirs_config_dir, home_dir, state_dir};
 use hodor_config::cli::{Cli, ProxyBackend};
 use hodor_config::config::{
   AppConfig, FileRewrite, HostTlsCfg, RewriteFormat, RuleCfg, SHARED_PROFILE, ToolCfg, config_dir, load, project_config_file,
-  project_rules_dir, rules_dir, valid_profile,
+  project_config_write_path, project_rules_dir, rules_dir, valid_profile,
 };
 use hodor_config::grants::GuestTlsMode;
 use hodor_config::registry::Registry;
@@ -23,8 +23,11 @@ use xpanda::Xpanda;
 use crate::adapt::{self, GRANTS_STATE_DIR, RewriteAdapted, sniff};
 use crate::error::Error;
 use crate::expand::{apply_rewrites, block_on, build_expander, expand_path, expand_value, resolution_env, rewrite_file_name};
+use crate::git;
+use crate::jj;
 use crate::kube;
 use crate::paths::{Mount, covering, expand, translate};
+use crate::ssh;
 use crate::talos;
 
 /// Revision of the generated stack's shape. Bump whenever what
@@ -36,8 +39,12 @@ use crate::talos;
 /// `fwd` exposure sidecar, `[workspace] ports`, and `HODOR_LISTEN`. Shape 3
 /// mounts profiles instead of agent directories, and adds `[workspace]
 /// passthrough` interpolation and `file_rewrite` mounts. Shape 4 mounts the
-/// tool-config grant layer at `/hodor/grants` instead of `/hodor/kube`.
-pub(crate) const STACK_SHAPE: u32 = 4;
+/// tool-config grant layer at `/hodor/grants` instead of `/hodor/kube`. Shape
+/// 5 mounts the global `rules.d` into the hodor service, so in-container rule
+/// derivation sees the same registry hosts as the host. Shape 6 derives
+/// the ambient sources — gitconfig, jj, ssh, kubeconfig, talosconfig — and
+/// mounts their decoy twins at the default paths.
+pub(crate) const STACK_SHAPE: u32 = 6;
 
 /// The shape revision a generated stack carries, from its `# stack shape:`
 /// marker line; `None` for a file without a readable one, which is a stack
@@ -93,6 +100,15 @@ pub(crate) fn by_hosts(registry: &Registry, decoys: Vec<Decoy>) -> (Vec<Decoy>, 
   decoys
     .into_iter()
     .partition(|decoy| registry.lookup(&decoy.env).is_some_and(|known| !known.hosts.is_empty()))
+}
+/// Env names serve-time derivation turns into rules: fnox-declared,
+/// registry-known, with hosts.
+pub(crate) fn derivable_envs(fnox: Option<&FnoxSource>, registry: &Registry) -> Vec<String> {
+  by_hosts(registry, select(fnox, registry))
+    .0
+    .into_iter()
+    .map(|decoy| decoy.env)
+    .collect()
 }
 
 /// A passthrough name that is also a rule env or a selected decoy is a
@@ -293,6 +309,14 @@ pub(crate) fn fnox_binds(fnox_dir: Option<&Path>, config_dir: Option<&Path>) -> 
       ro: true,
     });
   }
+  let rules_d = config_dir.map(|dir| dir.join("rules.d")).filter(|dir| dir.is_dir());
+  if let Some(dir) = rules_d {
+    binds.mounts.push(Mount {
+      host: dir,
+      container: PathBuf::from("/root/.config/hodor/rules.d"),
+      ro: true,
+    });
+  }
   binds
 }
 
@@ -314,54 +338,118 @@ pub(crate) fn include_entries(root: &Path, includes: &[PathBuf], host_home: Opti
   Ok(entries)
 }
 
+/// Workspace inputs resolved once for stack generation: the merged config,
+/// the registry, the secret source, the expansion environment, and the
+/// include-derived mounts.
+struct WorkspaceInputs {
+  /// The workspace's merged config.
+  config: AppConfig,
+  /// Host-known registry joined with fnox names.
+  registry: Registry,
+  /// The secret source, when one is configured.
+  fnox: Option<FnoxSource>,
+  /// Expansion environment: the process env plus fnox-resolved names.
+  env: HashMap<String, String>,
+  /// Xpanda expander built over `env`.
+  expander: Xpanda,
+  /// The expanded container home.
+  home: String,
+  /// The host home, when resolvable.
+  host_home: Option<PathBuf>,
+  /// Include-derived mounts, deepest path first.
+  mounts: Vec<Mount>,
+}
+
+impl WorkspaceInputs {
+  /// Resolve every input the stack generator reads.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the registry or config fails to load, when no
+  /// `[workspace] home` is stated, when value resolution fails, or when a
+  /// path fails to expand.
+  fn resolve(root: &Path) -> Result<Self, Error> {
+    let registry = generation_registry(Some(root))?;
+    let config = workspace_config(root)?;
+    let raw_home = config.workspace.home.clone().ok_or_else(|| Error::HomeRequired {
+      detail: "for stack generation".to_string(),
+    })?;
+    let fnox = open_fnox()?;
+    let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
+    let env = block_on(resolution_env(&registry, fnox.as_ref(), &referenced))??;
+    let expander = build_expander(env.clone());
+    let home = expand_value(&expander, &raw_home)?;
+    let host_home = home_dir();
+    let includes: Vec<PathBuf> = config
+      .workspace
+      .include
+      .iter()
+      .map(|entry| expand_path(&expander, &entry.to_string_lossy()).map(PathBuf::from))
+      .collect::<Result<_, Error>>()?;
+    let entries = include_entries(root, &includes, host_home.as_deref())?;
+    let mounts = covering(
+      entries
+        .into_iter()
+        .map(|(host, ro)| Mount {
+          container: translate(&host, host_home.as_deref(), &home),
+          host,
+          ro,
+        })
+        .collect(),
+    );
+    Ok(Self {
+      config,
+      registry,
+      fnox,
+      env,
+      expander,
+      home,
+      host_home,
+      mounts,
+    })
+  }
+}
+
 pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: &str) -> Result<String, Error> {
-  let registry = generation_registry(Some(root))?;
-  let config = workspace_config(root)?;
-  let raw_home = config.workspace.home.clone().ok_or_else(|| Error::HomeRequired {
-    detail: "for stack generation".to_string(),
-  })?;
-  let fnox = open_fnox()?;
-  let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
-  let env = block_on(resolution_env(&registry, fnox.as_ref(), &referenced))??;
-  let expander = build_expander(env.clone());
-  let home = expand_value(&expander, &raw_home)?;
-  let host_home = home_dir();
-  let includes: Vec<PathBuf> = config
-    .workspace
-    .include
-    .iter()
-    .map(|entry| expand_path(&expander, &entry.to_string_lossy()).map(PathBuf::from))
-    .collect::<Result<_, Error>>()?;
-  let entries = include_entries(root, &includes, host_home.as_deref())?;
-  let mounts = covering(
-    entries
-      .into_iter()
-      .map(|(host, ro)| Mount {
-        container: translate(&host, host_home.as_deref(), &home),
-        host,
-        ro,
-      })
-      .collect(),
-  );
-  let decoys = with_rule_patterns(select(fnox.as_ref(), &registry), &registry, &config.rules);
+  let inputs = WorkspaceInputs::resolve(root)?;
+  let config = &inputs.config;
+  let home = inputs.home.as_str();
+  let host_home = inputs.host_home.as_deref();
+  let decoys = with_rule_patterns(select(inputs.fnox.as_ref(), &inputs.registry), &inputs.registry, &config.rules);
   validate_passthrough(&config.rules, &decoys, &config.workspace.passthrough)?;
   let kube_ca = rewrite_ca(&config.workspace.file_rewrite)?;
+  let files_dir = workspace_state_dir(root).join("files");
   let guests_dir = workspace_state_dir(root).join("guests");
   let rewritten = write_rewrites(&RewriteInputs {
-    files_dir: &workspace_state_dir(root).join("files"),
+    files_dir: &files_dir,
     root,
     rewrites: &config.workspace.file_rewrite,
     decoys: &decoys,
-    env: &env,
-    expander: &expander,
-    home: &home,
-    host_home: host_home.as_deref(),
+    env: &inputs.env,
+    expander: &inputs.expander,
+    home,
+    host_home,
     kube_ca: kube_ca.as_ref(),
     guests_dir: &guests_dir,
   })?;
+  let mut grants = rewritten.grants;
+  let mut file_mounts = rewritten.mounts;
+  let ambient = derive_sources(&DeriveInputs {
+    files_dir: &files_dir,
+    root,
+    registry: &inputs.registry,
+    decoys: &decoys,
+    expander: &inputs.expander,
+    home,
+    host_home,
+    guests_dir: &guests_dir,
+    rewrites: &config.workspace.file_rewrite,
+  })?;
+  grants.extend(ambient.grants);
+  file_mounts.extend(ambient.mounts);
   let grants_state = workspace_state_dir(root).join("grants");
-  adapt::write_state(&grants_state, &rewritten.grants)?;
-  let grants_mounts = if rewritten.grants.is_empty() {
+  adapt::write_state(&grants_state, &grants)?;
+  let grants_mounts = if grants.is_empty() {
     Vec::new()
   } else {
     vec![Mount {
@@ -376,10 +464,10 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
     project: Some(project_profiles.as_path()),
     global: global_profiles.as_deref(),
   };
-  let tool_mounts = profile_mounts(&roots, config.workspace.profile_name(), &config.tools, &home)?;
-  let guest = guest_mounts(&config, &guests_dir, &home)?;
-  let fnox = fnox_binds(fnox_config_dir(host_home.as_deref()).as_deref(), config_dir().as_deref());
-  let root_container = translate(root, host_home.as_deref(), &home);
+  let tool_mounts = profile_mounts(&roots, config.workspace.profile_name(), &config.tools, home)?;
+  let guest = guest_mounts(config, &guests_dir, home)?;
+  let fnox = fnox_binds(fnox_config_dir(host_home).as_deref(), config_dir().as_deref());
+  let root_container = translate(root, host_home, home);
   let project = config.workspace.name.clone().unwrap_or_else(|| workspace_slug(root));
   let storage = workspace_state_dir(root).join("containers");
   let uid = current_uid();
@@ -390,18 +478,18 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
       decoys,
       agent: AgentSpec {
         root: &root_container,
-        home: &home,
+        home,
         storage: &storage,
         uid,
       },
-      mounts,
+      mounts: inputs.mounts,
       tool_mounts,
       fnox,
       guest,
       init: config.workspace.init.clone(),
       ports: config.workspace.ports.clone(),
       passthrough: config.workspace.passthrough.clone(),
-      file_mounts: rewritten.mounts,
+      file_mounts,
       grants_mounts,
       hodor_version,
     }
@@ -533,7 +621,7 @@ pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutput
     expander,
     home,
     host_home,
-    kube_ca: preloaded_ca,
+    kube_ca,
     guests_dir,
   } = *inputs;
   if rewrites.is_empty() {
@@ -543,83 +631,504 @@ pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutput
     });
   }
   let by_env: BTreeMap<&str, &str> = decoys.iter().map(|decoy| (decoy.env.as_str(), decoy.value.as_str())).collect();
-  fs::create_dir_all(files_dir).map_err(|source| Error::CreateDir {
-    path: files_dir.to_path_buf(),
-    source,
-  })?;
-  let mut mounts = Vec::new();
-  let mut grants = Vec::new();
-  let mut owned_ca: Option<CertAuthority> = None;
+  let mut pass = ExplicitRewrites {
+    files_dir,
+    guests_dir,
+    expander,
+    home,
+    preloaded_ca: kube_ca,
+    ca: None,
+    collector: RewriteCollector::new(files_dir)?,
+  };
   for (index, rewrite) in rewrites.iter().enumerate() {
-    let pairs = rewrite_pairs(rewrite, env, &by_env)?;
-    let expanded_source = PathBuf::from(expand_path(expander, &rewrite.source.to_string_lossy())?);
+    pass.write(index, rewrite, root, host_home, env, &by_env)?;
+  }
+  Ok(pass.collector.outputs())
+}
+
+/// Grants and decoy mounts collected from adapted documents: emitting one
+/// document writes its decoy side files into the state directory and mounts
+/// each read-only at its stated container path.
+struct RewriteCollector {
+  /// State directory the decoy files land in.
+  files_dir: PathBuf,
+  /// Read-only mounts collected with the grants.
+  mounts: Vec<Mount>,
+  /// Grants adapted from the documents.
+  grants: Vec<RewriteAdapted>,
+}
+
+impl RewriteCollector {
+  /// Create the state directory the decoy files land in.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the directory cannot be created.
+  fn new(files_dir: &Path) -> Result<Self, Error> {
+    fs::create_dir_all(files_dir).map_err(|source| Error::CreateDir {
+      path: files_dir.to_path_buf(),
+      source,
+    })?;
+    Ok(Self {
+      files_dir: files_dir.to_path_buf(),
+      mounts: Vec::new(),
+      grants: Vec::new(),
+    })
+  }
+
+  /// Write one adapted document's decoy side files and mount them.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a side file cannot be written.
+  fn decoy_files(&mut self, first: &RewriteAdapted) -> Result<(), Error> {
+    for file in &first.decoy_files {
+      let file_path = self.files_dir.join(&file.name);
+      fs::write(&file_path, &file.bytes).map_err(|source| Error::WriteFile {
+        path: file_path.clone(),
+        source,
+      })?;
+      self.mounts.push(Mount {
+        host: file_path,
+        container: PathBuf::from(&file.container),
+        ro: true,
+      });
+    }
+    Ok(())
+  }
+
+  /// Emit one adapted source: its decoy twin at `twin_dest`, its side
+  /// files, and the grant set. An empty adaptation derives nothing.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when an output cannot be written.
+  fn twin(&mut self, adapted: Vec<RewriteAdapted>, twin_name: &str, twin_dest: &str) -> Result<(), Error> {
+    let Some(first) = adapted.first() else {
+      return Ok(());
+    };
+    let twin_path = self.files_dir.join(twin_name);
+    fs::write(&twin_path, first.decoy.as_bytes()).map_err(|source| Error::WriteFile {
+      path: twin_path.clone(),
+      source,
+    })?;
+    self.mounts.push(Mount {
+      host: twin_path,
+      container: PathBuf::from(twin_dest),
+      ro: true,
+    });
+    self.decoy_files(first)?;
+    self.grants.extend(adapted);
+    Ok(())
+  }
+
+  /// The collected mounts and grants.
+  fn outputs(self) -> RewriteOutputs {
+    RewriteOutputs {
+      mounts: self.mounts,
+      grants: self.grants,
+    }
+  }
+}
+
+/// One workspace's explicit `[[workspace.file_rewrite]]` pass: each source
+/// expands, swaps its plain env values or runs the format adapter, and
+/// lands in the state directory with a read-only mount at its dest.
+struct ExplicitRewrites<'a> {
+  /// State directory the rewritten files land in.
+  files_dir: &'a Path,
+  /// Guest-identity directory the kube and talos adapters mint into.
+  guests_dir: &'a Path,
+  /// Xpanda expander for dest values.
+  expander: &'a Xpanda,
+  /// Container home for `{home}` substitution.
+  home: &'a str,
+  /// The guest CA preloaded by the caller, when it loaded one.
+  preloaded_ca: Option<&'a CertAuthority>,
+  /// The guest CA this pass loaded, on first adapter use.
+  ca: Option<CertAuthority>,
+  /// Grants and decoy mounts collected along the way.
+  collector: RewriteCollector,
+}
+
+impl ExplicitRewrites<'_> {
+  /// The guest CA for the format adapters: the caller's preloaded one, or
+  /// one loaded from the config directory on first use.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the hodor config directory or the CA cannot be
+  /// loaded.
+  fn ca(&mut self) -> Result<&CertAuthority, Error> {
+    if let Some(ca) = self.preloaded_ca {
+      return Ok(ca);
+    }
+    if self.ca.is_none() {
+      let ca_path = config_dir()
+        .ok_or_else(|| Error::ConfigDir {
+          detail: "an adapted rewrite needs the hodor config directory to load the CA from".to_string(),
+        })?
+        .join("ca.pem");
+      self.ca = Some(load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
+        path: ca_path.clone(),
+        source,
+      })?);
+    }
+    match self.ca.as_ref() {
+      Some(ca) => Ok(ca),
+      None => Err(Error::ConfigDir {
+        detail: "the adapted-rewrite CA slot is empty after loading it".to_string(),
+      }),
+    }
+  }
+
+  /// One rewrite's output bytes: the format adapter's decoy document with
+  /// its side files emitted, or the plain env-value swap.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the adapter rejects the document, a side file
+  /// cannot be written, or a stated format does not match the document.
+  fn output(&mut self, rewrite: &FileRewrite, host: &Path, content: &[u8], pairs: &RewritePairs) -> Result<Vec<u8>, Error> {
+    let Some(format) = rewrite.format.or_else(|| sniff(content)) else {
+      return Ok(apply_rewrites(content, pairs));
+    };
+    if !rewrite.envs.is_empty() {
+      return Err(Error::RewriteWithEnvs {
+        file: rewrite.source.clone(),
+        format,
+      });
+    }
+    let adapted: Vec<RewriteAdapted> = {
+      let guests_dir = self.guests_dir;
+      let ca = self.ca()?;
+      match format {
+        RewriteFormat::Kubeconfig => kube::adapt(host, content, ca, guests_dir)?.into_iter().collect(),
+        RewriteFormat::Talos => Vec::from([talos::adapt(host, content, ca, guests_dir)?]),
+      }
+    };
+    match adapted.first() {
+      Some(first) => {
+        let bytes = first.decoy.clone().into_bytes();
+        self.collector.decoy_files(first)?;
+        self.collector.grants.extend(adapted);
+        Ok(bytes)
+      }
+      None if rewrite.format.is_some() => Err(Error::RewriteInvalid {
+        file: host.to_path_buf(),
+        format,
+        detail: "the document does not carry the format's markers".to_string(),
+      }),
+      None => Ok(apply_rewrites(content, pairs)),
+    }
+  }
+
+  /// Write one declared rewrite's output and mount it at its dest.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a path fails to expand, the source cannot be
+  /// read, or an output cannot be written.
+  fn write(
+    &mut self,
+    index: usize,
+    rewrite: &FileRewrite,
+    root: &Path,
+    host_home: Option<&Path>,
+    env: &HashMap<String, String>,
+    by_env: &BTreeMap<&str, &str>,
+  ) -> Result<(), Error> {
+    let pairs = rewrite_pairs(rewrite, env, by_env)?;
+    let expanded_source = PathBuf::from(expand_path(self.expander, &rewrite.source.to_string_lossy())?);
     let host = expand(&expanded_source, root, host_home);
     let content = fs::read(&host).map_err(|source| Error::ReadFile {
       path: host.clone(),
       source,
     })?;
-    let format = rewrite.format.or_else(|| sniff(&content));
-    let out_bytes = match format {
-      Some(format) => {
-        if !rewrite.envs.is_empty() {
-          return Err(Error::RewriteWithEnvs {
-            file: rewrite.source.clone(),
-            format,
-          });
-        }
-        let ca: &CertAuthority = if let Some(ca) = preloaded_ca {
-          ca
-        } else {
-          let ca_path = config_dir()
-            .ok_or_else(|| Error::ConfigDir {
-              detail: "an adapted rewrite needs the hodor config directory to load the CA from".to_string(),
-            })?
-            .join("ca.pem");
-          owned_ca.insert(load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
-            path: ca_path.clone(),
-            source,
-          })?)
-        };
-        let adapted = match format {
-          RewriteFormat::Kubeconfig => kube::adapt(&host, &content, ca, guests_dir)?,
-          RewriteFormat::Talos => Some(talos::adapt(&host, &content, ca, guests_dir)?),
-        };
-        match adapted {
-          Some(adapted) => {
-            let bytes = adapted.decoy.clone().into_bytes();
-            grants.push(adapted);
-            bytes
-          }
-          None if rewrite.format.is_some() => {
-            return Err(Error::RewriteInvalid {
-              file: host.clone(),
-              format,
-              detail: "the document does not carry the format's markers".to_string(),
-            });
-          }
-          None => apply_rewrites(&content, &pairs),
-        }
-      }
-      None => apply_rewrites(&content, &pairs),
-    };
-    let out_path = files_dir.join(rewrite_file_name(index, &host));
+    let out_bytes = self.output(rewrite, &host, &content, &pairs)?;
+    let out_path = self.files_dir.join(rewrite_file_name(index, &host));
     fs::write(&out_path, out_bytes).map_err(|source| Error::WriteFile {
       path: out_path.clone(),
       source,
     })?;
-    let container = expand_value(expander, &rewrite.dest)?.replace("{home}", home);
+    let container = expand_value(self.expander, &rewrite.dest)?.replace("{home}", self.home);
     if !container.starts_with('/') {
       return Err(Error::RewriteDestNotAbsolute {
         dest: rewrite.dest.clone(),
       });
     }
-    mounts.push(Mount {
+    self.collector.mounts.push(Mount {
       host: out_path,
       container: PathBuf::from(container),
       ro: true,
     });
+    Ok(())
   }
-  Ok(RewriteOutputs { mounts, grants })
+}
+
+/// Inputs for [`derive_sources`]: the generation context the ambient
+/// sources read.
+pub(crate) struct DeriveInputs<'a> {
+  /// State directory the decoy twins land in.
+  pub(crate) files_dir: &'a Path,
+  /// Workspace root git resolution starts from.
+  pub(crate) root: &'a Path,
+  /// Host-known registry joining forge hosts to env names.
+  pub(crate) registry: &'a Registry,
+  /// Selected decoys supplying the replacement values.
+  pub(crate) decoys: &'a [Decoy],
+  /// Xpanda expander for comparing declared sources.
+  pub(crate) expander: &'a Xpanda,
+  /// Container home the twins mount under.
+  pub(crate) home: &'a str,
+  /// Host home the default source paths live under.
+  pub(crate) host_home: Option<&'a Path>,
+  /// Guest-identity directory the kube and talos adapters mint into.
+  pub(crate) guests_dir: &'a Path,
+  /// Declared rewrites: an explicitly-declared source stays with its
+  /// declaration, not the ambient default.
+  pub(crate) rewrites: &'a [FileRewrite],
+}
+
+/// Read the ambient authentication sources every workspace carries — no
+/// declaration, like fnox's own chain — and map each onto grants plus the
+/// agent's decoy twin at the tool's default path. The gitconfig resolves
+/// from the workspace root the way `git` there resolves it; jj reads its
+/// user chain; the ssh, kubectl, and talosctl configs come from their
+/// default paths. An absent source derives nothing; a present one that
+/// does not map fails closed naming the file.
+///
+/// # Errors
+///
+/// Returns an error naming the source when it cannot be read or does not
+/// map, when the guest CA cannot be loaded, or when an output cannot be
+/// written.
+///
+/// ponytail: no opt-out exists yet; none has been asked for.
+/// `KUBECONFIG`/`TALOSCONFIG` honor a single path — a list warns and falls
+/// back to the default.
+pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs, Error> {
+  let DeriveInputs {
+    files_dir,
+    root,
+    registry,
+    decoys,
+    expander,
+    home,
+    host_home,
+    guests_dir,
+    rewrites,
+  } = *inputs;
+  let Some(host_home) = host_home else {
+    return Ok(RewriteOutputs {
+      mounts: Vec::new(),
+      grants: Vec::new(),
+    });
+  };
+  let declared = rewrites
+    .iter()
+    .map(|rewrite| {
+      let expanded = PathBuf::from(expand_path(expander, &rewrite.source.to_string_lossy())?);
+      Ok(expand(&expanded, root, Some(host_home)))
+    })
+    .collect::<Result<Vec<_>, Error>>()?;
+  let mut deriver = AmbientDeriver {
+    root,
+    registry,
+    decoys,
+    home,
+    host_home,
+    guests_dir,
+    declared,
+    ca: None,
+    collector: RewriteCollector::new(files_dir)?,
+  };
+  deriver.git()?;
+  deriver.jj()?;
+  deriver.ssh()?;
+  deriver.kube_and_talos()?;
+  Ok(deriver.collector.outputs())
+}
+
+/// One workspace's ambient-source pass: the authentication sources every
+/// workspace carries — gitconfig, jj, ssh, kubectl, talosctl — map onto
+/// grants plus the agent's decoy twin at the tool's default path. A source
+/// the workspace declared explicitly stays with its declaration; a present
+/// source that does not map warns, and one whose guest CA is unavailable
+/// skips.
+struct AmbientDeriver<'a> {
+  /// Workspace root git resolution starts from.
+  root: &'a Path,
+  /// Host-known registry joining forge hosts to env names.
+  registry: &'a Registry,
+  /// Selected decoys supplying the replacement values.
+  decoys: &'a [Decoy],
+  /// Container home the twins mount under.
+  home: &'a str,
+  /// Host home the default source paths live under.
+  host_home: &'a Path,
+  /// Guest-identity directory the kube and talos adapters mint into.
+  guests_dir: &'a Path,
+  /// Sources the workspace declared explicitly; the ambient pass leaves
+  /// them to their declarations.
+  declared: Vec<PathBuf>,
+  /// The guest CA, loaded on first use.
+  ca: Option<CertAuthority>,
+  /// Grants and decoy mounts collected along the way.
+  collector: RewriteCollector,
+}
+
+impl AmbientDeriver<'_> {
+  /// The gitconfig chain `git` at the workspace root resolves.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the twin output cannot be written.
+  fn git(&mut self) -> Result<(), Error> {
+    let mut git_sources = vec![self.host_home.join(".gitconfig")];
+    if let Some(dir) = dirs_config_dir() {
+      git_sources.push(dir.join("git").join("config"));
+    }
+    if let Some(path) = env::var_os("GIT_CONFIG_GLOBAL") {
+      git_sources.push(PathBuf::from(path));
+    }
+    if git_sources.iter().any(|path| self.declared.contains(path)) {
+      return Ok(());
+    }
+    let first = &git_sources[0];
+    match git::adapt(first, self.root, self.registry, self.decoys, self.home, self.host_home) {
+      Ok(adapted) => self.collector.twin(adapted, "gitconfig", &format!("{}/.gitconfig", self.home)),
+      Err(err) => {
+        tracing::warn!(source = %first.display(), %err, "gitconfig source skipped");
+        Ok(())
+      }
+    }
+  }
+
+  /// The jj user chain, falling back to git identity.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the twin output cannot be written.
+  fn jj(&mut self) -> Result<(), Error> {
+    if jj::chain_paths().iter().any(|path| self.declared.contains(path)) {
+      return Ok(());
+    }
+    if let Some(adapted) = jj::adapt(self.root) {
+      let dest = format!("{}/.config/jj/config.toml", self.home);
+      return self.collector.twin(vec![adapted], "jj-config", &dest);
+    }
+    Ok(())
+  }
+
+  /// The ssh config at its default path.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the config cannot be read or the twin output
+  /// cannot be written.
+  fn ssh(&mut self) -> Result<(), Error> {
+    let ssh_config = self.host_home.join(".ssh").join("config");
+    if self.declared.contains(&ssh_config) || !ssh_config.is_file() {
+      return Ok(());
+    }
+    let content = fs::read(&ssh_config).map_err(|source| Error::ReadFile {
+      path: ssh_config.clone(),
+      source,
+    })?;
+    let dest = format!("{}/.ssh/config", self.home);
+    match ssh::adapt(&ssh_config, &content, self.home, self.host_home) {
+      Ok(adapted) => self.collector.twin(adapted, "ssh-config", &dest),
+      Err(err) => {
+        tracing::warn!(source = %ssh_config.display(), %err, "ssh source skipped");
+        Ok(())
+      }
+    }
+  }
+
+  /// The kubeconfig and talosconfig at their default paths, honoring a
+  /// single-path `KUBECONFIG`/`TALOSCONFIG` override.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a twin output cannot be written.
+  fn kube_and_talos(&mut self) -> Result<(), Error> {
+    for (name, env_name, default, twin_name, twin_dest) in [
+      ("kubeconfig", "KUBECONFIG", ".kube/config", "kube-config", ".kube/config"),
+      ("talosconfig", "TALOSCONFIG", ".talos/config", "talos-config", ".talos/config"),
+    ] {
+      let path = env_source(env_name, default, self.host_home);
+      if self.declared.contains(&path) || !path.is_file() {
+        continue;
+      }
+      let Ok(content) = fs::read(&path) else {
+        tracing::warn!(source = %path.display(), "{name} source skipped: it cannot be read");
+        continue;
+      };
+      let guests_dir = self.guests_dir;
+      let ca = match self.ca() {
+        Ok(ca) => ca,
+        Err(err) => {
+          tracing::warn!(source = %path.display(), %err, "{name} source skipped: the guest CA is unavailable");
+          continue;
+        }
+      };
+      let adapted = match name {
+        "kubeconfig" => kube::adapt(&path, &content, ca, guests_dir)
+          .ok()
+          .flatten()
+          .map(|adapted| vec![adapted])
+          .unwrap_or_default(),
+        _ => talos::adapt(&path, &content, ca, guests_dir)
+          .map(|adapted| vec![adapted])
+          .ok()
+          .unwrap_or_default(),
+      };
+      if adapted.is_empty() {
+        tracing::warn!(source = %path.display(), "{name} source skipped: it does not map onto a grant");
+        continue;
+      }
+      self.collector.twin(adapted, twin_name, &format!("{}/{twin_dest}", self.home))?;
+    }
+    Ok(())
+  }
+
+  /// The guest CA for the kubeconfig and talosconfig adapters, loaded on
+  /// first use.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the hodor config directory or the CA cannot be
+  /// loaded.
+  fn ca(&mut self) -> Result<&CertAuthority, Error> {
+    if self.ca.is_none() {
+      let ca_path = config_dir()
+        .ok_or_else(|| Error::ConfigDir {
+          detail: "ambient kubeconfig derivation needs the hodor config directory to load the CA from".to_string(),
+        })?
+        .join("ca.pem");
+      self.ca = Some(load_or_generate(&ca_path).map_err(|source| Error::GuestCa { path: ca_path, source })?);
+    }
+    match self.ca.as_ref() {
+      Some(ca) => Ok(ca),
+      None => Err(Error::ConfigDir {
+        detail: "the ambient guest CA slot is empty after loading it".to_string(),
+      }),
+    }
+  }
+}
+
+/// The source path one `KUBECONFIG`-style override names, or the default
+/// under the host home.
+fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
+  match env::var(env_name) {
+    Ok(value) if !value.contains(':') => PathBuf::from(value),
+    Ok(value) => {
+      tracing::warn!(env_name, value, "names multiple paths; using the default location instead");
+      host_home.join(default)
+    }
+    Err(_) => host_home.join(default),
+  }
 }
 
 /// The process's user id, from the kernel: the same value `id -u` prints,
@@ -629,46 +1138,31 @@ pub(crate) fn current_uid() -> u32 {
   unsafe { getuid() }
 }
 
-/// `[rules.*]` TOML for the selection: env names only, values resolve from
-/// fnox at serve time.
+/// `hodor rules` TOML for the selection: what derivation substitutes, what
+/// still needs a host, and what no registry entry covers.
 pub(crate) fn rules_toml(decoys: &[Decoy], hostless: &[Decoy], unregistered: &[String]) -> String {
   let mut out = String::from(
-    "# generated by `hodor rules` — values resolve from fnox at serve time.\n\
+    "# `hodor rules` — what this workspace's proxy substitutes.\n\
      #\n\
-     # A rule swaps its real value in only for the hosts it lists, so every rule\n\
-     # needs at least one. The registry supplies them, which is why most rules\n\
-     # below need nothing more. Providers whose hosts are per deployment (self-hosted\n\
-     # control planes) are listed commented at the end — name the host to use them.\n\
-     # Put the rule in the workspace `.config/hodor/config.toml` or in the global\n\
-     # `<config-dir>/hodor/config.toml`; per label, the workspace file wins:\n\
-     #\n\
-     #   [rules.my_secret]\n\
-     #   env = \"MY_SECRET\"\n\
-     #   allow = [\"https://api.internal.example.com\"]\n\
-     #\n\
-     # To give a name hosts for every workspace instead of one rule, add an\n\
-     # override file in `<config-dir>/hodor/rules.d/` or\n\
-     # `<workspace root>/.config/hodor/rules.d/`:\n\
-     #\n\
-     #   [names.MY_SECRET]\n\
-     #   hosts = [\"https://api.internal.example.com\"]\n\
-     #\n\
-     # `allow` takes `scheme://host[:port]` entries and unions with the registry\n\
-     # hosts; `registry = false` drops those and keeps only `allow`. A fnox key\n\
-     # no registry entry covers gets no rule at all — the names are listed at the\n\
-     # end of this output.\n",
+     # The catalog derives at serve time: every fnox-declared name the registry\n\
+     # gives hosts becomes a rule, its value resolving from fnox. Config states\n\
+     # overrides only — a [rules.<env>] block in the workspace\n\
+     # `.config/hodor/config.toml` or the global `<config-dir>/hodor/config.toml`,\n\
+     # where the workspace file wins per label; its `allow` unions with the\n\
+     # registry hosts, and `registry = false` keeps only `allow`. To give a name\n\
+     # hosts in every workspace instead, add an override file in\n\
+     # `<config-dir>/hodor/rules.d/` or `<workspace root>/.config/hodor/rules.d/`.\n",
   );
-  for decoy in decoys {
-    let _ = writeln!(
-      out,
-      "[rules.{}]\nenv = \"{}\"\nif_missing = \"warn\"\n",
-      decoy.env.to_lowercase(),
-      decoy.env
-    );
+  if !decoys.is_empty() {
+    out.push_str("#\n# derives automatically, hosts from the registry:\n");
+    for decoy in decoys {
+      let _ = writeln!(out, "#   {}", decoy.env);
+    }
   }
   if !hostless.is_empty() {
     out.push_str(
-      "# The registry knows these names but states no hosts: either the endpoint is\n\
+      "#\n\
+       # The registry knows these names but states no hosts: either the endpoint is\n\
        # per deployment (self-hosted control planes) or the value is a signing input\n\
        # that never reaches the wire (exchange API secrets — see\n\
        # https://github.com/casualjim/hodor/issues/19). Name the endpoint to use the\n\
@@ -678,7 +1172,7 @@ pub(crate) fn rules_toml(decoys: &[Decoy], hostless: &[Decoy], unregistered: &[S
     for decoy in hostless {
       let _ = writeln!(
         out,
-        "# [rules.{}]\n# env = \"{}\"\n# allow = [\"https://<your-host>\"]\n# if_missing = \"warn\"\n",
+        "# [rules.{}]\n# env = \"{}\"\n# allow = [\"https://<your-host>\"]\n",
         decoy.env.to_lowercase(),
         decoy.env
       );
@@ -687,7 +1181,7 @@ pub(crate) fn rules_toml(decoys: &[Decoy], hostless: &[Decoy], unregistered: &[S
   if !unregistered.is_empty() {
     let _ = writeln!(
       out,
-      "# fnox declares these but no registry entry covers them, so nothing generates a rule:\n# {}\n",
+      "#\n# fnox declares these but no registry entry covers them, so nothing derives:\n# {}\n",
       unregistered.join(", ")
     );
   }
@@ -1164,10 +1658,12 @@ pub(crate) fn workspace_slug(root: &Path) -> String {
 }
 
 /// The workspace's own config, as generation and support-file setup read it:
-/// the unified project layer when it exists, the legacy flat file otherwise.
+/// the unified project layer when it exists, the legacy flat file otherwise,
+/// and the unified path itself when neither does — a workspace with no config
+/// has no project layer at all, never one discovered from the process cwd.
 pub(crate) fn workspace_config(root: &Path) -> Result<AppConfig, Error> {
   let cli = Cli {
-    config: project_config_file(root),
+    config: Some(project_config_file(root).unwrap_or_else(|| project_config_write_path(root))),
   };
   Ok(load(&cli, None)?.0)
 }
@@ -1205,6 +1701,7 @@ mod tests {
       registry: None,
       oauth2: None,
       tls,
+      ssh: BTreeMap::new(),
       if_missing: IfMissing::default(),
     };
     let mut rules = BTreeMap::new();

@@ -11,11 +11,13 @@ mod h2;
 mod http;
 mod postgres;
 mod raw;
+mod ssh;
 
 pub(crate) use h2::H2;
 pub(crate) use http::Http;
 pub(crate) use postgres::{GuestOpening, Postgres, read_guest_opening, request_upstream_tls};
 pub(crate) use raw::Raw;
+pub(crate) use ssh::{SshLegs, SshLegsFiles, Upstream};
 
 use std::borrow::Cow;
 
@@ -141,7 +143,9 @@ pub(crate) fn eligible_pairs(grants: &[Grant], scheme: Scheme, host: &str, port:
     if !grant.matches(scheme, host, port) {
       continue;
     }
-    let credential = grant.credential();
+    let Some(credential) = grant.credential() else {
+      continue;
+    };
     let (needle, replacement) = match dir {
       Direction::Downstream => (credential.fake.as_bytes(), credential.value.expose_secret().as_bytes()),
       Direction::Upstream => (credential.value.expose_secret().as_bytes(), credential.fake.as_bytes()),
@@ -178,13 +182,16 @@ pub(crate) struct MintPlan {
 /// flow-granted grant matches this endpoint.
 pub(crate) fn mint_plan_for(grants: &[Grant], scheme: Scheme, host: &str, port: u16) -> Option<MintPlan> {
   grants.iter().find_map(|grant| match grant {
-    Grant::Token { oauth2: Some(flow), .. } if grant.matches(scheme, host, port) => {
+    Grant::Token {
+      credential,
+      oauth2: Some(flow),
+      ..
+    } if grant.matches(scheme, host, port) => {
       let fields = if flow.token_fields.is_empty() {
         flow.fields().into_iter().map(str::to_string).collect()
       } else {
         flow.token_fields.clone()
       };
-      let credential = grant.credential();
       Some(MintPlan {
         label: credential.label.clone(),
         pattern: grant_pattern(grant),
@@ -199,7 +206,7 @@ pub(crate) fn mint_plan_for(grants: &[Grant], scheme: Scheme, host: &str, port: 
 fn grant_pattern(grant: &Grant) -> Option<String> {
   match grant {
     Grant::Token { pattern, .. } => pattern.clone(),
-    Grant::Database { .. } => None,
+    Grant::Database { .. } | Grant::Ssh { .. } => None,
   }
 }
 

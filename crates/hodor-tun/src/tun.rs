@@ -47,7 +47,7 @@ pub async fn run_tun(state: Arc<ProxyState>) -> Result<(), Error> {
   run_tun_named(TUN_NAME, TUN_ADDR, true, None, state).await
 }
 
-/// Test seam: custom interface name/addr, optional route install,
+/// Test overrides: custom interface name/addr, optional route install,
 /// optional DNS upstream override (else /etc/resolv.conf).
 pub(crate) async fn run_tun_named(
   name: &str,
@@ -222,7 +222,7 @@ fn forward_udp(
 /// One captured TCP connection: sniff TLS vs plain, then serve through
 /// the same candidate machinery as explicit CONNECT (no 200, no
 /// authority check — the SNI itself is the identity).
-/// `upstream_override` is a test seam (DNS remap shape): dial this address
+/// `upstream_override` is a test override (DNS remap shape): dial this address
 /// instead of the captured destination. None in production.
 async fn tun_conn_task(conn: NewTcpConn, upstream_override: Option<SocketAddr>, state: Arc<ProxyState>) {
   let snapshot = state.snapshot();
@@ -277,6 +277,8 @@ mod tests {
           listen: "127.0.0.1:0".parse().unwrap(),
           ca_file: None,
           root_certs: Vec::new(),
+          ssh_host_key: None,
+          ssh_known_hosts: None,
           handshake_timeout_secs: 10,
         },
         grants,
@@ -392,6 +394,8 @@ mod tests {
           proxy: hodor_config::config::ProxyCfg {
             listen: "127.0.0.1:0".parse().unwrap(),
             ca_file: None,
+            ssh_host_key: None,
+            ssh_known_hosts: None,
             root_certs: Vec::new(),
             handshake_timeout_secs: 10,
           },

@@ -113,23 +113,35 @@ parent = "__shared__"
 
 A profile mounts its own tool dirs plus every tool its cookie parent names that it does not override. The mounts are writable: what the tool writes lands beside the profile on the host. No cookie means `__shared__` directly, and when both layers hold a `profile.toml` the project one wins outright. Cycles, unknown parents, and non-segment names fail generation.
 
+## Automatic sources
+
+`hodor agent` derives a working, decoy-only development environment from the authentication sources a workspace already carries — no declaration, the same way fnox's own chain is read. Each source present on the host maps onto grants plus a decoy twin mounted at the tool's default path; an absent source derives nothing, and the pass is liberal: a source that does not map — an ssh config whose blocks carry `Include`/`Match`/`ProxyJump` or a second identity, a broken kubeconfig — is skipped with a warning, never a failure. Only a credential-shaped gitconfig value (an `Authorization` extra header, an insteadOf base with userinfo) skips its whole source, because mounting a twin would carry a real secret.
+
+| Source | Resolution | Twin mounts at |
+| --- | --- | --- |
+| gitconfig | The chain `git` itself resolves from the workspace root: globals with their `include.path`/`includeIf` follows, the repository's own config (linked worktrees resolve to the common dir), and `GIT_CONFIG_*` environment overrides. | `{home}/.gitconfig` |
+| jj config | jj's user chain: `JJ_CONFIG` (a file, a `*.toml` directory, or a path list; even empty it replaces the defaults), else `~/.jjconfig.toml`, then `<config-dir>/jj/config.toml` and `<config-dir>/jj/conf.d/*.toml` in name order. `user.name`/`user.email` fall back to the resolved git chain, as jj itself falls back. | `{home}/.config/jj/config.toml` |
+| ssh config | `~/.ssh/config`, per exact-host `Host` block carrying exactly one `IdentityFile`. | `{home}/.ssh/config` plus the decoy key at the mirrored path and a fresh `known_hosts` |
+| kubeconfig | `KUBECONFIG` when it names a single file, else `~/.kube/config`. A file-reference kubeconfig must be flattened first: `kubectl config view --flatten --minify`. | `{home}/.kube/config` |
+| talosconfig | `TALOSCONFIG` when it names a single file, else `~/.talos/config`. | `{home}/.talos/config` |
+
+The gitconfig is a per-forge-host authentication map, never a secret store: an `Authorization` extra header or an insteadOf base with embedded userinfo fails closed, because the agent's copy must carry decoys only. For each https remote (rewritten through `url.<base>.insteadOf`) and `credential.<url>` scope whose host a fnox-declared registry name covers, the twin mints an `http.<url>.extraHeader` holding basic auth over that name's decoy — the agent runs no credential helpers, and the proxy decodes, swaps decoy for the real value, and re-encodes. Remotes over git+ssh with a `core.sshCommand -i` identity mint the same per-host ssh grant the ssh config source mints; ssh remotes without one warn. A kubeconfig source is adapted rather than byte-swapped: the API server URL becomes an `https://` allow entry, the client certificate and key materialize into a per-entry TLS identity, the cluster CA becomes that entry's `root_cert`, and the decoy twin points at the same server but carries the hodor CA plus a minted guest pair. A talosconfig adapts the same way (bare endpoints gain the Talos API port 50000); Omni `auth:` blocks carry no substitutable pair and fail closed.
+
 ## `[[workspace.file_rewrite]]`
 
-Host files rewritten with decoys and mounted read-only into the agent. Each listed env name's real value is byte-replaced by its decoy in the file, and the rewritten copy lands under the workspace state directory — the agent sees decoys only; hodor holds the real values. A file-reference kubeconfig must be flattened first: `kubectl config view --flatten --minify`.
+Host files rewritten with decoys and mounted read-only into the agent — the escape hatch for files outside the automatic sources above. Each listed env name's real value is byte-replaced by its decoy in the file, and the rewritten copy lands under the workspace state directory — the agent sees decoys only; hodor holds the real values.
 
 | Key | Required | Purpose |
 | --- | --- | --- |
 | `source` | yes | Host file to read. `~` and `$VAR` expand; relative paths resolve against the workspace root. |
 | `dest` | yes | Container path the rewritten file mounts at, read-only. `{home}` expands to `[workspace] home` and `$VAR` expands first. |
-| `envs` | no | Env names whose real values are replaced by their decoys in the file. Empty for the known config formats — `kubeconfig` (kubectl) and `talos` (talosctl): the adapter knows where the secrets live. |
-| `format` | no | Declared format, skipping detection. Known: `format = "kubeconfig"` and `format = "talos"`, each failing closed when the file does not parse as one. Absent, both are detected by content and other files keep the raw byte-swap. |
-
-A kubeconfig source is adapted rather than byte-swapped: the API server URL becomes an `https://` allow entry, the client certificate and key materialize into a per-entry TLS identity, the cluster CA becomes that entry's `root_cert`, and the generated decoy kubeconfig points at the same server but carries the hodor CA plus a minted guest pair. Grant labels derive from the source path and context. A talosconfig source adapts the same way: each endpoint becomes an `https://` allow entry (bare endpoints gain the Talos API port 50000), the client pair and cluster CA materialize into the TLS identity, and the decoy keeps the endpoints and nodes but carries the hodor CA plus a minted guest pair. Omni `auth:` blocks carry no substitutable pair and fail closed.
+| `envs` | no | Env names whose real values are replaced by their decoys in the file. Empty for the structural formats — `kubeconfig` (kubectl), `talos` (talosctl): the adapter knows where the secrets live. |
+| `format` | no | Declared format, skipping detection. Known: `format = "kubeconfig"` and `format = "talos"`, each failing closed when the file does not parse as one. Absent, both are detected by content and other files keep the raw byte-swap. A source matching an automatic location stays with its declaration; the automatic pass skips it. |
 
 ```toml
 [[workspace.file_rewrite]]
-source = "~/.kube/k3s.yaml"
-dest = "{home}/.kube/config"
+source = "~/.kube/other-cluster.yaml"
+dest = "{home}/.kube/other-config"
 format = "kubeconfig"
 ```
 

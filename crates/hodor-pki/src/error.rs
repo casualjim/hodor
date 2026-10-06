@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::str::Utf8Error;
 
 use rcgen::Error as RcgenError;
+use russh::keys::Error as RusshKeysError;
+use russh::keys::ssh_key::Error as SshKeyError;
 use rustls::Error as RustlsError;
 use rustls::pki_types::pem::Error as PemError;
 
@@ -153,5 +155,19 @@ pub enum Error {
     /// Underlying I/O failure.
     #[source]
     source: IoError,
+  },
+  /// An SSH key pair does not generate.
+  #[error("ssh keygen: {source}")]
+  SshKeygen {
+    /// Underlying generation failure.
+    #[source]
+    source: SshKeyError,
+  },
+  /// SSH key material does not parse or encode.
+  #[error("ssh key material: {source}")]
+  SshKeys {
+    /// Underlying russh keys failure.
+    #[source]
+    source: RusshKeysError,
   },
 }

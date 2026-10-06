@@ -580,7 +580,7 @@ pattern = "dp.st.{base62:3}.{base62:24}"
 env = ["DRONE_TOKEN"]
 pattern = "eyJ{base62:32}.{base62:32}.{base62:32}"
 # source: https://0-8-0.docs.drone.io/cli-authentication/
-# note: the page documents `export DRONE_TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` alongside `DRONE_SERVER`; the token is a personal access token from the user profile screen, so the pattern approximates a JWT.
+# note: the page documents `export DRONE_TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` alongside `DRONE_SERVER`; the token is a personal access token from the user profile screen, so the pattern approximates a JWT. betterleaks:allow
 # note: the cited page is Drone's versioned 0.8 CLI-authentication documentation; the current site no longer serves that path (`docs.drone.io/cli/authentication/` returns 404).
 # note: Drone control planes are self-hosted (`DRONE_SERVER`, e.g. `http://drone.mycompany.com`); rules carry explicit allow entries.
 
@@ -1830,7 +1830,7 @@ pattern = "{base62:14}.atlasv1.{base62:67}"
 # source: https://developer.hashicorp.com/terraform/cli/config/config-file
 # source: https://developer.hashicorp.com/terraform/cloud-docs/api-docs/user-tokens
 # note: `TFE_TOKEN` is the tfe provider's documented env var; `TF_TOKEN_app_terraform_io` is the Terraform CLI's documented host-specific credential variable (`TF_TOKEN_` plus the hostname with periods encoded as underscores), which the CLI prefers over stored credentials.
-# note: the pattern follows the documented user-token example `6tL24nM38M7XWQ.atlasv1.KmWckRfzeNmUVFNvpvwUEChKaLGznCSD6fPf3VPzqMMVzmSxFU0p2Ibzpo2h5…` (example redacted); no cited page states the shape of the team, group, or organization token types.
+# note: the pattern follows the documented user-token example `6tL24nM38M7XWQ.atlasv1.KmWckRfzeNmUVFNvpvwUEChKaLGznCSD6fPf3VPzqMMVzmSxFU0p2Ibzpo2h5…` (example redacted); no cited page states the shape of the team, group, or organization token types. betterleaks:allow
 # note: HCP Terraform also answers at its historical hostname `atlas.hashicorp.com`; HCP Europe organizations use `app.eu.terraform.io`, whose CLI variable would be `TF_TOKEN_app_eu_terraform_io`. Terraform Enterprise is self-hosted and takes a per-hostname `TF_TOKEN_*` variable.
 
 [providers.the-grid-ai]

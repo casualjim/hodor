@@ -8,21 +8,21 @@ repository = "https://github.com/casualjim/hodor"
 publish = false
 
 [dependencies]
-fnox-core = "1.33"
-hodor-config = { path = "../hodor-config" }
-miette = { version = "7", features = ["fancy"] }
-secrecy = { version = "0.10", features = ["serde"] }
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-toml = "0.8"
-toml_edit = { version = "0.25", features = ["serde"] }
-tracing = "0.1"
+fnox-core = { workspace = true }
+hodor-config = { workspace = true }
+miette = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-miette = { version = "7", features = ["fancy"] }
-pretty_assertions = "1"
-tempfile = "3"
+miette = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

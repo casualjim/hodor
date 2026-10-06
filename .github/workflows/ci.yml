@@ -28,18 +28,36 @@ jobs:
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold
 
-      - name: Install clang matching rustc's LLVM major
+      # Pinned by hand to the LLVM major the pinned rustc ships. rustc is
+      # NOT installed yet when this step runs, so probing `rustc -Vv` here
+      # reads the runner's stale preinstall and installs the wrong clang.
+      # Bump this together with the `linker` in `.cargo/config.toml` and
+      # the rustc version, a few times a year.
+      - name: Install clang 23 (rustc 1.99 = LLVM 23)
         run: |-
           set -euxo pipefail
-          llvm_major="$(rustc -Vv | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
-          curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- "$llvm_major"
-          sudo apt-get install -y --no-install-recommends "clang-${llvm_major}"
+          curl -sSL https://apt.llvm.org/llvm.sh | sudo bash -s -- 23
+          sudo apt-get install -y --no-install-recommends clang-23
 
       - uses: jdx/mise-action@v4
         with:
           experimental: true
           install: true
           cache: true
+
+      # With the pinned rustc now on PATH, assert it still ships the LLVM
+      # major the clang pin above and `.cargo/config.toml`'s `linker` were
+      # written for. A rust bump that skips the pin fails here, loudly,
+      # instead of as a missing-linker error halfway through a build.
+      - name: Verify the clang pin matches rustc's LLVM major
+        run: |-
+          set -euxo pipefail
+          llvm_major="$(rustc -vV | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
+          if [ "$llvm_major" != 23 ]; then
+            echo "rustc reports LLVM ${llvm_major} but the pinned clang is 23." >&2
+            echo "Bump the clang pin in this workflow and the linker in .cargo/config.toml." >&2
+            exit 1
+          fi
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -51,5 +69,3 @@ jobs:
 
       - name: Buld & Test
         run: mise build
-
-

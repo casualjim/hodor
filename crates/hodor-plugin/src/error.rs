@@ -65,4 +65,11 @@ pub enum Error {
     #[source]
     origin: WasmtimeError,
   },
+  /// A fresh store cannot arm its fuel budget.
+  #[error("arming fuel on a fresh plugin store: {origin}")]
+  FuelArm {
+    /// Underlying wasmtime failure.
+    #[source]
+    origin: WasmtimeError,
+  },
 }

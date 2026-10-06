@@ -12,13 +12,13 @@ use tokio::process::Command;
 use crate::error::Error;
 use crate::paths::translate;
 use crate::stack::{
-  STACK_SHAPE, current_uid, generate_stack, generation_registry, open_fnox, rules_command, stack_shape_in, uncovered_names,
+  STACK_SHAPE, current_uid, derivable_envs, generate_stack, generation_registry, open_fnox, stack_shape_in, uncovered_names,
   uncovered_warning, workspace_config, workspace_file, workspace_state_dir,
 };
 use clap::Args;
 use dirs::home_dir;
 use hodor_config::cli::{Cli, CliCommand, ProxyBackend};
-use hodor_config::config::{AppConfig, config_dir};
+use hodor_config::config::{AppConfig, RuleCfg, config_dir};
 use hodor_fnox::selected_envs;
 use hodor_pki::ca::load_or_generate;
 use libc::{SIG_DFL, SIGINT, c_int, sighandler_t, signal};
@@ -78,7 +78,7 @@ pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> Result<Vec<(Pa
     Ok(_) => files.push((ca, created)),
     // A read-only or unwritable config directory only warns: the stack still
     // starts when a compose layer mounts a CA made with `hodor ca`.
-    Err(err) => println!("warning: could not prepare {}: {err}", dir.join("ca.pem").display()),
+    Err(err) => tracing::warn!(path = %ca.display(), %err, "could not prepare the CA"),
   }
   files.push((entrypoint.clone(), write_entrypoint(&entrypoint)?));
   // The agent's inner container storage — see the generated compose file for
@@ -86,7 +86,7 @@ pub(crate) fn ensure_support_files(dir: &Path, storage: &Path) -> Result<Vec<(Pa
   let storage_created = !storage.exists();
   match fs::create_dir_all(storage) {
     Ok(()) => files.push((storage.to_path_buf(), storage_created)),
-    Err(err) => println!("warning: could not prepare {}: {err}", storage.display()),
+    Err(err) => tracing::warn!(path = %storage.display(), %err, "could not prepare the agent storage directory"),
   }
   Ok(files)
 }
@@ -183,21 +183,6 @@ pub(crate) fn write_if_absent(path: &Path, content: &str) -> Result<bool, Error>
     source,
   })?;
   Ok(true)
-}
-
-/// Generate the workspace config when the workspace has none, from `hodor
-/// rules`: every fnox-declared name the registry knows, as `[rules.*]` blocks.
-/// Without a rule nothing is substituted — every decoy the agent holds stays a
-/// decoy — so `init` writes the file rather than serving a workspace that
-/// cannot swap anything. The file is the user's to trim from then on.
-fn ensure_workspace_config(root: &Path) -> Result<(PathBuf, bool), Error> {
-  if let Some(existing) = hodor_config::config::project_config_file(root) {
-    return Ok((existing, false));
-  }
-  let path = workspace_config_file(root);
-  let content = rules_command(Some(root)).map_err(|source| Error::GenerateRules { source: source.into() })?;
-  let written = write_if_absent(&path, &content)?;
-  Ok((path, written))
 }
 
 /// Write `mise.agent.toml` from `mise.local.toml` when the workspace uses
@@ -297,17 +282,19 @@ fn rewrite_mise_string(value: &str, host_home: Option<&Path>, home: &str) -> Str
   }
 }
 
-/// A warning when no rule is in play, since then nothing would be substituted
-/// and every credential the agent holds stays a decoy; `None` when at least
-/// one rule is in effect.
-pub(crate) fn rules_warning(rules: &BTreeMap<String, hodor_config::config::RuleCfg>, config_file: &Path) -> Option<String> {
-  if !rules.is_empty() {
+/// A warning when nothing will substitute — no rule in play and nothing the
+/// registry could turn into one — since then every credential the agent
+/// holds stays a decoy; `None` when a rule or a derivable name is in effect.
+pub(crate) fn rules_warning(rules: &BTreeMap<String, RuleCfg>, derivable: &[String]) -> Option<String> {
+  if !rules.is_empty() || !derivable.is_empty() {
     return None;
   }
-  Some(format!(
-    "warning: no [rules.*] in play, so nothing will be substituted and every credential the agent holds stays a decoy; `hodor rules` prints the blocks to add to {}",
-    config_file.display()
-  ))
+  Some(
+    "warning: no [rules.*] in play and nothing derives from fnox through the registry, \
+     so nothing will be substituted and every credential the agent holds stays a decoy; \
+     `hodor rules` lists what fnox and the registry cover"
+      .to_string(),
+  )
 }
 
 /// Digest of both config layers' bytes — global and workspace — plus the
@@ -398,12 +385,11 @@ async fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bo
     path: state_ws.clone(),
     source,
   })?;
-  let (config_file, written) = ensure_workspace_config(root)?;
-  if written {
-    println!("wrote {}", config_file.display());
-  }
   let workspace = workspace_config(root)?;
-  if let Some(warning) = rules_warning(&workspace.rules, &config_file) {
+  let registry = generation_registry(Some(root))?;
+  let fnox = open_fnox()?;
+  let derivable = derivable_envs(fnox.as_ref(), &registry);
+  if let Some(warning) = rules_warning(&workspace.rules, &derivable) {
     println!("{warning}");
   }
   report_created(&prepare_support_files(root)?);
@@ -646,12 +632,13 @@ fn workspace_arg(workspace: Option<&Path>) -> PathBuf {
   workspace.unwrap_or(Path::new(".")).to_path_buf()
 }
 
-/// `hodor init [--backend <backend>] [workspace]`: write the support files, the
-/// workspace config when it has none (`[rules.*]` for every fnox-declared name
-/// the registry knows, so the stack can actually substitute), and the workspace
-/// stack into `<state-dir>/hodor/ws/<slug>/compose.yml` — the one editable file
-/// where generated services and secret mounts live. An existing stack is
-/// regenerated only when the workspace config changed since it was generated.
+/// `hodor init [--backend <backend>] [workspace]`: write the support files, a
+/// stub workspace config when the workspace has none (rules derive at serve
+/// time, so the file holds overrides and `[workspace]` keys only), and the
+/// workspace stack into `<state-dir>/hodor/ws/<slug>/compose.yml` — the one
+/// editable file where generated services and secret mounts live. An existing
+/// stack is regenerated only when the workspace config changed since it was
+/// generated.
 impl CliCommand for InitArgs {
   type Error = Error;
   /// Runs the init generation.
@@ -659,8 +646,7 @@ impl CliCommand for InitArgs {
   /// # Errors
   ///
   /// Returns an error when the host is not Linux, when the workspace cannot be
-  /// resolved or its stack generated, when `hodor rules` cannot be computed, or
-  /// when a file cannot be written.
+  /// resolved or its stack generated, or when the registry cannot be loaded.
   async fn run(self, _cli: &Cli, hodor_version: &str) -> Result<(), Self::Error> {
     let root = resolve_root(&workspace_arg(self.workspace.as_deref()))?;
     init_workspace(&root, resolve_backend(self.backend)?, self.backend.is_some(), hodor_version).await

@@ -151,7 +151,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
   };
   let (active, identity) = doc.selected(source, invalid)?;
   let allows = TalosDoc::allows(active, invalid)?;
-  let label = rewrite_label(source, RewriteFormat::Talos, &doc.context)?;
+  let label = rewrite_label(source, &doc.context)?;
   let env = label.to_uppercase().replace('-', "_");
   // Identity-only grant: the certificate never reaches the wire as
   // application data, so it can never match the swap; it still needs a value
@@ -189,10 +189,12 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       env,
       registry: false,
       allow: allows.clone(),
-      value,
+      value: Some(value),
+      if_missing: None,
       tls: allows.iter().map(|allow| (allow.clone(), tls.clone())).collect(),
+      ssh: BTreeMap::new(),
     },
-  );
+  )?;
   let decoy = render_decoy(&DecoyDoc {
     context: doc.context.clone(),
     contexts: BTreeMap::from([(
@@ -205,11 +207,12 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
         key: STANDARD.encode(&guest_key),
       },
     )]),
-  });
+  })?;
   Ok(RewriteAdapted {
     fragment,
     decoy,
     materialized,
+    decoy_files: Vec::new(),
   })
 }
 

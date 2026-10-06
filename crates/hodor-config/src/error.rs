@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use confique::Error as ConfiqueError;
 use serde_json::Error as JsonError;
 use toml::de::Error as TomlError;
+use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 
 /// Every way config loading, validation, and grant resolution can fail.
@@ -71,6 +72,13 @@ pub enum Error {
   /// A rule states an empty inline value.
   #[error("rule `{label}`: `value` must not be empty")]
   EmptyValue {
+    /// Rule label.
+    label: String,
+  },
+  /// A database rule states no fake `value` string; the connection string
+  /// is the grant and one side cannot be missing.
+  #[error("rule `{label}`: a database rule states no `value` string")]
+  DatabaseValueMissing {
     /// Rule label.
     label: String,
   },
@@ -251,16 +259,15 @@ pub enum Error {
     provider: String,
   },
   /// An `oauth2` URL does not parse.
-  #[error("{origin}: `{name}`: bad oauth2 url `{url}`: {detail}")]
+  #[error("{origin}: `{name}`: {source}")]
   BadOAuthUrl {
     /// Config origin.
     origin: String,
     /// Entry name.
     name: String,
-    /// Offending URL.
-    url: String,
-    /// Parse failure.
-    detail: String,
+    /// Why the URL is unusable.
+    #[source]
+    source: Box<Error>,
   },
   /// An `authorization_code` flow lacks its `authorize_url`.
   #[error("{origin}: `{name}`: `authorization_code` flow needs an `authorize_url`")]
@@ -365,5 +372,57 @@ pub enum Error {
   PostgresTrust {
     /// Rule label.
     label: String,
+  },
+  /// An ssh rule mixes `ssh://` entries with other schemes.
+  #[error("rule `{label}`: ssh entries cannot mix with other schemes in one rule")]
+  SshMixedSchemes {
+    /// Rule label.
+    label: String,
+  },
+  /// An `ssh` table sits on a rule whose allow entries are not ssh: the
+  /// table would silently never apply, so resolution fails closed.
+  #[error("rule `{label}`: ssh config on a rule with no ssh entry")]
+  SshMisplaced {
+    /// Rule label.
+    label: String,
+  },
+  /// An ssh rule states a `value`, which nothing would swap.
+  #[error("rule `{label}`: an ssh rule states no `value`; its secret is key material in the `ssh` config")]
+  SshValue {
+    /// Rule label.
+    label: String,
+  },
+  /// An ssh entry carries `tls` config, which only endpoint entries take.
+  #[error("rule `{label}`: ssh entry `{entry}` states no `tls` config; its trust is pinned host keys")]
+  SshTls {
+    /// Rule label.
+    label: String,
+    /// Offending entry.
+    entry: String,
+  },
+  /// An ssh entry lacks its key material.
+  #[error("rule `{label}`: ssh entry `{entry}`: {detail}")]
+  SshIdentity {
+    /// Rule label.
+    label: String,
+    /// Offending entry.
+    entry: String,
+    /// What is missing.
+    detail: String,
+  },
+  /// An `ssh` entry names an `allow` entry the rule does not grant.
+  #[error("rule `{label}`: ssh config names entry `{key}` the rule does not allow")]
+  SshUnknownEntry {
+    /// Rule label.
+    label: String,
+    /// Offending key.
+    key: String,
+  },
+  /// The in-repo reference samples fail to serialize.
+  #[error("serializing the reference samples: {source}")]
+  SerializeSamples {
+    /// Underlying serialization failure.
+    #[source]
+    source: TomlSerializeError,
   },
 }

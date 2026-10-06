@@ -16,7 +16,7 @@ services:
       [
         "bash",
         "-c",
-        "/srv/gen-certs.sh /certs && /srv/gen-secrets.sh /hodor-config",
+        "apt-get update -qq && apt-get install -qq -y openssh-client && /srv/gen-certs.sh /certs && /srv/gen-secrets.sh /hodor-config",
       ]
     environment:
       HODOR_REAL: ${HODOR_REAL:?copy integration/.env.example to integration/.env}
@@ -37,12 +37,16 @@ services:
       [
         "serve",
         "--proxy-backend",
-        "tproxy",
+        "${HODOR_BACKEND:-tproxy}",
         "--config",
         "/etc/hodor/hodor.toml",
       ]
     environment:
       RUST_LOG: debug
+      # The guest leg's host key and hodor's own upstream known_hosts
+      # (accept-new): both live in the certs volume gen-certs.sh seeded.
+      HODOR_SSH_HOST_KEY: /certs/ssh/hodor_host
+      HODOR_SSH_KNOWN_HOSTS: /var/lib/hodor/ssh_known_hosts
       # The mounted volume is the config dir: it holds the config anchor
       # plus fnox.toml, the secret source gen-secrets.sh rendered from the
       # environment. No committed file carries a real value.
@@ -50,6 +54,9 @@ services:
     stop_grace_period: 1s
     cap_add:
       - NET_ADMIN
+    # The tun backend opens the host TUN device; harmless for the others.
+    devices:
+      - /dev/net/tun:/dev/net/tun
     volumes:
       - ./hodor.toml:/etc/hodor/hodor.toml:ro
       - certs:/certs:ro
@@ -101,21 +108,57 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
-      start_period: 5s
     volumes:
       - certs:/certs:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
     networks:
       server:
         ipv4_address: 10.202.0.30
 
+  # A plain openssh-server. It admits exactly the real identity's public
+  # half; the decoy never authenticates here. hodor dials it on the server
+  # net, and its host key rides accept-new into hodor's known_hosts.
+  sshd:
+    image: alpine:3.22
+    entrypoint:
+      [
+        "/bin/sh",
+        "-c",
+        "apk add --no-cache openssh-server && ssh-keygen -A && adduser -D -s /bin/sh agent && sed -i '/^agent:/s/!/*/' /etc/shadow && mkdir -p /home/agent/.ssh && cp /certs/ssh/authorized_keys /home/agent/.ssh/authorized_keys && chown -R agent:agent /home/agent/.ssh && exec /usr/sbin/sshd -D -e -o Port=22 -o ListenAddress=0.0.0.0 -o PermitRootLogin=no -o PasswordAuthentication=no -o PubkeyAuthentication=yes -o StrictModes=no -o UsePAM=no -o AuthorizedKeysFile=.ssh/authorized_keys -o LogLevel=VERBOSE",
+      ]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    volumes:
+      - certs:/certs:ro
+    networks:
+      server:
+        ipv4_address: 10.202.0.40
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
   client:
     image: oven/bun:1
     working_dir: /srv
-    command: ["run", "run.ts"]
+    # openssh-client first: scenario 8 is a plain `ssh` binary holding only
+    # the decoy identity, connecting through the transparent capture.
+    command:
+      [
+        "bash",
+        "-c",
+        "apt-get update -qq && apt-get install -qq -y openssh-client && exec bun run run.ts",
+      ]
     environment:
       HODOR_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `hodor fake GH_TOKEN`, not a credential
       DATABASE_URL: postgres://hodor:hodor_fake_password_01@db:5432/demo?sslmode=require # nosemgrep: deterministic demo decoy, not a credential
       OIDC_FAKE_SECRET: 7271a39407d20fdea4e3d6f42c4bfbda # nosemgrep: deterministic decoy from `hodor fake OIDC_CLIENT_SECRET`, not a credential
+      SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
@@ -125,6 +168,8 @@ services:
         condition: service_started
       api:
         condition: service_started
+      sshd:
+        condition: service_healthy
       db:
         condition: service_healthy
 

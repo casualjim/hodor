@@ -77,7 +77,7 @@ fn enclosing_from(own: &Path) -> Option<PathBuf> {
 /// The compiled programs, embedded at build time by `build.rs`.
 static PROGRAMS: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/hodor-ebpf-programs"));
 
-/// Test seams over [`run_ebpf`], mirroring `tproxy::Options`.
+/// Test overrides over [`run_ebpf`], mirroring `tproxy::Options`.
 #[derive(Debug, Default)]
 pub(crate) struct Options {
   /// cgroup directory to attach the programs to. Required in production: a
@@ -169,7 +169,9 @@ fn own_netns_cookie() -> u64 {
     return 0;
   };
   let mut cookie = 0u64;
-  let mut size = libc::socklen_t::try_from(std::mem::size_of::<u64>()).expect("size_of::<u64>() is 8 and always fits socklen_t");
+  let Ok(mut size) = libc::socklen_t::try_from(std::mem::size_of::<u64>()) else {
+    return 0;
+  };
   // SAFETY: the fd is owned by `socket`, and the option reads exactly
   // `size` bytes into `cookie`, a valid u64 slot.
   let ok = unsafe {
@@ -262,7 +264,7 @@ fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfE
     udp_port: u32::from(udp_port),
     netns_cookie,
   };
-  config.validate().map_err(|detail| Error::ConfigInvalid { detail })?;
+  config.validate()?;
   let map = bpf.map_mut("CONFIG").ok_or(Error::MapMissing { name: "CONFIG" })?;
   let mut map: Array<&mut MapData, Config> = map.try_into().map_err(|err| Error::UnexpectedMapType {
     name: "CONFIG",
@@ -300,9 +302,9 @@ impl Config {
   ///
   /// `proxy_pid` is not checked: [`SelfExclusion`] is the only way to set it,
   /// and its production variant is this process's PID, which is never zero.
-  fn validate(self) -> Result<(), String> {
+  fn validate(self) -> Result<(), Error> {
     if self.tcp_port == 0 || self.udp_port == 0 {
-      return Err("listen ports must be non-zero".into());
+      return Err(Error::ListenPortsZero);
     }
     Ok(())
   }
@@ -326,14 +328,14 @@ pub(crate) fn encode_addr(addr: Ipv4Addr) -> u32 {
   u32::from(addr).to_be()
 }
 
-/// Port encoding the kernel uses in `bpf_sock_addr.user_port`, which holds the
-/// port in network byte order in its low 16 bits.
-pub(crate) fn decode_port(raw: u32) -> u16 {
+/// Port encoding the kernel uses in `bpf_sock_addr.user_port`, which holds
+/// the port in network byte order in its low 16 bits.
+pub(crate) fn decode_port(raw: u32) -> Option<u16> {
   // The kernel writes this field with a 2-byte store, so the upper half is
-  // always zero: masking then converting cannot fail, and the `expect` states
-  // that invariant rather than silently truncating a malformed value.
+  // always zero; a value outside that shape decodes to `None` and callers
+  // treat it as "not this flow" instead of truncating.
   let low = raw & u32::from(u16::MAX);
-  u16::from_be(u16::try_from(low).expect("masked to the low 16 bits"))
+  u16::try_from(low).ok().map(u16::from_be)
 }
 
 /// Inverse of [`decode_port`].
@@ -368,9 +370,9 @@ pub(crate) struct OrigDst {
 unsafe impl aya::Pod for OrigDst {}
 
 impl OrigDst {
-  /// The destination as a socket address.
-  pub(crate) fn socket_addr(&self) -> SocketAddr {
-    SocketAddr::from((decode_addr(self.ip), decode_port(self.port)))
+  /// The destination as a socket address, when the recorded port decodes.
+  pub(crate) fn socket_addr(&self) -> Option<SocketAddr> {
+    Some(SocketAddr::from((decode_addr(self.ip), decode_port(self.port)?)))
   }
 }
 
@@ -527,7 +529,7 @@ mod tests {
   #[test]
   fn port_encoding_round_trips_through_the_kernel_layout() {
     for port in [1u16, 53, 443, TCP_LISTEN_PORT, UDP_LISTEN_PORT, u16::MAX] {
-      assert_eq!(decode_port(encode_port(port)), port);
+      assert_eq!(decode_port(encode_port(port)), Some(port));
     }
     assert_eq!(encode_port(TCP_LISTEN_PORT), u32::from(TCP_LISTEN_PORT.to_be()));
   }
@@ -542,7 +544,7 @@ mod tests {
       proto: 6,
       _pad: [0; 3],
     };
-    assert_eq!(orig.socket_addr(), SocketAddr::from(([127, 0, 0, 1], TCP_LISTEN_PORT)));
+    assert_eq!(orig.socket_addr(), Some(SocketAddr::from(([127, 0, 0, 1], TCP_LISTEN_PORT))));
   }
 
   /// A flow key built from an accepted connection's peer must decode back to

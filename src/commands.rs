@@ -96,13 +96,11 @@ impl CliCommand for FakeArgs {
     }
     let registry = generation_registry()?;
     let (mut config, _) = load(cli, None)?;
-    // Resolve the rule's value the way `serve` does, so a `tcp://` rule
-    // previews the length-matched decoy the proxy will actually use.
-    let needs_fnox = config.rules.values().any(|rule| rule.env == self.env && rule.value.is_none());
-    if needs_fnox {
-      let fnox = FnoxSource::open()?;
-      resolve(&mut config, &registry, fnox).await?;
-    }
+    // Resolve the way `serve` does, so a `tcp://` rule previews the
+    // length-matched decoy the proxy will actually use; fnox also supplies
+    // the names derivation turns into rules, so it opens unconditionally.
+    let fnox = FnoxSource::open()?;
+    resolve(&mut config, &registry, fnox).await?;
     let rule = config.rules.values().find(|rule| rule.env == self.env);
     let Some(rule) = rule else {
       println!("{}", registry.decoy(&self.env, self.pattern.as_deref()));
@@ -161,7 +159,8 @@ pub struct RulesArgs;
 
 impl CliCommand for RulesArgs {
   type Error = Report;
-  /// Prints `[rules.*]` for the workspace's resolvable secrets.
+  /// Prints what this workspace's proxy substitutes: derived rules, names
+  /// still needing a host, and uncovered fnox declarations.
   ///
   /// # Errors
   ///
@@ -257,7 +256,7 @@ impl CliCommand for ConfigArgs {
     print!(
       "{}{}",
       confique::toml::template::<AppConfig>(FormatOptions::default()),
-      reference_samples()
+      reference_samples().map_err(Report::from)?
     );
     Ok(())
   }

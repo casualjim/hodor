@@ -1,8 +1,18 @@
+## [0.3.1] - 2026-10-06
+
+### 🐛 Bug Fixes
+
+- *(fnox)* Make merge_configs infallible
 ## [0.3.0] - 2026-10-06
 
 ### 🚀 Features
 
 - Ssh decoy sessions, ambient source twins, review hardening (#42)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.0 [ci skip]
+- Release
 ## [0.2.5] - 2026-10-02
 
 ### 🚀 Features

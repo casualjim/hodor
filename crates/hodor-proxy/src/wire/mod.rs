@@ -17,7 +17,7 @@ pub(crate) use h2::H2;
 pub(crate) use http::Http;
 pub(crate) use postgres::{GuestOpening, Postgres, read_guest_opening, request_upstream_tls};
 pub(crate) use raw::Raw;
-pub(crate) use ssh::SshLegs;
+pub(crate) use ssh::{SshLegs, SshLegsFiles, Upstream};
 
 use std::borrow::Cow;
 

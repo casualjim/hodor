@@ -44,9 +44,8 @@ pub(crate) fn adapt(root: &Path) -> Option<RewriteAdapted> {
   let mut merged = Table::new();
   let mut present = false;
   for path in &chain {
-    let text = match fs::read_to_string(path) {
-      Ok(text) => text,
-      Err(_) => continue,
+    let Ok(text) = fs::read_to_string(path) else {
+      continue;
     };
     present = true;
     let parsed = match toml::from_str::<Table>(&text) {

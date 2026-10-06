@@ -242,29 +242,36 @@ pub fn selected_envs(fnox: Option<&FnoxSource>, registry: &Registry) -> Vec<Stri
     .collect()
 }
 
-/// fnox secret name for one rule: `fnox_key`, else `env`.
-fn fnox_key(rule: &RuleCfg) -> String {
-  rule.fnox_key.clone().unwrap_or_else(|| rule.env.clone())
+/// One resolution pass over the rule table. It derives the catalog the
+/// secret source and the registry agree on, fetches every rule's value,
+/// then rewrites each rule in place — its kind's host union, decoy
+/// pattern, and skip policy — reporting which rules to drop.
+struct RulePass<'a> {
+  /// Host registry for host unions, oauth flows, and decoy templates.
+  registry: &'a Registry,
+  /// The secret source, when one is configured.
+  fnox: Option<&'a FnoxSource>,
+  /// Fetched values by rule label, consumed as rules claim them.
+  values: BTreeMap<String, Option<String>>,
 }
 
-/// Resolve every rule in place: fetch values from fnox when no inline value
-/// is present, union registry hosts into `allow`, fill the decoy pattern, and
-/// drop rules that `if_missing` lets go.
-///
-/// # Errors
-///
-/// Returns an error when a rule's `fnox_key` is declared yet resolves to no
-/// usable value, or when a rule's `allow` entry fails to parse.
-pub async fn resolve(config: &mut AppConfig, registry: &Registry, fnox: Option<FnoxSource>) -> Result<(), Error> {
-  // Values are fetched before the map is mutated, so rules stay borrowed
-  // immutably while fnox is awaited.
-  // The catalog derives from what fnox declares and the registry hosts;
-  // config states overrides, not every name. An explicit rule wins per env,
-  // and a name the registry gives no hosts derives nothing.
-  if let Some(source) = &fnox {
+impl RulePass<'_> {
+  /// fnox secret name for one rule: `fnox_key`, else `env`.
+  fn fnox_key(rule: &RuleCfg) -> String {
+    rule.fnox_key.clone().unwrap_or_else(|| rule.env.clone())
+  }
+
+  /// Derive catalog rules: the catalog comes from what fnox declares and
+  /// the registry hosts; config states overrides, not every name. An
+  /// explicit rule wins per env, and a name the registry gives no hosts
+  /// derives nothing.
+  fn derive_catalog(&self, config: &mut AppConfig) {
+    let Some(source) = self.fnox else {
+      return;
+    };
     let covered = config.rules.values().map(|rule| rule.env.clone()).collect::<BTreeSet<_>>();
     for name in source.declared() {
-      if covered.contains(name) || registry.lookup(name).is_none_or(|known| known.hosts.is_empty()) {
+      if covered.contains(name) || self.registry.lookup(name).is_none_or(|known| known.hosts.is_empty()) {
         continue;
       }
       config.rules.entry(name.to_lowercase()).or_insert_with(|| RuleCfg {
@@ -282,78 +289,95 @@ pub async fn resolve(config: &mut AppConfig, registry: &Registry, fnox: Option<F
       });
     }
   }
-  let keys = config
-    .rules
-    .iter()
-    .filter(|(_, rule)| rule.value.is_none() || rule.is_database())
-    .map(|(label, rule)| (label.clone(), fnox_key(rule)))
-    .collect::<Vec<_>>();
-  let mut values = BTreeMap::new();
-  for (label, key) in keys {
-    let value = match &fnox {
-      Some(source) => source.value(&key).await?,
-      None => None,
-    };
-    values.insert(label, value);
+
+  /// Fetch every rule's value before the map is mutated, so rules stay
+  /// borrowed immutably while fnox is awaited.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the secret source fails to answer.
+  async fn fetch_values(&mut self, config: &AppConfig) -> Result<(), Error> {
+    let keys = config
+      .rules
+      .iter()
+      .filter(|(_, rule)| rule.value.is_none() || rule.is_database())
+      .map(|(label, rule)| (label.clone(), Self::fnox_key(rule)))
+      .collect::<Vec<_>>();
+    for (label, key) in keys {
+      let value = match self.fnox {
+        Some(source) => source.value(&key).await?,
+        None => None,
+      };
+      self.values.insert(label, value);
+    }
+    Ok(())
   }
 
-  let mut dropped = Vec::new();
-  for (label, rule) in &mut config.rules {
+  /// Rewrite one rule per its kind. Returns `true` when the rule must be
+  /// dropped from the table.
+  fn apply(&mut self, label: &str, rule: &mut RuleCfg) -> Result<bool, Error> {
     if rule.is_ssh() {
       // SSH rule: the secret is key material in the `ssh` table, stated in
       // the config. Nothing resolves from fnox and no registry union may
       // widen the entries — an ssh rule's allow list is all ssh.
       tracing::info!(label, env = %rule.env, "ssh rule resolved: key material from the config");
-      continue;
+      return Ok(false);
     }
     if rule.is_database() {
-      // Database rule: `value` holds the stated fake string; the real
-      // connection string comes from fnox and never overwrites it. No
-      // registry hosts, no pattern — the connection string is the grant.
-      if let Some(value) = values.remove(label).flatten() {
-        rule.real = Some(SecretString::from(value));
-        tracing::info!(label, env = %rule.env, "database rule resolved: stated fake string, real connection string from fnox");
-      } else {
-        let what = if fnox.is_some() {
-          "no resolved real connection string and fnox does not declare its key"
-        } else {
-          "no resolved real connection string and fnox has no configuration"
-        };
-        skip(label, rule, what)?;
-        dropped.push(label.clone());
-      }
-      continue;
+      return self.database(label, rule);
     }
+    self.token(label, rule)
+  }
+
+  /// Database rule: `value` holds the stated fake string; the real
+  /// connection string comes from fnox and never overwrites it. No
+  /// registry hosts, no pattern — the connection string is the grant.
+  fn database(&mut self, label: &str, rule: &mut RuleCfg) -> Result<bool, Error> {
+    if let Some(value) = self.values.remove(label).flatten() {
+      rule.real = Some(SecretString::from(value));
+      tracing::info!(label, env = %rule.env, "database rule resolved: stated fake string, real connection string from fnox");
+      return Ok(false);
+    }
+    let what = if self.fnox.is_some() {
+      "no resolved real connection string and fnox does not declare its key"
+    } else {
+      "no resolved real connection string and fnox has no configuration"
+    };
+    Self::skip(label, rule, what)?;
+    Ok(true)
+  }
+
+  /// Token rule: resolve the value when none is inline, union the registry
+  /// hosts and flow authorities into `allow`, and fill the decoy pattern.
+  fn token(&mut self, label: &str, rule: &mut RuleCfg) -> Result<bool, Error> {
     let inline = rule.value.is_some();
     if !inline {
-      if let Some(value) = values.remove(label).flatten() {
+      if let Some(value) = self.values.remove(label).flatten() {
         rule.value = Some(SecretString::from(value));
       } else {
-        let what = if fnox.is_some() {
+        let what = if self.fnox.is_some() {
           "no inline value and fnox does not declare its key"
         } else {
           "no inline value and fnox has no configuration"
         };
-        skip(label, rule, what)?;
-        dropped.push(label.clone());
-        continue;
+        Self::skip(label, rule, what)?;
+        return Ok(true);
       }
     }
-    let mut hosts = registry.hosts_for(rule).to_vec();
+    let mut hosts = self.registry.hosts_for(rule).to_vec();
     for entry in &rule.allow {
       if !hosts.contains(entry) {
         hosts.push(entry.clone());
       }
     }
     if hosts.is_empty() {
-      skip(label, rule, "no hosts: registry has no entry and `allow` is empty")?;
-      dropped.push(label.clone());
-      continue;
+      Self::skip(label, rule, "no hosts: registry has no entry and `allow` is empty")?;
+      return Ok(true);
     }
     // Unioned once here so `grants::resolve` sees the final list.
     rule.allow = hosts;
     if rule.oauth2.is_none() {
-      rule.oauth2 = registry.flow_for(rule);
+      rule.oauth2 = self.registry.flow_for(rule);
     }
     if let Some(flow) = &rule.oauth2 {
       for url in [&Some(flow.token_url.clone()), &flow.authorize_url, &flow.refresh_url]
@@ -368,34 +392,59 @@ pub async fn resolve(config: &mut AppConfig, registry: &Registry, fnox: Option<F
     }
     rule.pattern = rule.pattern.take().filter(|pattern| !pattern.is_empty());
     if rule.pattern.is_none() {
-      rule.pattern = Some(registry.template(&rule.env, None).into_owned());
+      rule.pattern = Some(self.registry.template(&rule.env, None).into_owned());
     }
     let source = if inline { "inline" } else { "fnox" };
-    let key = fnox_key(rule);
+    let key = Self::fnox_key(rule);
     let key = (key != rule.env).then_some(key);
     tracing::info!(label, env = %rule.env, fnox_key = key.as_deref(), hosts = rule.allow.len(), value = source, "rule resolved");
+    Ok(false)
+  }
+
+  /// Apply one rule's `if_missing` policy. `Ok(())` means drop the rule;
+  /// `Error` bails instead.
+  fn skip(label: &str, rule: &RuleCfg, detail: &str) -> Result<(), Error> {
+    match rule.if_missing {
+      IfMissing::Error => Err(Error::UnresolvedRule {
+        label: label.to_string(),
+        env: rule.env.clone(),
+        detail: detail.to_string(),
+      }),
+      IfMissing::Warn => {
+        tracing::warn!(label, env = %rule.env, reason = detail, "dropping rule");
+        Ok(())
+      }
+      IfMissing::Ignore => Ok(()),
+    }
+  }
+}
+
+/// Resolve every rule in place: fetch values from fnox when no inline value
+/// is present, union registry hosts into `allow`, fill the decoy pattern, and
+/// drop rules that `if_missing` lets go.
+///
+/// # Errors
+///
+/// Returns an error when a rule's `fnox_key` is declared yet resolves to no
+/// usable value, or when a rule's `allow` entry fails to parse.
+pub async fn resolve(config: &mut AppConfig, registry: &Registry, fnox: Option<FnoxSource>) -> Result<(), Error> {
+  let mut pass = RulePass {
+    registry,
+    fnox: fnox.as_ref(),
+    values: BTreeMap::new(),
+  };
+  pass.derive_catalog(config);
+  pass.fetch_values(config).await?;
+  let mut dropped = Vec::new();
+  for (label, rule) in &mut config.rules {
+    if pass.apply(label, rule)? {
+      dropped.push(label.clone());
+    }
   }
   for label in dropped {
     config.rules.remove(&label);
   }
   Ok(())
-}
-
-/// Apply one rule's `if_missing` policy. Returns `Ok(())` when the caller
-/// must drop the rule; `Error` bails instead.
-fn skip(label: &str, rule: &RuleCfg, detail: &str) -> Result<(), Error> {
-  match rule.if_missing {
-    IfMissing::Error => Err(Error::UnresolvedRule {
-      label: label.to_string(),
-      env: rule.env.clone(),
-      detail: detail.to_string(),
-    }),
-    IfMissing::Warn => {
-      tracing::warn!(label, env = %rule.env, reason = detail, "dropping rule");
-      Ok(())
-    }
-    IfMissing::Ignore => Ok(()),
-  }
 }
 
 #[cfg(test)]

@@ -32,7 +32,7 @@ use crate::connection::{GuestIo, PgTransport, Prefixed, PumpService, client_auth
 use crate::identity::{Expect, Hello, MintBucket, expect, hello_complete, read_client_hello, read_http_head};
 use crate::mint::{MintHandle, MintStore};
 use crate::protocol::{MAX_HEAD, PairCtx, http_pair, postgres_pair, raw_tcp_pair};
-use crate::wire::{GuestOpening, SshLegs, read_guest_opening, request_upstream_tls};
+use crate::wire::{GuestOpening, SshLegs, SshLegsFiles, Upstream, read_guest_opening, request_upstream_tls};
 use hodor_config::grants::{Grant, ResolvedConfig, Scheme, SslMode};
 use hodor_pki::ca::CertAuthority;
 pub(crate) use relay::relay_guarded;
@@ -652,27 +652,32 @@ where
         return splice_replay(guest, dial_host, port, state.fwmark, &banner).await;
       }
       let name = host.unwrap_or(dial_host).to_string();
+      let config_dir = hodor_config::config::config_dir();
       let host_key_path = snapshot
         .proxy
         .ssh_host_key
         .clone()
-        .or_else(|| hodor_config::config::config_dir().map(|dir| dir.join("ssh_host_ed25519")))
-        .ok_or_else(|| Error::SshHostKeyUnset)?;
+        .or_else(|| config_dir.as_ref().map(|dir| dir.join("ssh_host_ed25519")))
+        .ok_or(Error::SshHostKeyUnset)?;
       let known_hosts = snapshot
         .proxy
         .ssh_known_hosts
         .clone()
-        .or_else(|| hodor_config::config::config_dir().map(|dir| dir.join("ssh_known_hosts")))
-        .expect("the host key resolution proved a config directory exists");
+        .or_else(|| config_dir.map(|dir| dir.join("ssh_known_hosts")))
+        .ok_or(Error::SshHostKeyUnset)?;
       let legs = SshLegs::load(
-        &host_key_path,
-        &scope.identity,
-        &scope.guest_key,
-        &known_hosts,
-        dial_host,
-        port,
-        &name,
-        state.fwmark,
+        SshLegsFiles {
+          host_key: &host_key_path,
+          identity: &scope.identity,
+          guest_key: &scope.guest_key,
+          known_hosts: &known_hosts,
+        },
+        Upstream {
+          host: dial_host.to_string(),
+          port,
+          name,
+          fwmark: state.fwmark,
+        },
       )?;
       legs.serve(Prefixed::new(banner, guest), budget).await
     }

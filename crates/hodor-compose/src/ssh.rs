@@ -110,9 +110,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
       },
     )?;
     let decoy_key = decoy.to_openssh()?;
-    let container = if let Ok(container) = mirror_container_path(identity, host_home, home) {
-      container
-    } else {
+    let Some(container) = mirror_container_path(identity, host_home, home) else {
       tracing::warn!(config = %source.display(), host = %host, identity = %identity, "ssh block skipped: the identity does not mirror under the container home");
       continue;
     };
@@ -203,16 +201,16 @@ pub(crate) fn host_identity_path(identity: &str, host_home: &Path) -> PathBuf {
 /// The container path the decoy identity mounts at, mirroring the source
 /// layout under the container home. `~`-relative and home-relative paths
 /// mirror; anything else off the host home does not.
-pub(crate) fn mirror_container_path(identity: &str, host_home: &Path, home: &str) -> Result<String, ()> {
+pub(crate) fn mirror_container_path(identity: &str, host_home: &Path, home: &str) -> Option<String> {
   if let Some(rest) = identity.strip_prefix("~/") {
-    return Ok(format!("{home}/{rest}"));
+    return Some(format!("{home}/{rest}"));
   }
   let path = Path::new(identity);
   if path.is_absolute() {
-    let rest = path.strip_prefix(host_home).map_err(|_| ())?;
-    return Ok(format!("{home}/{}", rest.display()));
+    let rest = path.strip_prefix(host_home).ok()?;
+    return Some(format!("{home}/{}", rest.display()));
   }
-  Ok(format!("{home}/.ssh/{identity}"))
+  Some(format!("{home}/.ssh/{identity}"))
 }
 
 #[cfg(test)]

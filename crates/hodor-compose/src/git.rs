@@ -292,7 +292,7 @@ fn include_endpoint(endpoints: &mut Vec<ForgeEndpoint>, endpoint: ForgeEndpoint)
 /// the remote cannot authenticate from the agent until fnox declares it.
 fn https_mint(endpoint: &ForgeEndpoint, registry: &Registry, decoys: &[Decoy], usernames: &[(ForgeEndpoint, String)]) -> Option<String> {
   let covering = registry.envs_for_host(endpoint.scheme, &endpoint.host, endpoint.port);
-  let Some(decoy) = covering
+  let decoy = covering
     .iter()
     .find_map(|env| decoys.iter().find(|decoy| decoy.env == *env))
     .map(|decoy| decoy.value.clone())
@@ -307,10 +307,7 @@ fn https_mint(endpoint: &ForgeEndpoint, registry: &Registry, decoys: &[Decoy], u
         );
         None
       }
-    })
-  else {
-    return None;
-  };
+    })?;
   let username = usernames
     .iter()
     .find(|(candidate, _)| candidate == endpoint)
@@ -374,9 +371,7 @@ fn ssh_mint(source: &Path, config: &GitConfig, endpoint: &ForgeEndpoint, home: &
     },
   )?;
   let decoy_key = decoy.to_openssh()?;
-  let container = if let Ok(container) = mirror_container_path(&identity, host_home, home) {
-    container
-  } else {
+  let Some(container) = mirror_container_path(&identity, host_home, home) else {
     tracing::warn!(host = %endpoint.host, identity = %identity, "ssh remote skipped: the identity does not mirror under the container home");
     return Ok(None);
   };

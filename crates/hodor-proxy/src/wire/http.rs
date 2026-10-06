@@ -408,7 +408,6 @@ impl Http {
             // breaks that guard must degrade, not panic, on the wire.
             ChunkPhase::Data | ChunkPhase::AfterData | ChunkPhase::Broken => {
               self.chunk_phase = ChunkPhase::Broken;
-              continue;
             }
           }
         }

@@ -26,6 +26,7 @@ use russh::server::Config as ServerConfig;
 use russh::server::Msg as ServerMsg;
 use russh::server::Session;
 use russh::server::run_stream;
+use std::future::ready;
 use std::io::Error as IoError;
 use std::path::Path;
 use std::path::PathBuf;
@@ -62,15 +63,29 @@ pub(crate) struct SshLegs {
 
 /// The upstream dial target.
 #[derive(Clone)]
-struct Upstream {
+pub(crate) struct Upstream {
   /// Dial host.
-  host: String,
+  pub(crate) host: String,
   /// Dial port.
-  port: u16,
+  pub(crate) port: u16,
   /// Hostname the pinned keys are recorded for.
-  name: String,
+  pub(crate) name: String,
   /// fwmark excluding the dial from capture.
-  fwmark: Option<u32>,
+  pub(crate) fwmark: Option<u32>,
+}
+
+/// The four files one guest connection's legs need: the guest host key
+/// (hodor's own), the real upstream identity, the decoy admission key, and
+#[derive(Clone, Copy)]
+pub(crate) struct SshLegsFiles<'a> {
+  /// Host key the guest verifies, generated on first run.
+  pub(crate) host_key: &'a Path,
+  /// Identity hodor presents upstream.
+  pub(crate) identity: &'a Path,
+  /// The only public key the guest leg admits.
+  pub(crate) guest_key: &'a Path,
+  /// Hodor's own upstream `known_hosts`.
+  pub(crate) known_hosts: &'a Path,
 }
 
 impl SshLegs {
@@ -82,24 +97,15 @@ impl SshLegs {
   ///
   /// Returns an error when the host key cannot be generated or loaded, or
   /// when either key file cannot be read or parsed.
-  pub(crate) fn load(
-    host_key_path: &Path,
-    scope_identity: &Path,
-    scope_guest_key: &Path,
-    known_hosts: &Path,
-    host: &str,
-    port: u16,
-    name: &str,
-    fwmark: Option<u32>,
-  ) -> Result<Self, Error> {
-    let host_key = Arc::new(hodor_pki::load_or_generate_host_key(host_key_path)?.into_private());
-    let identity_text = std::fs::read_to_string(scope_identity).map_err(|source| Error::SshRead {
-      path: scope_identity.to_path_buf(),
+  pub(crate) fn load(files: SshLegsFiles<'_>, upstream: Upstream) -> Result<Self, Error> {
+    let host_key = Arc::new(hodor_pki::load_or_generate_host_key(files.host_key)?.into_private());
+    let identity_text = std::fs::read_to_string(files.identity).map_err(|source| Error::SshRead {
+      path: files.identity.to_path_buf(),
       source,
     })?;
     let identity = Arc::new(decode_secret_key(&identity_text, None).map_err(RusshError::from)?);
-    let guest_line = std::fs::read_to_string(scope_guest_key).map_err(|source| Error::SshRead {
-      path: scope_guest_key.to_path_buf(),
+    let guest_line = std::fs::read_to_string(files.guest_key).map_err(|source| Error::SshRead {
+      path: files.guest_key.to_path_buf(),
       source,
     })?;
     let blob = guest_line.split(' ').nth(1).unwrap_or_default();
@@ -108,13 +114,8 @@ impl SshLegs {
       host_key,
       decoy,
       identity,
-      known_hosts: known_hosts.to_path_buf(),
-      upstream: Upstream {
-        host: host.to_string(),
-        port,
-        name: name.to_string(),
-        fwmark,
-      },
+      known_hosts: files.known_hosts.to_path_buf(),
+      upstream,
     })
   }
 
@@ -153,27 +154,29 @@ struct Guest {
 }
 impl russh::server::Handler for Guest {
   type Error = RusshError;
-  async fn auth_publickey_offered(&mut self, _user: &str, public_key: &PublicKey) -> Result<Auth, Self::Error> {
+  fn auth_publickey_offered(&mut self, _user: &str, public_key: &PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> {
     tracing::debug!(key = ?public_key.to_openssh(), "ssh guest leg: key offered");
-    if *public_key == self.legs.decoy {
-      Ok(Auth::Accept)
+    let auth = if *public_key == self.legs.decoy {
+      Auth::Accept
     } else {
-      Ok(Auth::reject())
-    }
+      Auth::reject()
+    };
+    ready(Ok(auth))
   }
 
-  async fn auth_publickey(&mut self, user: &str, public_key: &PublicKey) -> Result<Auth, Self::Error> {
+  fn auth_publickey(&mut self, user: &str, public_key: &PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> {
     tracing::debug!(key = ?public_key.to_openssh(), "ssh guest leg: signed auth");
-    if *public_key == self.legs.decoy {
+    let auth = if *public_key == self.legs.decoy {
       self.user = user.to_string();
-      Ok(Auth::Accept)
+      Auth::Accept
     } else {
-      Ok(Auth::reject())
-    }
+      Auth::reject()
+    };
+    ready(Ok(auth))
   }
 
-  async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
-    Ok(Auth::reject())
+  fn auth_password(&mut self, _user: &str, _password: &str) -> impl Future<Output = Result<Auth, Self::Error>> {
+    ready(Ok(Auth::reject()))
   }
   async fn channel_open_session(&mut self, mut channel: Channel<ServerMsg>, session: &mut Session) -> Result<bool, Self::Error> {
     if self.upstream.is_none() {
@@ -341,7 +344,16 @@ struct UpstreamLeg {
 impl russh::client::Handler for UpstreamLeg {
   type Error = RusshError;
 
-  async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
+  fn check_server_key(&mut self, server_public_key: &PublicKey) -> impl Future<Output = Result<bool, Self::Error>> {
+    ready(self.verify_server_key(server_public_key))
+  }
+}
+
+impl UpstreamLeg {
+  /// Verify the upstream host key OpenSSH `accept-new`: a first-seen key
+  /// is recorded, a matching pin verifies, a changed key on a known host
+  /// fails.
+  fn verify_server_key(&self, server_public_key: &PublicKey) -> Result<bool, RusshError> {
     let pinned = pinned_host_keys(&self.name, self.port, &self.known_hosts).map_err(russh_io)?;
     if pinned.is_empty() {
       append_known_host(&self.name, self.port, server_public_key, &self.known_hosts).map_err(russh_io)?;
@@ -358,6 +370,7 @@ mod tests {
   use super::*;
   use hodor_pki::ssh::SshKey;
   use hodor_pki::ssh::known_hosts_line_for_public;
+  use std::process::ExitStatus;
   use tokio::net::TcpStream;
 
   /// An upstream stub that admits only the real key and echoes exec output.
@@ -371,12 +384,16 @@ mod tests {
   impl russh::server::Handler for Stub {
     type Error = RusshError;
 
-    async fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> Result<Auth, Self::Error> {
+    fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> {
       *self.saw_key.lock().expect("stub mutex") = Some(public_key.clone());
-      Ok(if *public_key == self.admit { Auth::Accept } else { Auth::reject() })
+      ready(Ok(if *public_key == self.admit { Auth::Accept } else { Auth::reject() }))
     }
 
-    async fn channel_open_session(&mut self, mut channel: Channel<ServerMsg>, session: &mut Session) -> Result<bool, Self::Error> {
+    fn channel_open_session(
+      &mut self,
+      mut channel: Channel<ServerMsg>,
+      session: &mut Session,
+    ) -> impl Future<Output = Result<bool, Self::Error>> {
       let writer = session.handle();
       let id = channel.id();
       tokio::spawn(async move {
@@ -394,7 +411,7 @@ mod tests {
           }
         }
       });
-      Ok(true)
+      ready(Ok(true))
     }
   }
 
@@ -404,8 +421,8 @@ mod tests {
   impl russh::client::Handler for Client {
     type Error = RusshError;
 
-    async fn check_server_key(&mut self, _server_public_key: &PublicKey) -> Result<bool, Self::Error> {
-      Ok(true)
+    fn check_server_key(&mut self, _server_public_key: &PublicKey) -> impl Future<Output = Result<bool, Self::Error>> {
+      ready(Ok(true))
     }
   }
 
@@ -418,7 +435,7 @@ mod tests {
     let stub_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stub_addr = stub_listener.local_addr().unwrap();
     let saw_key = Arc::new(std::sync::Mutex::new(None));
-    let stub_saw = saw_key.clone();
+    let stub_saw = Arc::clone(&saw_key);
     let admit = real.public().clone();
     let stub_key = SshKey::generate().unwrap();
     let stub_public = stub_key.public().clone();
@@ -442,14 +459,18 @@ mod tests {
     let guest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let guest_addr = guest_listener.local_addr().unwrap();
     let legs = SshLegs::load(
-      &dir.path().join("ssh_host"),
-      &write_key(&dir, "identity", &real),
-      &write_key(&dir, "guest", &decoy),
-      &known_hosts,
-      &stub_addr.ip().to_string(),
-      stub_addr.port(),
-      "stub.local",
-      None,
+      SshLegsFiles {
+        host_key: &dir.path().join("ssh_host"),
+        identity: &write_key(&dir, "identity", &real),
+        guest_key: &write_key(&dir, "guest", &decoy),
+        known_hosts: &known_hosts,
+      },
+      Upstream {
+        host: stub_addr.ip().to_string(),
+        port: stub_addr.port(),
+        name: "stub.local".to_string(),
+        fwmark: None,
+      },
     )
     .unwrap();
     tokio::spawn(async move {
@@ -510,7 +531,7 @@ mod tests {
     let admit = real.public().clone();
     let stub_key = SshKey::generate().unwrap();
     let saw_key = Arc::new(std::sync::Mutex::new(None));
-    let stub_saw = saw_key.clone();
+    let stub_saw = Arc::clone(&saw_key);
     tokio::spawn(async move {
       let (socket, _) = stub_listener.accept().await.unwrap();
       let config = Arc::new(ServerConfig {
@@ -535,14 +556,18 @@ mod tests {
     let guest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let guest_addr = guest_listener.local_addr().unwrap();
     let legs = SshLegs::load(
-      &dir.path().join("ssh_host"),
-      &write_key(&dir, "identity", &real),
-      &write_key(&dir, "guest", &decoy),
-      &known_hosts,
-      &stub_addr.ip().to_string(),
-      stub_addr.port(),
-      "stub.local",
-      None,
+      SshLegsFiles {
+        host_key: &dir.path().join("ssh_host"),
+        identity: &write_key(&dir, "identity", &real),
+        guest_key: &write_key(&dir, "guest", &decoy),
+        known_hosts: &known_hosts,
+      },
+      Upstream {
+        host: stub_addr.ip().to_string(),
+        port: stub_addr.port(),
+        name: "stub.local".to_string(),
+        fwmark: None,
+      },
     )
     .unwrap();
     tokio::spawn(async move {
@@ -604,7 +629,7 @@ mod tests {
       let stub_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
       let stub_addr = stub_listener.local_addr().unwrap();
       let saw_key = Arc::new(std::sync::Mutex::new(None));
-      let stub_saw = saw_key.clone();
+      let stub_saw = Arc::clone(&saw_key);
       let admit = real.public().clone();
       let stub_key = SshKey::generate().unwrap();
       tokio::spawn(async move {
@@ -624,14 +649,18 @@ mod tests {
       let guest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
       let guest_addr = guest_listener.local_addr().unwrap();
       let legs = SshLegs::load(
-        &dir.path().join("ssh_host"),
-        &write_key(&dir, "identity", &real),
-        &write_key(&dir, "guest", &decoy),
-        &known_hosts,
-        &stub_addr.ip().to_string(),
-        stub_addr.port(),
-        "stub.local",
-        None,
+        SshLegsFiles {
+          host_key: &dir.path().join("ssh_host"),
+          identity: &write_key(&dir, "identity", &real),
+          guest_key: &write_key(&dir, "guest", &decoy),
+          known_hosts: &known_hosts,
+        },
+        Upstream {
+          host: stub_addr.ip().to_string(),
+          port: stub_addr.port(),
+          name: "stub.local".to_string(),
+          fwmark: None,
+        },
       )
       .unwrap();
       let serve_legs = legs.clone();
@@ -671,40 +700,7 @@ mod tests {
         "echo".to_string(),
         "marker".to_string(),
       ];
-      let ssh_client = tokio::task::spawn_blocking(move || {
-        let mut child = std::process::Command::new(&ssh)
-          .args(&args)
-          .env_remove("SSH_AUTH_SOCK")
-          .stdout(std::process::Stdio::piped())
-          .stderr(std::process::Stdio::piped())
-          .spawn()
-          .expect("the ssh client runs");
-        // A stuck bridge shows up as a hang, not an error: bound the wait
-        // and report the client's own protocol log either way.
-        for _ in 0..200 {
-          if let Some(status) = child.try_wait().expect("the client is pollable") {
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            use std::io::Read;
-            child
-              .stdout
-              .take()
-              .expect("stdout piped")
-              .read_to_string(&mut stdout)
-              .expect("stdout read");
-            child
-              .stderr
-              .take()
-              .expect("stderr piped")
-              .read_to_string(&mut stderr)
-              .expect("stderr read");
-            return Some((status, stdout, stderr));
-          }
-          std::thread::sleep(Duration::from_millis(100));
-        }
-        let _ = child.kill();
-        None
-      });
+      let ssh_client = tokio::task::spawn_blocking(move || run_ssh_client(&ssh, &args));
       let log = std::fs::read_to_string(&ssh_log).unwrap_or_default();
       let Some((status, stdout, stderr)) = ssh_client.await.expect("the client thread joins") else {
         panic!("ssh client hung; protocol log:\n{log}");
@@ -718,6 +714,42 @@ mod tests {
       let learned = std::fs::read_to_string(&known_hosts).unwrap();
       assert!(learned.contains("stub.local"), "accept-new recorded the upstream: {learned}");
     });
+  }
+
+  /// Run the openssh client to completion, bounded to ~20s. A stuck bridge
+  /// shows up as a hang, not an error, and the caller reports the client's
+  /// own protocol log either way.
+  fn run_ssh_client(ssh: &Path, args: &[String]) -> Option<(ExitStatus, String, String)> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(ssh)
+      .args(args)
+      .env_remove("SSH_AUTH_SOCK")
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::piped())
+      .spawn()
+      .expect("the ssh client runs");
+    for _ in 0..200 {
+      if let Some(status) = child.try_wait().expect("the client is pollable") {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+          .stdout
+          .take()
+          .expect("stdout piped")
+          .read_to_string(&mut stdout)
+          .expect("stdout read");
+        child
+          .stderr
+          .take()
+          .expect("stderr piped")
+          .read_to_string(&mut stderr)
+          .expect("stderr read");
+        return Some((status, stdout, stderr));
+      }
+      std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    None
   }
 
   fn which_ssh() -> Option<PathBuf> {

@@ -8,7 +8,7 @@ use std::str::FromStr;
 use secrecy::{ExposeSecret as _, SecretString};
 use url::{Host, Url};
 
-use crate::config::{AppConfig, fake_for};
+use crate::config::{AppConfig, RuleCfg, fake_for};
 use crate::error::Error;
 use crate::plugins::resolve_plugins;
 
@@ -667,69 +667,55 @@ pub struct ResolvedConfig {
 /// Returns an error when an `allow` entry is not a valid URI grant, or when
 /// one rule mixes endpoint and database entries.
 pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
-  let mut grants = Vec::with_capacity(cfg.rules.len());
+  let mut collector = GrantCollector::default();
   for (label, rule) in &cfg.rules {
+    collector.collect(label, rule)?;
+  }
+  Ok(ResolvedConfig {
+    proxy: cfg.proxy.clone(),
+    grants: collector.grants,
+    plugins: resolve_plugins(cfg)?,
+  })
+}
+
+/// One rule table's grants, collected kind by kind. Each method owns one
+/// rule kind's validation and grant shape; a warn-and-skip outcome stays a
+/// plain `Ok(())` so the entrypoint remains a fold over the rule table.
+#[derive(Debug, Default)]
+struct GrantCollector {
+  grants: Vec<Grant>,
+}
+
+impl GrantCollector {
+  /// Fold one rule into the set, dispatching on the rule's kind.
+  fn collect(&mut self, label: &str, rule: &RuleCfg) -> Result<(), Error> {
     if rule.is_database() {
-      // Database rule: the rule states the fake connection string in
-      // `value`; the real one resolved from the secret source into `real`.
-      // No allow entries — the connection string is the grant.
-      if !rule.allow.is_empty() {
-        return Err(Error::DatabaseAllow { label: label.clone() });
-      }
-      let Some(real) = rule.real.clone() else {
-        // The secret source did not resolve this name; no grant rather than
-        // a rule that swaps in nothing.
-        tracing::warn!(label, env = %rule.env, "rule has no resolved real connection string; no grant");
-        continue;
-      };
-      let Some(fake) = rule.value.as_ref() else {
-        return Err(Error::DatabaseValueMissing { label: label.clone() });
-      };
-      let fake = fake.expose_secret();
-      let mut scope = DatabaseScope::from_strings(fake, real.expose_secret()).map_err(|err| Error::DatabaseScope {
-        label: label.clone(),
-        detail: err,
-      })?;
-      // The rule table states the guest leg only; the upstream identity
-      // lives in the real string's libpq URL.
-      for (key, tls) in &rule.tls {
-        if key != &rule.env {
-          return Err(Error::TlsEnvMismatch {
-            label: label.clone(),
-            key: key.clone(),
-            env: rule.env.clone(),
-          });
-        }
-        if tls.client_cert.is_some() || tls.client_key.is_some() {
-          return Err(Error::PostgresIdentity { label: label.clone() });
-        }
-        if tls.root_cert.is_some() {
-          return Err(Error::PostgresTrust { label: label.clone() });
-        }
-        scope.guest_tls = tls.guest_tls_mode;
-      }
-      // The wire needles are the credentials: fake password in, real
-      // password out; the legs' users swap when they differ (the wire
-      // machine rewrites the startup's `user` parameter).
-      let credential = Credential {
-        label: label.clone(),
-        fake: scope.downstream.password.expose_secret().to_string(),
-        value: scope.upstream.password.clone(),
-      };
-      grants.push(Grant::Database {
-        credential,
-        scope: Box::new(scope),
-      });
-      continue;
+      return self.database(label, rule);
     }
-    // Endpoint rule: `allow` names the hosts; `value` is the real secret.
-    // SSH rules are the exception: their real secret is key material in the
-    // `ssh` table, so the entries parse first and the value comes after the
-    // kind is settled.
+    let parsed = Self::parse_entries(label, rule)?;
+    if parsed.is_empty() {
+      tracing::warn!(label, env = %rule.env, "rule has no allow entries; no grant");
+      return Ok(());
+    }
+    // An ssh table that cannot apply — the rule's entries are not ssh —
+    // would vanish silently; that is a misspecified rule, fail closed.
+    if !rule.ssh.is_empty() && parsed.first().is_none_or(|(_, scope)| scope.scheme != Scheme::Ssh) {
+      return Err(Error::SshMisplaced { label: label.to_string() });
+    }
+    if parsed.first().is_some_and(|(_, scope)| scope.scheme == Scheme::Ssh) {
+      return self.ssh(label, rule, parsed);
+    }
+    self.token(label, rule, parsed);
+    Ok(())
+  }
+
+  /// Parse a rule's `allow` entries with their `tls` overlay applied, and
+  /// reject `tls` rows no entry claims.
+  fn parse_entries(label: &str, rule: &RuleCfg) -> Result<Vec<(String, EndpointScope)>, Error> {
     let mut parsed = Vec::with_capacity(rule.allow.len());
     for entry in &rule.allow {
       let mut scope: EndpointScope = entry.parse().map_err(|err| Error::BadAllow {
-        label: label.clone(),
+        label: label.to_string(),
         entry: entry.clone(),
         detail: err,
       })?;
@@ -739,14 +725,14 @@ pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
       if let Some(tls) = rule.tls.get(entry) {
         if scope.scheme == Scheme::Ssh {
           return Err(Error::SshTls {
-            label: label.clone(),
-            entry: (*entry).clone(),
+            label: label.to_string(),
+            entry: entry.clone(),
           });
         }
         if tls.client_cert.is_some() != tls.client_key.is_some() {
           return Err(Error::CertKeyPair {
-            label: label.clone(),
-            entry: (*entry).clone(),
+            label: label.to_string(),
+            entry: entry.clone(),
           });
         }
         scope.client_cert.clone_from(&tls.client_cert);
@@ -754,101 +740,145 @@ pub fn resolve(cfg: &AppConfig) -> Result<ResolvedConfig, Error> {
         scope.root_cert.clone_from(&tls.root_cert);
         scope.guest_tls = tls.guest_tls_mode;
       }
-      parsed.push((entry, scope));
+      parsed.push((entry.clone(), scope));
     }
     for key in rule.tls.keys() {
       if !rule.allow.iter().any(|entry| entry == key) {
         return Err(Error::TlsUnknownEntry {
-          label: label.clone(),
+          label: label.to_string(),
           key: key.clone(),
         });
       }
     }
-    if parsed.is_empty() {
-      tracing::warn!(label, env = %rule.env, "rule has no allow entries; no grant");
-      continue;
+    Ok(parsed)
+  }
+
+  /// Database rule: the rule states the fake connection string in `value`;
+  /// the real one resolved from the secret source into `real`. No allow
+  /// entries — the connection string is the grant.
+  fn database(&mut self, label: &str, rule: &RuleCfg) -> Result<(), Error> {
+    if !rule.allow.is_empty() {
+      return Err(Error::DatabaseAllow { label: label.to_string() });
     }
-    // An ssh table that cannot apply — the rule's entries are not ssh —
-    // would vanish silently; that is a misspecified rule, fail closed.
-    if !rule.ssh.is_empty() && parsed.first().is_none_or(|(_, scope)| scope.scheme != Scheme::Ssh) {
-      return Err(Error::SshMisplaced { label: label.clone() });
-    }
-    // SSH rule: every entry ssh, key material from the `ssh` table, and no
-    // credential to resolve — the swap happens at the protocol layer.
-    if parsed.first().is_some_and(|(_, scope)| scope.scheme == Scheme::Ssh) {
-      if parsed.iter().any(|(_, scope)| scope.scheme != Scheme::Ssh) {
-        return Err(Error::SshMixedSchemes { label: label.clone() });
-      }
-      if rule.value.is_some() {
-        return Err(Error::SshValue { label: label.clone() });
-      }
-      for key in rule.ssh.keys() {
-        if !rule.allow.iter().any(|entry| entry == key) {
-          return Err(Error::SshUnknownEntry {
-            label: label.clone(),
-            key: key.clone(),
-          });
-        }
-      }
-      let mut allow = Vec::with_capacity(parsed.len());
-      for (entry, scope) in parsed {
-        let Some(ssh) = rule.ssh.get(entry) else {
-          return Err(Error::SshIdentity {
-            label: label.clone(),
-            entry: entry.clone(),
-            detail: "no ssh config for this entry".to_string(),
-          });
-        };
-        let identity = ssh.identity.clone().ok_or_else(|| Error::SshIdentity {
-          label: label.clone(),
-          entry: entry.clone(),
-          detail: "identity is required".to_string(),
-        })?;
-        let guest_key = ssh.guest_key.clone().ok_or_else(|| Error::SshIdentity {
-          label: label.clone(),
-          entry: entry.clone(),
-          detail: "guest_key is required".to_string(),
-        })?;
-        allow.push(SshScope {
-          host: scope.host,
-          port: scope.port,
-          identity,
-          guest_key,
+    let Some(real) = rule.real.clone() else {
+      // The secret source did not resolve this name; no grant rather than
+      // a rule that swaps in nothing.
+      tracing::warn!(label, env = %rule.env, "rule has no resolved real connection string; no grant");
+      return Ok(());
+    };
+    let Some(fake) = rule.value.as_ref() else {
+      return Err(Error::DatabaseValueMissing { label: label.to_string() });
+    };
+    let fake = fake.expose_secret();
+    let mut scope = DatabaseScope::from_strings(fake, real.expose_secret()).map_err(|err| Error::DatabaseScope {
+      label: label.to_string(),
+      detail: err,
+    })?;
+    // The rule table states the guest leg only; the upstream identity
+    // lives in the real string's libpq URL.
+    for (key, tls) in &rule.tls {
+      if key != &rule.env {
+        return Err(Error::TlsEnvMismatch {
+          label: label.to_string(),
+          key: key.clone(),
+          env: rule.env.clone(),
         });
       }
-      grants.push(Grant::Ssh { allow });
-      continue;
+      if tls.client_cert.is_some() || tls.client_key.is_some() {
+        return Err(Error::PostgresIdentity { label: label.to_string() });
+      }
+      if tls.root_cert.is_some() {
+        return Err(Error::PostgresTrust { label: label.to_string() });
+      }
+      scope.guest_tls = tls.guest_tls_mode;
     }
+    // The wire needles are the credentials: fake password in, real
+    // password out; the legs' users swap when they differ (the wire
+    // machine rewrites the startup's `user` parameter).
+    let credential = Credential {
+      label: label.to_string(),
+      fake: scope.downstream.password.expose_secret().to_string(),
+      value: scope.upstream.password.clone(),
+    };
+    self.grants.push(Grant::Database {
+      credential,
+      scope: Box::new(scope),
+    });
+    Ok(())
+  }
+
+  /// SSH rule: every entry ssh, key material from the `ssh` table, and no
+  /// credential to resolve — the swap happens at the protocol layer.
+  fn ssh(&mut self, label: &str, rule: &RuleCfg, parsed: Vec<(String, EndpointScope)>) -> Result<(), Error> {
+    if parsed.iter().any(|(_, scope)| scope.scheme != Scheme::Ssh) {
+      return Err(Error::SshMixedSchemes { label: label.to_string() });
+    }
+    if rule.value.is_some() {
+      return Err(Error::SshValue { label: label.to_string() });
+    }
+    for key in rule.ssh.keys() {
+      if !rule.allow.iter().any(|entry| entry == key) {
+        return Err(Error::SshUnknownEntry {
+          label: label.to_string(),
+          key: key.clone(),
+        });
+      }
+    }
+    let mut allow = Vec::with_capacity(parsed.len());
+    for (entry, scope) in parsed {
+      let Some(ssh) = rule.ssh.get(&entry) else {
+        return Err(Error::SshIdentity {
+          label: label.to_string(),
+          entry,
+          detail: "no ssh config for this entry".to_string(),
+        });
+      };
+      let identity = ssh.identity.clone().ok_or_else(|| Error::SshIdentity {
+        label: label.to_string(),
+        entry: entry.clone(),
+        detail: "identity is required".to_string(),
+      })?;
+      let guest_key = ssh.guest_key.clone().ok_or_else(|| Error::SshIdentity {
+        label: label.to_string(),
+        entry: entry.clone(),
+        detail: "guest_key is required".to_string(),
+      })?;
+      allow.push(SshScope {
+        host: scope.host,
+        port: scope.port,
+        identity,
+        guest_key,
+      });
+    }
+    self.grants.push(Grant::Ssh { allow });
+    Ok(())
+  }
+
+  /// Token rule: `allow` names the hosts and `value` is the real secret.
+  fn token(&mut self, label: &str, rule: &RuleCfg, parsed: Vec<(String, EndpointScope)>) {
     let Some(value) = rule.value.clone() else {
       // `secrets::resolve` fills this before `serve`; a caller that skips
       // resolution gets no grant rather than a rule that swaps in nothing.
       tracing::warn!(label, env = %rule.env, "rule has no resolved value; no grant");
-      continue;
+      return;
     };
     let allow: Vec<EndpointScope> = parsed.into_iter().map(|(_, scope)| scope).collect();
-    // A decoy is a key the proxy maps back to the real value; its shape is a
-    // prop for the observer. Raw TCP grants need the decoy at the real
+    // A decoy is a key the proxy maps back to the real value; its shape is
+    // a prop for the observer. Raw TCP grants need the decoy at the real
     // value's length (the raw swap is equal-length only), so the decoy
     // falls back to a length-matched render there.
     let (fake, _) = decoy_for_rule(&rule.env, rule.pattern.as_deref(), &allow, value.expose_secret().len());
-    let credential = Credential {
-      label: label.clone(),
-      fake,
-      value,
-    };
-    grants.push(Grant::Token {
-      credential,
+    self.grants.push(Grant::Token {
+      credential: Credential {
+        label: label.to_string(),
+        fake,
+        value,
+      },
       allow,
       pattern: rule.pattern.clone(),
       oauth2: rule.oauth2.clone(),
     });
   }
-  let plugins = resolve_plugins(cfg)?;
-  Ok(ResolvedConfig {
-    proxy: cfg.proxy.clone(),
-    grants,
-    plugins,
-  })
 }
 
 /// The decoy a rule's grant will use: the shaped decoy, falling back to a
@@ -878,7 +908,7 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
-  use crate::config::{HostSshCfg, HostTlsCfg, IfMissing, ProxyCfg, RuleCfg, WorkspaceCfg};
+  use crate::config::{HostSshCfg, HostTlsCfg, IfMissing, ProxyCfg, WorkspaceCfg};
 
   fn endpoint_grant(entries: &[&str]) -> Grant {
     Grant::Token {

@@ -42,7 +42,7 @@ on:
   pull_request:
   push:
     tags:
-      - "**[0-9]+.[0-9]+.[0-9]+*"
+      - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -130,10 +130,6 @@ jobs:
       - name: "Install system deps"
         if: "${{ runner.os == 'Linux' }}"
         run: "sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold"
-      # Pinned by hand to the LLVM major the pinned rustc ships, like the
-      # matching step in ci.yml: rustc is not installed yet at this point,
-      # so probing it here reads a stale preinstall. Bump together with
-      # `.cargo/config.toml` and the rustc version.
       - name: "Install clang 23 (rustc 1.99 = LLVM 23)"
         if: "${{ runner.os == 'Linux' }}"
         run: |
@@ -146,9 +142,6 @@ jobs:
           "cache": true
           "experimental": true
           "install": true
-      # With the pinned rustc now on PATH, assert it still ships the LLVM
-      # major the clang pin above and `.cargo/config.toml`'s `linker` were
-      # written for. Same guard as ci.yml.
       - name: "Verify the clang pin matches rustc's LLVM major"
         if: "${{ runner.os == 'Linux' }}"
         run: |
@@ -156,7 +149,7 @@ jobs:
           llvm_major="$(rustc -vV | awk -F': ' '/^LLVM version:/ {sub(/\..*/, "", $2); print $2}')"
           if [ "$llvm_major" != 23 ]; then
             echo "rustc reports LLVM ${llvm_major} but the pinned clang is 23." >&2
-            echo "Bump the clang pin in this workflow and the linker in .cargo/config.toml." >&2
+            echo "Bump the clang pin here, in ci.yml, and the linker in .cargo/config.toml." >&2
             exit 1
           fi
       - name: "Cache Rust dependencies"

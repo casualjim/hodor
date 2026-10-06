@@ -1,3 +1,8 @@
+## [0.3.0] - 2026-10-06
+
+### 🚀 Features
+
+- Ssh decoy sessions, ambient source twins, review hardening (#42)
 ## [0.2.5] - 2026-10-02
 
 ### 🚀 Features
@@ -7,6 +12,8 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Drop vendored skills from lychee
+- Update changelog for v0.2.5 [ci skip]
+- Release
 ## [0.2.4] - 2026-09-29
 
 ### 🚀 Features

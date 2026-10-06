@@ -132,7 +132,7 @@ fn load_recursive(dir: &Path, found_any: bool, profiles: &[String], include_loca
           set_source_paths(&mut file_config, &path);
         }
       }
-      config = merge_configs(config, file_config)?;
+      config = merge_configs(config, file_config);
       found = true;
     }
   }
@@ -142,15 +142,15 @@ fn load_recursive(dir: &Path, found_any: bool, profiles: &[String], include_loca
     // Load imports if any
     for import_path in &config.import.clone() {
       let import_config = Config::load_import(import_path, dir)?;
-      config = merge_configs(import_config, config)?;
+      config = merge_configs(import_config, config);
     }
     // Load global config as the base even for root configs
     let (global_config, global_found) = load_global()?;
     // hodor level, read after fnox's global config so it stacks above it.
     let (hodor_config, hodor_found) = load_hodor_level(profiles)?;
     if global_found || hodor_found {
-      let base = merge_configs(global_config, hodor_config)?;
-      config = merge_configs(base, config)?;
+      let base = merge_configs(global_config, hodor_config);
+      config = merge_configs(base, config);
       found = true;
     }
     return Ok((config, found));
@@ -159,13 +159,13 @@ fn load_recursive(dir: &Path, found_any: bool, profiles: &[String], include_loca
   // Load imports first (they get overridden by local config)
   for import_path in &config.import.clone() {
     let import_config = Config::load_import(import_path, dir)?;
-    config = merge_configs(import_config, config)?;
+    config = merge_configs(import_config, config);
   }
 
   // If we have a parent directory, recurse up and merge
   if let Some(parent_dir) = dir.parent() {
     let (parent_config, parent_found) = load_recursive(parent_dir, found, profiles, include_local_sync)?;
-    config = merge_configs(parent_config, config)?;
+    config = merge_configs(parent_config, config);
     found = found || parent_found;
   } else {
     // At the filesystem root, try to load global config as base
@@ -173,8 +173,8 @@ fn load_recursive(dir: &Path, found_any: bool, profiles: &[String], include_loca
     // hodor level, read after fnox's global config so it stacks above it.
     let (hodor_config, hodor_found) = load_hodor_level(profiles)?;
     if global_found || hodor_found {
-      let base = merge_configs(global_config, hodor_config)?;
-      config = merge_configs(base, config)?;
+      let base = merge_configs(global_config, hodor_config);
+      config = merge_configs(base, config);
       found = true;
     }
   }
@@ -258,7 +258,7 @@ fn load_global() -> Result<(Config, bool)> {
     let dir = global_config_path.parent().unwrap_or_else(|| Path::new(""));
     for import_path in &config.import.clone() {
       let import_config = Config::load_import(import_path, dir)?;
-      config = merge_configs(import_config, config)?;
+      config = merge_configs(import_config, config);
     }
 
     Ok((config, true))
@@ -310,19 +310,19 @@ fn load_hodor_level(profiles: &[String]) -> Result<(Config, bool)> {
     let file_dir = path.parent().unwrap_or_else(|| Path::new(""));
     for import_path in &file_config.import.clone() {
       let import_config = Config::load_import(import_path, file_dir)?;
-      file_config = merge_configs(import_config, file_config)?;
+      file_config = merge_configs(import_config, file_config);
     }
-    config = merge_configs(config, file_config)?;
+    config = merge_configs(config, file_config);
     found = true;
   }
   Ok((config, found))
 }
 
-#[expect(
-  clippy::unnecessary_wraps,
-  reason = "signature copied verbatim from fnox-core, and every call site uses ?"
-)]
-fn merge_configs(base: Config, overlay: Config) -> Result<Config> {
+/// Merge `base` with `overlay`, overlay taking precedence field by field.
+/// Copied from fnox-core as fallible; here it is infallible, because the
+/// merge is pure field combination and every fallible step (imports,
+/// loading) happens in the callers.
+fn merge_configs(base: Config, overlay: Config) -> Config {
   let mut merged = base;
 
   // Merge imports (overlay takes precedence, but keep unique paths)
@@ -460,7 +460,7 @@ fn merge_configs(base: Config, overlay: Config) -> Result<Config> {
     }
   }
 
-  Ok(merged)
+  merged
 }
 
 // ---- copied private helpers, freed from the impl block ----

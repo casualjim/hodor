@@ -8,3 +8,4 @@ cd "$proj_dir" || exit 1
 set -euo pipefail
 
 cargo clean
+rm -rf examples/plugins/marker-request/target examples/plugins/marker-response/target examples/plugins/trap-request/target

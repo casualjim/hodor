@@ -1005,7 +1005,7 @@ impl AmbientDeriver<'_> {
     }
   }
 
-  /// The jj user chain, falling back to git identity.
+  /// The full host jj config dir, mounted writable.
   ///
   /// # Errors
   ///
@@ -1013,6 +1013,20 @@ impl AmbientDeriver<'_> {
   fn jj(&mut self) -> Result<(), Error> {
     if jj::chain_paths().iter().any(|path| self.declared.contains(path)) {
       return Ok(());
+    }
+    let host_jj = jj::config_path().parent().map(Path::to_path_buf).unwrap_or_default();
+    if !host_jj.as_os_str().is_empty() {
+      if self.declared.iter().any(|path| path == &host_jj || path.starts_with(&host_jj)) {
+        return Ok(());
+      }
+      if host_jj.is_dir() {
+        self.collector.mounts.push(Mount {
+          host: host_jj,
+          container: PathBuf::from(format!("{}/.config/jj", self.home)),
+          ro: false,
+        });
+        return Ok(());
+      }
     }
     if let Some(adapted) = jj::adapt(self.root) {
       let dest = format!("{}/.config/jj/config.toml", self.home);

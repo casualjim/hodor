@@ -1,8 +1,18 @@
+## [0.3.2] - 2026-10-06
+
+### 🐛 Bug Fixes
+
+- *(jj)* Map the jj config directory into the agent container
 ## [0.3.1] - 2026-10-06
 
 ### 🐛 Bug Fixes
 
 - *(fnox)* Make merge_configs infallible
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.1 [ci skip]
+- Release
 ## [0.3.0] - 2026-10-06
 
 ### 🚀 Features

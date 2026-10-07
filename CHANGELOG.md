@@ -1,8 +1,18 @@
+## [0.3.4] - 2026-10-07
+
+### 🐛 Bug Fixes
+
+- *(compose)* Print derived rules as TOML blocks
 ## [0.3.3] - 2026-10-07
 
 ### 🚀 Features
 
 - *(config)* Agent devices and cap_add
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.3 [ci skip]
+- Release
 ## [0.3.2] - 2026-10-06
 
 ### 🐛 Bug Fixes

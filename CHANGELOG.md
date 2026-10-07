@@ -1,8 +1,18 @@
+## [0.3.3] - 2026-10-07
+
+### 🚀 Features
+
+- *(config)* Agent devices and cap_add
 ## [0.3.2] - 2026-10-06
 
 ### 🐛 Bug Fixes
 
 - *(jj)* Map the jj config directory into the agent container
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.2 [ci skip]
+- Release
 ## [0.3.1] - 2026-10-06
 
 ### 🐛 Bug Fixes

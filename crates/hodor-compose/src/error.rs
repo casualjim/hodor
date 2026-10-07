@@ -133,6 +133,24 @@ pub enum Error {
     /// Offending name.
     name: String,
   },
+  /// `[workspace] image` names an empty tag.
+  #[error("[workspace] image is empty: name a tag or drop the key for the default")]
+  EmptyImage,
+  /// `[workspace.build]` names a dockerfile that does not exist.
+  #[error("[workspace.build] dockerfile `{}` does not exist", path.display())]
+  BuildDockerfileMissing {
+    /// Missing dockerfile.
+    path: PathBuf,
+  },
+  /// `[workspace.build]` names a context directory that does not exist.
+  #[error("[workspace.build] context `{}` does not exist", path.display())]
+  BuildContextMissing {
+    /// Missing context directory.
+    path: PathBuf,
+  },
+  /// `--build` without a `[workspace.build]` to build.
+  #[error("--build names no [workspace.build]: add the section or drop the flag")]
+  BuildNotConfigured,
   /// A file rewrite names an env with no known real value.
   #[error("file rewrite `{}` names `{name}` with no known real value", file.display())]
   RewriteNoValue {

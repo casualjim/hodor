@@ -10,8 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use dirs::{config_dir as dirs_config_dir, home_dir, state_dir};
 use hodor_config::cli::{Cli, ProxyBackend};
 use hodor_config::config::{
-  AppConfig, FileRewrite, HostTlsCfg, RewriteFormat, RuleCfg, SHARED_PROFILE, ToolCfg, config_dir, load, project_config_file,
-  project_config_write_path, project_rules_dir, rules_dir, valid_profile,
+  AppConfig, FileRewrite, HostTlsCfg, RewriteFormat, RuleCfg, SHARED_PROFILE, ToolCfg, WorkspaceBuild, config_dir, load,
+  project_config_file, project_config_write_path, project_rules_dir, rules_dir, valid_profile,
 };
 use hodor_config::grants::GuestTlsMode;
 use hodor_config::registry::Registry;
@@ -346,6 +346,25 @@ pub(crate) fn include_entries(root: &Path, includes: &[PathBuf], host_home: Opti
   Ok(entries)
 }
 
+/// Resolve `[workspace.build]` to absolute host paths for compose, failing
+/// loudly on a missing dockerfile or context: compose would fail without
+/// naming the setting.
+pub(crate) fn resolve_build(root: &Path, build: &WorkspaceBuild, host_home: Option<&Path>) -> Result<(PathBuf, PathBuf), Error> {
+  let dockerfile = expand(&build.dockerfile, root, host_home);
+  if !dockerfile.is_file() {
+    return Err(Error::BuildDockerfileMissing {
+      path: build.dockerfile.clone(),
+    });
+  }
+  let context = expand(&build.context, root, host_home);
+  if !context.is_dir() {
+    return Err(Error::BuildContextMissing {
+      path: build.context.clone(),
+    });
+  }
+  Ok((context, dockerfile))
+}
+
 /// Workspace inputs resolved once for stack generation: the merged config,
 /// the registry, the secret source, the expansion environment, and the
 /// include-derived mounts.
@@ -479,6 +498,13 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
   let project = config.workspace.name.clone().unwrap_or_else(|| workspace_slug(root));
   let storage = workspace_state_dir(root).join("containers");
   let uid = current_uid();
+  let build_paths: Option<(PathBuf, PathBuf)> = config
+    .workspace
+    .build
+    .as_ref()
+    .map(|build| resolve_build(root, build, host_home))
+    .transpose()?;
+  let agent_image = agent_image(&project, config.workspace.image.as_deref(), build_paths.is_some())?;
   Ok(
     Stack {
       backend,
@@ -491,6 +517,8 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
         uid,
         devices: &config.workspace.devices,
         cap_add: &config.workspace.cap_add,
+        image: &agent_image,
+        build: build_paths.as_ref().map(|(context, dockerfile)| AgentBuild { context, dockerfile }),
       },
       mounts: inputs.mounts,
       tool_mounts,
@@ -1228,6 +1256,36 @@ pub(crate) struct AgentSpec<'a> {
   /// Extra capabilities from `[workspace] cap_add`, appended to the built-in
   /// set.
   pub(crate) cap_add: &'a [String],
+  /// Image tag the agent service runs: configured, derived, or default.
+  pub(crate) image: &'a str,
+  /// Dockerfile build from `[workspace.build]`, when one builds the image.
+  pub(crate) build: Option<AgentBuild<'a>>,
+}
+
+/// Default agent image, when `[workspace] image` is unset and no
+/// `[workspace.build]` builds one.
+pub(crate) const DEFAULT_AGENT_IMAGE: &str = "ghcr.io/casualjim/devagent:26.04";
+
+/// Resolved Dockerfile build for the agent service: absolute host paths for
+/// compose, which sends the context to the daemon itself.
+pub(crate) struct AgentBuild<'a> {
+  /// Build context directory.
+  pub(crate) context: &'a Path,
+  /// Dockerfile to build.
+  pub(crate) dockerfile: &'a Path,
+}
+
+/// Image tag the agent service runs: the configured `image`, a local tag
+/// derived from the project when `[workspace.build]` builds one unnamed, or
+/// the default pull. An empty `image` is a config error, not a silent
+/// default: compose would fail on the empty tag without naming the setting.
+pub(crate) fn agent_image(project: &str, image: Option<&str>, has_build: bool) -> Result<String, Error> {
+  match image {
+    Some(name) if !name.is_empty() => Ok(name.to_string()),
+    Some(_) => Err(Error::EmptyImage),
+    None if has_build => Ok(format!("hodor-agent-{}:local", project.to_lowercase())),
+    None => Ok(DEFAULT_AGENT_IMAGE.to_string()),
+  }
 }
 
 /// What the hodor service runs for a capture backend, the extra capabilities
@@ -1397,12 +1455,25 @@ impl Stack<'_> {
       .chain(self.agent.devices.iter().map(String::as_str))
       .collect::<Vec<_>>()
       .join(", ");
+    let build = self
+      .agent
+      .build
+      .as_ref()
+      .map(|build| {
+        format!(
+          "    build:\n      context: {}\n      dockerfile: {}\n",
+          build.context.display(),
+          build.dockerfile.display()
+        )
+      })
+      .unwrap_or_default();
     let mut out = String::new();
     let _ = write!(
       out,
       "\n\
      \x20 agent:\n\
-     \x20   image: ghcr.io/casualjim/devagent:26.04\n\
+     \x20   image: {image}\n\
+      {build}\
      \x20   # The agent runs containers of its own, which is what the widened\n\
      \x20   # privileges are for: inner containers mount, chroot and raise their\n\
      \x20   # own networking, so seccomp/systempaths/apparmor are unconfined and\n\
@@ -1428,8 +1499,18 @@ impl Stack<'_> {
      \x20     # decoys — one per declared rule, swapped by hodor on grant match\n",
       root = self.agent.root.display(),
       home = self.agent.home,
-      uid = self.agent.uid
+      uid = self.agent.uid,
+      image = self.agent.image,
+      build = build,
     );
+    self.agent_service_tail(&mut out);
+    out
+  }
+
+  /// The agent service's environment and volumes: init chain, decoys,
+  /// passthrough interpolation, and every mount layer with the entrypoint,
+  /// CA, and inner container storage last.
+  fn agent_service_tail(&self, out: &mut String) {
     if let Some(init) = &self.init {
       let _ = writeln!(out, "      HODOR_INIT: \"{init}\"");
     }
@@ -1477,9 +1558,7 @@ impl Stack<'_> {
       home = self.agent.home,
       storage = self.agent.storage.display()
     );
-    out
   }
-
   /// The exposure sidecar: hodor's netns to see every listener of the shared
   /// namespace, the agent's PID namespace so only agent-owned processes can
   /// ever be attributed a listener — hodor's capture and explicit-proxy

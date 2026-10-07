@@ -1,16 +1,17 @@
 //! `hodor init` plus the stack commands (`up`, `down`, `logs`):
 //! generate-once-then-edit, then drive the compose project and enter the agent.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::ffi::OsString;
 use std::fs;
+use std::hash::{Hash as _, Hasher as _};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::error::Error;
-use crate::paths::translate;
+use crate::paths::{expand, translate};
 use crate::stack::{
   STACK_SHAPE, current_uid, derivable_envs, generate_stack, generation_registry, open_fnox, stack_shape_in, uncovered_names,
   uncovered_warning, workspace_config, workspace_file, workspace_state_dir,
@@ -18,7 +19,7 @@ use crate::stack::{
 use clap::Args;
 use dirs::home_dir;
 use hodor_config::cli::{Cli, CliCommand, ProxyBackend};
-use hodor_config::config::{AppConfig, RuleCfg, config_dir};
+use hodor_config::config::{AppConfig, RuleCfg, WorkspaceBuild, config_dir};
 use hodor_fnox::selected_envs;
 use hodor_pki::ca::load_or_generate;
 use libc::{SIG_DFL, SIGINT, c_int, sighandler_t, signal};
@@ -480,12 +481,114 @@ async fn compose_status_interruptible(command: &mut Command) -> Result<(), Error
   Ok(())
 }
 
+/// The compose arguments `hodor up` maps to: `--build` only when the agent
+/// image must be (re)built, so a plain `up` never compiles a Dockerfile.
+pub(crate) fn up_argv(will_build: bool) -> Vec<OsString> {
+  let mut argv: Vec<OsString> = vec!["up".into(), "-d".into()];
+  if will_build {
+    argv.push("--build".into());
+  }
+  argv
+}
+
+/// Digest of the agent build inputs — the dockerfile bytes plus the context
+/// tree's relative paths, sizes, and mtimes — so an edited Dockerfile or a
+/// changed context rebuilds on the next `up` without a flag. Hashing file
+/// contents across the whole context would resend it on every check;
+/// metadata notices a change and stays cheap to read.
+pub(crate) fn build_digest(root: &Path, build: &WorkspaceBuild) -> u64 {
+  fn hash_file(path: &Path, hasher: &mut DefaultHasher) {
+    match fs::read(path) {
+      Ok(bytes) => bytes.hash(hasher),
+      Err(_) => "absent".hash(hasher),
+    }
+    path.hash(hasher);
+  }
+  fn hash_tree(dir: &Path, root: &Path, hasher: &mut DefaultHasher) {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+      .ok()
+      .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+      .unwrap_or_default();
+    entries.sort();
+    for path in entries {
+      if path.is_dir() {
+        hash_tree(&path, root, hasher);
+        continue;
+      }
+      path.strip_prefix(root).unwrap_or(&path).hash(hasher);
+      match path.metadata() {
+        Ok(meta) => {
+          meta.len().hash(hasher);
+          meta.modified().ok().hash(hasher);
+        }
+        Err(_) => "absent".hash(hasher),
+      }
+    }
+  }
+  let home = home_dir();
+  let mut hasher = DefaultHasher::new();
+  hash_file(&expand(&build.dockerfile, root, home.as_deref()), &mut hasher);
+  hash_tree(
+    &expand(&build.context, root, home.as_deref()),
+    &expand(&build.context, root, home.as_deref()),
+    &mut hasher,
+  );
+  hasher.finish()
+}
+
+/// State file holding the last successfully built inputs digest.
+fn build_digest_file(root: &Path) -> PathBuf {
+  workspace_state_dir(root).join("build.digest")
+}
+
+/// Whether this `up` must (re)build the agent image: `--build` forces it,
+/// otherwise a `[workspace.build]` whose inputs changed since the last
+/// successful build. No build section means no build, and `--build` then is
+/// a config error, not a silent no-op.
+fn should_build(root: &Path, is_forced: bool) -> Result<bool, Error> {
+  let Some(build) = workspace_config(root)?.workspace.build else {
+    if is_forced {
+      return Err(Error::BuildNotConfigured);
+    }
+    return Ok(false);
+  };
+  if is_forced {
+    return Ok(true);
+  }
+  let stored = fs::read_to_string(build_digest_file(root)).unwrap_or_default();
+  Ok(stored.trim() != build_digest(root, &build).to_string())
+}
+
+/// Record a successful build's inputs digest, or drop a stale digest file
+/// when no build section configures one.
+fn record_build_digest(root: &Path, was_built: bool) -> Result<(), Error> {
+  let path = build_digest_file(root);
+  match workspace_config(root)?.workspace.build {
+    Some(build) if was_built => fs::write(&path, build_digest(root, &build).to_string()).map_err(|source| Error::WriteFile {
+      path: path.clone(),
+      source,
+    }),
+    Some(_) => Ok(()),
+    None => {
+      if path.exists() {
+        fs::remove_file(&path).map_err(|source| Error::RemoveFile {
+          path: path.clone(),
+          source,
+        })?;
+      }
+      Ok(())
+    }
+  }
+}
+
 /// Start the layered project, making sure what it mounts exists first.
-async fn up_workspace(root: &Path) -> Result<(), Error> {
+async fn up_workspace(root: &Path, is_forced: bool) -> Result<(), Error> {
   report_created(&prepare_support_files(root)?);
+  let will_build = should_build(root, is_forced)?;
   let mut command = compose_command(root)?;
-  command.arg("up").arg("-d");
-  compose_status(&mut command).await
+  command.args(up_argv(will_build));
+  compose_status(&mut command).await?;
+  record_build_digest(root, will_build)
 }
 
 /// Stop the layered project.
@@ -570,6 +673,10 @@ fn warn_uncovered(root: &Path, config: &AppConfig) {
 pub struct UpArgs {
   /// Workspace directory; defaults to the current directory.
   pub workspace: Option<PathBuf>,
+  /// (Re)build the agent image even when its Dockerfile and context are
+  /// unchanged; without it a build happens only when missing or stale.
+  #[arg(long)]
+  pub build: bool,
 }
 
 /// Arguments for the `down` command.
@@ -621,6 +728,10 @@ pub struct AgentArgs {
   /// stack keeps running.
   #[arg(long)]
   pub rm: bool,
+  /// (Re)build the agent image even when its Dockerfile and context are
+  /// unchanged; without it a build happens only when missing or stale.
+  #[arg(long)]
+  pub build: bool,
   /// Command to run in the agent instead of the configured shell; the
   /// arguments after `--`.
   #[arg(last = true)]
@@ -670,7 +781,7 @@ impl CliCommand for AgentArgs {
   async fn run(self, _cli: &Cli, hodor_version: &str) -> Result<(), Self::Error> {
     let root = resolve_root(&workspace_arg(self.workspace.as_deref()))?;
     init_workspace(&root, resolve_backend(None)?, false, hodor_version).await?;
-    up_workspace(&root).await?;
+    up_workspace(&root, self.build).await?;
     if !self.rm {
       return exec_agent(&root, &self.command).await;
     }
@@ -720,7 +831,7 @@ impl CliCommand for UpArgs {
   /// Returns an error when the workspace cannot be resolved, when the support
   /// files cannot be written, or when the compose command fails.
   async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
-    up_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?).await
+    up_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?, self.build).await
   }
 }
 
@@ -749,5 +860,40 @@ impl CliCommand for LogsArgs {
   /// command fails.
   async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
     logs_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?, &self).await
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn up_argv_adds_build_only_when_asked() {
+    assert_eq!(up_argv(false), vec![OsString::from("up"), OsString::from("-d")]);
+    assert_eq!(
+      up_argv(true),
+      vec![OsString::from("up"), OsString::from("-d"), OsString::from("--build")]
+    );
+  }
+
+  #[test]
+  fn build_digest_follows_the_dockerfile_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let docker = dir.path().join("docker");
+    std::fs::create_dir(&docker).unwrap();
+    let dockerfile = docker.join("Dockerfile.agent");
+    std::fs::write(&dockerfile, "FROM scratch\n").unwrap();
+    let build = WorkspaceBuild {
+      dockerfile: PathBuf::from("docker/Dockerfile.agent"),
+      context: PathBuf::from("docker"),
+    };
+    let before = build_digest(dir.path(), &build);
+    std::fs::write(&dockerfile, "FROM scratch\nRUN true\n").unwrap();
+    assert_ne!(build_digest(dir.path(), &build), before, "edited dockerfile rebuilds");
+    assert_eq!(
+      build_digest(dir.path(), &build),
+      build_digest(dir.path(), &build),
+      "same tree is stable"
+    );
   }
 }

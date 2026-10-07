@@ -56,7 +56,10 @@ local project_steps = new Mapping<String, Step> {
     glob = List("**/*.md")
     // Vendored tool skills under .agents/ are upstream text we don't own;
     // their links rot independently of this repo and 503-flake the gate.
-    check = "lychee --exclude-path '\\.agents/' {{files}}"
+    // Excluded here (not via --exclude-path) so lychee never receives them:
+    // it warns "no files found" for every input it filters out itself.
+    exclude = List(".agents/**")
+    check = "lychee {{files}}"
   }
 
   ["check-toml"] = (Builtins.taplo) {

@@ -138,7 +138,7 @@ pub(crate) fn adapt(
   if !mints.is_empty() {
     let container = format!("{home}/.config/hodor/git-credential-hodor");
     twin.push_str("\n# hodor: decoy credentials for granted remotes — generated, do not edit.\n");
-    twin.push_str(&format!("[credential]\n\thelper = !sh {container}\n"));
+    let _ = write!(twin, "[credential]\n\thelper = !sh {container}\n");
     decoy_files.push(DecoyFile {
       name: "git-credential-hodor".to_string(),
       bytes: credential_helper_script(&mints).into_bytes(),

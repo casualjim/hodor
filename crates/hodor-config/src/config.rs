@@ -133,6 +133,15 @@ pub struct WorkspaceCfg {
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub cap_add: Vec<String>,
+  /// Agent image for the generated stack; defaults to the hodor dev image
+  /// when unset.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub image: Option<String>,
+  /// Dockerfile build for the agent image; when set, the agent service
+  /// builds it instead of pulling, tagged with `image` above or a derived
+  /// local tag.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub build: Option<WorkspaceBuild>,
 }
 impl WorkspaceCfg {
   /// Selected profile name, or the shared base when unset.
@@ -231,6 +240,18 @@ impl fmt::Display for RewriteFormat {
       Self::Talos => "talos",
     })
   }
+}
+
+/// Dockerfile build for the agent image: paths resolve against the workspace
+/// root, `~` expands. Both keys are required when `[workspace.build]` is
+/// present; an absent section pulls `image` (or the default) instead.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceBuild {
+  /// Dockerfile to build, relative to the workspace root.
+  pub dockerfile: PathBuf,
+  /// Build context directory, relative to the workspace root.
+  pub context: PathBuf,
 }
 
 /// Proxy listener settings (CLI/env/file overlay).
@@ -1526,6 +1547,28 @@ allow = ["https://b.example"]
     write_file(&global, "[proxy]\n");
     let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert!(config.workspace.ports.is_empty(), "absent ports stay empty");
+    scrub_env();
+  }
+  #[test]
+  fn workspace_image_and_build_parse() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    set_env("HODOR_CONFIG", &global);
+    write_file(
+      &global,
+      "[workspace]\nimage = \"ghcr.io/example/devenv:1.0\"\n[workspace.build]\ndockerfile = \"docker/Dockerfile.agent\"\ncontext = \"docker\"\n",
+    );
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
+    assert_eq!(config.workspace.image.as_deref(), Some("ghcr.io/example/devenv:1.0"));
+    let build = config.workspace.build.as_ref().unwrap();
+    assert_eq!(build.dockerfile, PathBuf::from("docker/Dockerfile.agent"));
+    assert_eq!(build.context, PathBuf::from("docker"));
+    write_file(&global, "[proxy]\n");
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
+    assert!(config.workspace.image.is_none(), "absent image stays none");
+    assert!(config.workspace.build.is_none(), "absent build stays none");
     scrub_env();
   }
 

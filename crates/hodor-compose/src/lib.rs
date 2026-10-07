@@ -29,7 +29,7 @@ mod tests {
   use std::slice::from_ref;
 
   use hodor_config::cli::{Cli, ProxyBackend};
-  use hodor_config::config::{FileRewrite, RewriteFormat, RuleCfg, ToolCfg, fake_for};
+  use hodor_config::config::{FileRewrite, RewriteFormat, RuleCfg, ToolCfg, WorkspaceBuild, fake_for};
   use tempfile::tempdir;
 
   use crate::confine::*;
@@ -68,6 +68,8 @@ mod tests {
       uid: 1000,
       devices: &[],
       cap_add: &[],
+      image: DEFAULT_AGENT_IMAGE,
+      build: None,
     }
   }
 
@@ -492,6 +494,71 @@ mod tests {
     }
     // The agent runs its own runtime; it never reaches the host's.
     assert!(!yaml.contains("docker.sock") && !yaml.contains("/var/run/docker"), "{yaml}");
+  }
+  #[test]
+  fn workspace_image_overrides_the_agent_image() {
+    let mut stack = test_stack(ProxyBackend::Tproxy);
+    stack.agent.image = "ghcr.io/example/devenv:1.0";
+    let yaml = stack.render();
+    assert!(yaml.contains("image: ghcr.io/example/devenv:1.0"), "{yaml}");
+    assert!(!yaml.contains(DEFAULT_AGENT_IMAGE), "{yaml}");
+  }
+
+  #[test]
+  fn agent_build_renders_context_and_dockerfile() {
+    let mut stack = test_stack(ProxyBackend::Tproxy);
+    let build = AgentBuild {
+      context: Path::new("/ws/docker"),
+      dockerfile: Path::new("/ws/docker/Dockerfile.agent"),
+    };
+    stack.agent.build = Some(build);
+    let yaml = stack.render();
+    assert!(
+      yaml.contains("build:\n      context: /ws/docker\n      dockerfile: /ws/docker/Dockerfile.agent"),
+      "{yaml}"
+    );
+  }
+
+  #[test]
+  fn default_agent_service_has_no_build_section() {
+    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    assert!(!yaml.contains("\n    build:\n"), "{yaml}");
+  }
+
+  #[test]
+  fn agent_image_resolution_prefers_config_then_build_then_default() {
+    assert_eq!(
+      agent_image("hodor", Some("ghcr.io/example/devenv:1.0"), false).unwrap(),
+      "ghcr.io/example/devenv:1.0"
+    );
+    assert_eq!(agent_image("hodor", None, false).unwrap(), DEFAULT_AGENT_IMAGE);
+    assert_eq!(agent_image("hodor", None, true).unwrap(), "hodor-agent-hodor:local");
+    agent_image("hodor", Some(""), false).unwrap_err();
+  }
+
+  #[test]
+  fn agent_build_resolution_rejects_missing_inputs() {
+    let dir = tempdir().unwrap();
+    let build = WorkspaceBuild {
+      dockerfile: PathBuf::from("docker/Dockerfile.agent"),
+      context: PathBuf::from("docker"),
+    };
+    let err = resolve_build(dir.path(), &build, None).unwrap_err();
+    assert!(err.to_string().contains("dockerfile"), "{err:?}");
+    let docker = dir.path().join("docker");
+    fs::create_dir(&docker).unwrap();
+    fs::write(docker.join("Dockerfile.agent"), "FROM scratch\n").unwrap();
+    let (context, dockerfile) = resolve_build(dir.path(), &build, None).unwrap();
+    assert_eq!(context, docker);
+    assert_eq!(dockerfile, docker.join("Dockerfile.agent"));
+    fs::remove_dir_all(&docker).unwrap();
+    fs::write(dir.path().join("Dockerfile.agent"), "FROM scratch\n").unwrap();
+    let lone = WorkspaceBuild {
+      dockerfile: PathBuf::from("Dockerfile.agent"),
+      context: PathBuf::from("docker"),
+    };
+    let err = resolve_build(dir.path(), &lone, None).unwrap_err();
+    assert!(err.to_string().contains("context"), "{err:?}");
   }
 
   #[test]

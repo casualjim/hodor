@@ -131,16 +131,21 @@ pub(crate) fn client_identity(cert: &Path, key: &Path) -> Result<ClientAuth, Err
 }
 
 /// Per-connection MITM client-auth policy for one https scope: the entry's
-/// upstream identity when upstream requests one, plus a guest-certificate
-/// demand in `Mtls` mode. `None` keeps the relay default (anonymous ingress,
-/// no egress identity).
+/// upstream identity when upstream requests one, a guest-certificate demand
+/// in `Mtls` mode, and an explicit empty answer otherwise. The empty plan
+/// matters: with no policy the relay rejects an upstream certificate
+/// request outright, while every ordinary TLS client answers it empty and
+/// carries on — which is what servers that request without requiring (like
+/// a kube apiserver) expect.
 pub(crate) fn client_auth_policy(scope: &EndpointScope, trust: &X509Store) -> Result<Option<TlsMitmClientAuthPolicy>, Error> {
   let auth = match (&scope.client_cert, &scope.client_key) {
     (Some(cert), Some(key)) => Some(client_identity(cert, key)?),
     (Some(_) | None, None) | (None, Some(_)) => None,
   };
   match (scope.guest_tls, auth) {
-    (GuestTlsMode::Tls, None) => Ok(None),
+    (GuestTlsMode::Tls, None) => Ok(Some(TlsMitmClientAuthPolicy::new(service_fn(|_: TlsMitmClientAuthInput| async {
+      Ok::<_, std::convert::Infallible>(TlsMitmClientAuthPlan::fixed(None))
+    })))),
     (GuestTlsMode::Tls, Some(auth)) => TlsMitmClientAuthPolicy::try_from(auth)
       .map(Some)
       .map_err(|err| Error::ClientAuthPolicy { source: err }),
@@ -625,5 +630,42 @@ impl ServerCertVerifier for EgressCertVerifier {
 
   fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
     self.provider.signature_verification_algorithms.supported_schemes()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use rama::tls::boring::core::x509::store::X509StoreBuilder;
+
+  use super::*;
+  use hodor_config::grants::Scheme;
+
+  fn tls_scope() -> EndpointScope {
+    EndpointScope {
+      scheme: Scheme::Https,
+      host: "localhost".parse().unwrap(),
+      port: 443,
+      client_cert: None,
+      client_key: None,
+      root_cert: None,
+      guest_tls: GuestTlsMode::Tls,
+    }
+  }
+
+  fn test_trust() -> X509Store {
+    let ca = CertAuthority::generate().unwrap();
+    let (crt, _) = ca.boring_pair().unwrap();
+    let mut builder = X509StoreBuilder::new().unwrap();
+    builder.add_cert(&crt).unwrap();
+    builder.build()
+  }
+
+  #[test]
+  fn anonymous_scopes_carry_an_explicit_empty_client_auth_plan() {
+    let policy = client_auth_policy(&tls_scope(), &test_trust()).expect("policy builds");
+    assert!(
+      policy.is_some(),
+      "anonymous legs must answer an upstream certificate request empty instead of dying"
+    );
   }
 }

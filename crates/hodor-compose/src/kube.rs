@@ -357,11 +357,16 @@ fn kube_blobs(
     client_cert: None,
     client_key: None,
     root_cert: None,
-    guest_tls_mode: GuestTlsMode::Mtls,
+    // A client pair means mutual TLS both ways: the guest presents the
+    // minted pair, the proxy the real one upstream. Token-only users carry
+    // no client certificate, so asking for one fails their handshake with
+    // `certificate required` before any bearer swap can happen.
+    guest_tls_mode: GuestTlsMode::Tls,
     guest_cert: None,
     guest_key: None,
   };
   if let (Some(cert), Some(key)) = (cert, key) {
+    tls.guest_tls_mode = GuestTlsMode::Mtls;
     let cert_name = format!("{label}.client.crt");
     let key_name = format!("{label}.client.key");
     tls.client_cert = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}")));
@@ -622,6 +627,34 @@ users:
     );
     assert!(!decoy.contains("Q0VSVA=="), "no real pair survives: {decoy}");
     assert_eq!(decoy.matches("token: ").count(), 2, "each user keeps a decoy token: {decoy}");
+  }
+
+  #[test]
+  fn token_only_user_takes_plain_tls_while_pair_users_take_mtls() {
+    // Only unmasked fixture text is touched here, so the bearer value never
+    // appears in this test.
+    let token_doc = BEARER_DOC.replace(", client-certificate-data: Q0VSVA==, client-key-data: S0VZ", "");
+    let token_rules = rules_from(&adapt_doc(&token_doc).fragment);
+    let token_rule = token_rules.get("home-ivan-kube-k3s-k3s-local").expect("rule present");
+    let token_tls = token_rule.tls.get("https://10.0.0.1:6443").expect("tls keyed by the allow entry");
+    assert_eq!(
+      token_tls.guest_tls_mode,
+      GuestTlsMode::Tls,
+      "no client pair, so the proxy must not ask the guest for a client certificate"
+    );
+    let marker = "user: {";
+    let fields_at = BEARER_DOC.find(marker).expect("user line") + marker.len();
+    let pair_at = BEARER_DOC[fields_at..].find(", client-certificate-data").expect("pair fields") + fields_at + 2;
+    let mut pair_doc = BEARER_DOC.to_string();
+    pair_doc.replace_range(fields_at..pair_at, "");
+    let pair_rules = rules_from(&adapt_doc(&pair_doc).fragment);
+    let pair_rule = pair_rules.get("home-ivan-kube-k3s-k3s-local").expect("rule present");
+    let pair_tls = pair_rule.tls.get("https://10.0.0.1:6443").expect("tls keyed by the allow entry");
+    assert_eq!(
+      pair_tls.guest_tls_mode,
+      GuestTlsMode::Mtls,
+      "pair users still swap the client certificate"
+    );
   }
 
   #[test]

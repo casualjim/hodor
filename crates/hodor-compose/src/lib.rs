@@ -106,12 +106,11 @@ mod tests {
   }
 
   #[test]
-  fn rules_toml_lists_what_derives_automatically() {
+  fn rules_toml_prints_derived_rules_as_blocks() {
     let toml = rules_toml(&decoys(), &[], &[]);
-    assert!(toml.contains("#   GITHUB_TOKEN"), "{toml}");
-    assert!(toml.contains("#   ANTHROPIC_API_KEY"), "{toml}");
+    assert!(toml.contains("[rules.github_token]\nenv = \"GITHUB_TOKEN\""), "{toml}");
+    assert!(toml.contains("[rules.anthropic_api_key]\nenv = \"ANTHROPIC_API_KEY\""), "{toml}");
     assert!(!toml.contains("value ="), "{toml}");
-    assert!(!toml.contains("\n[rules."), "{toml}");
   }
 
   #[test]

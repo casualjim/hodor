@@ -1170,9 +1170,9 @@ pub(crate) fn rules_toml(decoys: &[Decoy], hostless: &[Decoy], unregistered: &[S
      # `<config-dir>/hodor/rules.d/` or `<workspace root>/.config/hodor/rules.d/`.\n",
   );
   if !decoys.is_empty() {
-    out.push_str("#\n# derives automatically, hosts from the registry:\n");
+    out.push_str("#\n# derives automatically at serve time, hosts from the registry:\n");
     for decoy in decoys {
-      let _ = writeln!(out, "#   {}", decoy.env);
+      let _ = writeln!(out, "[rules.{}]\nenv = \"{}\"\n", decoy.env.to_lowercase(), decoy.env);
     }
   }
   if !hostless.is_empty() {

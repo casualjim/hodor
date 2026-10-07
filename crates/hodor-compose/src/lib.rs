@@ -66,6 +66,8 @@ mod tests {
       home: "/home/eng",
       storage: Path::new("/state/hodor/ws/hodor/containers"),
       uid: 1000,
+      devices: &[],
+      cap_add: &[],
     }
   }
 
@@ -474,6 +476,21 @@ mod tests {
     }
     // The agent runs its own runtime; it never reaches the host's.
     assert!(!yaml.contains("docker.sock") && !yaml.contains("/var/run/docker"), "{yaml}");
+  }
+
+  #[test]
+  fn workspace_devices_and_caps_append_to_the_agent_builtin_set() {
+    let mut stack = test_stack(ProxyBackend::Tproxy);
+    let devices = ["/dev/kvm".to_string()];
+    let cap_add = ["SYS_PTRACE".to_string()];
+    stack.agent.devices = &devices;
+    stack.agent.cap_add = &cap_add;
+    let yaml = stack.render();
+    assert!(yaml.contains("devices: [/dev/net/tun, /dev/kvm]"), "{yaml}");
+    assert!(
+      yaml.contains("cap_add: [SYS_CHROOT, AUDIT_WRITE, NET_ADMIN, SETUID, SETGID, SYS_ADMIN, SYS_PTRACE]"),
+      "{yaml}"
+    );
   }
 
   #[test]

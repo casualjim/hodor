@@ -119,6 +119,20 @@ pub struct WorkspaceCfg {
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub file_rewrite: Vec<FileRewrite>,
+  /// Devices the generated stack hands the agent container on top of the
+  /// built-in set (`/dev/net/tun`): host device paths passed verbatim to
+  /// compose, e.g. `/dev/kvm`. Applying a change needs a stack restart —
+  /// devices are fixed at container create.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub devices: Vec<String>,
+  /// Extra Linux capabilities the agent container gains on top of the
+  /// built-in set (`SYS_CHROOT`, `AUDIT_WRITE`, `NET_ADMIN`, `SETUID`,
+  /// `SETGID`, `SYS_ADMIN`): capability names passed verbatim to compose,
+  /// e.g. `SYS_PTRACE`.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub cap_add: Vec<String>,
 }
 impl WorkspaceCfg {
   /// Selected profile name, or the shared base when unset.

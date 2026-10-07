@@ -481,6 +481,8 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
         home,
         storage: &storage,
         uid,
+        devices: &config.workspace.devices,
+        cap_add: &config.workspace.cap_add,
       },
       mounts: inputs.mounts,
       tool_mounts,
@@ -1213,6 +1215,11 @@ pub(crate) struct AgentSpec<'a> {
   pub(crate) storage: &'a Path,
   /// Host uid baked as the agent user: mounts the agent writes must be its own.
   pub(crate) uid: u32,
+  /// Extra devices from `[workspace] devices`, appended to `/dev/net/tun`.
+  pub(crate) devices: &'a [String],
+  /// Extra capabilities from `[workspace] cap_add`, appended to the built-in
+  /// set.
+  pub(crate) cap_add: &'a [String],
 }
 
 /// What the hodor service runs for a capture backend, the extra capabilities
@@ -1369,6 +1376,15 @@ impl Stack<'_> {
       ),
       ProxyBackend::Tun | ProxyBackend::Tproxy | ProxyBackend::None => String::new(),
     };
+    let caps = std::iter::once("SYS_CHROOT")
+      .chain(["AUDIT_WRITE", "NET_ADMIN", "SETUID", "SETGID", "SYS_ADMIN"])
+      .chain(self.agent.cap_add.iter().map(String::as_str))
+      .collect::<Vec<_>>()
+      .join(", ");
+    let devices = std::iter::once("/dev/net/tun")
+      .chain(self.agent.devices.iter().map(String::as_str))
+      .collect::<Vec<_>>()
+      .join(", ");
     let mut out = String::new();
     let _ = write!(
       out,
@@ -1382,8 +1398,8 @@ impl Stack<'_> {
      \x20   # profile requires and is inert where AppArmor is not loaded.\n\
      \x20   # systempaths=unconfined is podman-only: drop it under docker.\n\
      \x20   security_opt: [seccomp=unconfined, systempaths=unconfined, apparmor=unconfined]\n\
-     \x20   cap_add: [SYS_CHROOT, AUDIT_WRITE, NET_ADMIN, SETUID, SETGID, SYS_ADMIN]\n\
-     \x20   devices: [/dev/net/tun]\n\
+     \x20   cap_add: [{caps}]\n\
+     \x20   devices: [{devices}]\n\
      {cgroup}\
      \x20   # docker-init (tini) as pid 1: signal handling and child reaping\n\
      \x20   # for the long-running shells this container hosts\n\

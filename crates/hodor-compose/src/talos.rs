@@ -19,8 +19,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hodor_config::config::{HostTlsCfg, RewriteFormat};
 use hodor_config::grants::{EndpointScope, GuestTlsMode, Scheme};
 use hodor_pki::ca::{CertAuthority, load_or_generate_client_pair};
-use serde::{Deserialize, Serialize};
-use serde_yaml::{Mapping, from_str};
+use serde::Deserialize;
+use serde_yaml::{Mapping, Value, from_str};
 
 use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment, rewrite_label};
 use crate::error::Error;
@@ -42,9 +42,6 @@ struct TalosContext {
   /// Talos API endpoints: bare hosts, `host:port`, or an Omni URL.
   #[serde(default)]
   endpoints: Vec<String>,
-  /// Default node targets; carried into the decoy unchanged.
-  #[serde(default)]
-  nodes: Vec<String>,
   /// Base64 cluster CA.
   #[serde(default)]
   ca: String,
@@ -195,19 +192,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       ssh: BTreeMap::new(),
     },
   )?;
-  let decoy = render_decoy(&DecoyDoc {
-    context: doc.context.clone(),
-    contexts: BTreeMap::from([(
-      doc.context.clone(),
-      DecoyContext {
-        endpoints: active.endpoints.clone(),
-        nodes: active.nodes.clone(),
-        ca: STANDARD.encode(ca.cert_pem()),
-        crt: STANDARD.encode(&guest_cert),
-        key: STANDARD.encode(&guest_key),
-      },
-    )]),
-  })?;
+  let decoy = decoy_doc(&text, source, ca, &guest_cert, &guest_key, &doc.context)?;
   Ok(RewriteAdapted {
     fragment,
     decoy,
@@ -234,22 +219,49 @@ fn normalize_endpoint(endpoint: &str) -> String {
   }
 }
 
-/// The agent's decoy talosconfig: same context, endpoints, and nodes, hodor
-/// CA, guest pair. `nodes` drops when empty, matching talosctl's own output.
-#[derive(Serialize)]
-struct DecoyDoc {
-  context: String,
-  contexts: BTreeMap<String, DecoyContext>,
-}
-
-#[derive(Serialize)]
-struct DecoyContext {
-  endpoints: Vec<String>,
-  #[serde(skip_serializing_if = "Vec::is_empty")]
-  nodes: Vec<String>,
-  ca: String,
-  crt: String,
-  key: String,
+/// The agent's decoy talosconfig: the parsed document verbatim, with trust
+/// and identity swapped in every context — hodor's CA, the guest pair —
+/// because only decoys may cross into the agent. `auth` blocks on contexts
+/// beyond the active one are dropped: they carry Omni credential config the
+/// adapter cannot substitute. Every other field round-trips unchanged.
+fn decoy_doc(text: &str, source: &Path, ca: &CertAuthority, guest_cert: &[u8], guest_key: &[u8], active: &str) -> Result<String, Error> {
+  let mut root: Value = from_str(text).map_err(|err| Error::RewriteYaml {
+    file: source.to_path_buf(),
+    source: err,
+  })?;
+  let guest_ca = Value::String(STANDARD.encode(ca.cert_pem()));
+  let guest_cert = Value::String(STANDARD.encode(guest_cert));
+  let guest_key = Value::String(STANDARD.encode(guest_key));
+  let Some(contexts) = root
+    .as_mapping_mut()
+    .and_then(|map| map.get_mut(Value::String("contexts".to_string())))
+    .and_then(Value::as_mapping_mut)
+  else {
+    return render_decoy(&root);
+  };
+  let names = contexts
+    .keys()
+    .filter_map(|key| key.as_str().map(str::to_string))
+    .collect::<Vec<_>>();
+  for name in names {
+    let Some(context) = contexts.get_mut(Value::String(name.clone())).and_then(Value::as_mapping_mut) else {
+      continue;
+    };
+    let ca_key = Value::String("ca".to_string());
+    let crt_key = Value::String("crt".to_string());
+    let key_key = Value::String("key".to_string());
+    if context.contains_key(&ca_key) {
+      context.insert(ca_key, guest_ca.clone());
+    }
+    if context.contains_key(&crt_key) || context.contains_key(&key_key) {
+      context.insert(crt_key, guest_cert.clone());
+      context.insert(key_key, guest_key.clone());
+    }
+    if name != active {
+      context.remove(Value::String("auth".to_string()));
+    }
+  }
+  render_decoy(&root)
 }
 
 #[cfg(test)]
@@ -300,6 +312,37 @@ mod tests {
     assert!(adapted.decoy.contains("endpoints:\n    - 10.5.0.6"), "{}", adapted.decoy);
     assert!(adapted.decoy.contains("context: prod"), "{}", adapted.decoy);
     assert_eq!(adapted.materialized.len(), 3);
+  }
+
+  #[test]
+  fn decoy_round_trips_every_context() {
+    let body = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n  staging:\n    endpoints:\n      - 10.6.0.7\n    nodes:\n      - 10.6.0.8\n    ca: {}\n    crt: {}\n    key: {}\n",
+      STANDARD.encode(b"CA"),
+      STANDARD.encode(b"CRT"),
+      STANDARD.encode(b"KEY"),
+      STANDARD.encode(b"CA2"),
+      STANDARD.encode(b"CRT2"),
+      STANDARD.encode(b"KEY2"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let adapted = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap();
+    let decoy = &adapted.decoy;
+    assert!(decoy.contains("staging:"), "{decoy}");
+    assert!(decoy.contains("- 10.6.0.7"), "{decoy}");
+    assert!(decoy.contains("- 10.6.0.8"), "{decoy}");
+    assert!(
+      !decoy.contains(&STANDARD.encode(b"CA2")),
+      "no real CA survives in any context: {decoy}"
+    );
+    assert!(
+      !decoy.contains(&STANDARD.encode(b"CRT2")),
+      "no real identity survives in any context: {decoy}"
+    );
+    assert!(
+      !decoy.contains(&STANDARD.encode(b"KEY2")),
+      "no real key survives in any context: {decoy}"
+    );
   }
 
   #[test]

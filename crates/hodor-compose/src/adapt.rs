@@ -175,9 +175,9 @@ pub(crate) fn rewrite_label(source: &Path, name: &str) -> Result<String, Error> 
 
 /// Write the grant layer: the grant fragments concatenated into the marker
 /// global config, plus the blobs under `rules.d`, pruning stale adapter blobs
-/// so a removed rewrite stops granting. The hodor service points
-/// `HODOR_CONFIG` at the marker, adding this layer without touching user
-/// config.
+/// so a removed rewrite stops granting. The hodor service mounts the marker
+/// at `/root/.config/hodor/config.toml`, adding this layer without touching
+/// user config.
 ///
 /// # Errors
 ///

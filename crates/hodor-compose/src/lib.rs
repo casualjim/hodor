@@ -114,6 +114,23 @@ mod tests {
   }
 
   #[test]
+  fn grants_layer_mounts_at_the_standard_config_path() {
+    let mut stack = test_stack(ProxyBackend::Ebpf);
+    stack.grants_mounts = vec![Mount {
+      host: Path::new("/state/hodor/ws/hodor/grants").to_path_buf(),
+      container: PathBuf::from("/hodor/grants"),
+      ro: true,
+    }];
+    let yaml = stack.render();
+    assert!(yaml.contains("- /state/hodor/ws/hodor/grants:/hodor/grants:ro"), "{yaml}");
+    assert!(
+      yaml.contains("- /state/hodor/ws/hodor/grants/hodor.toml:/root/.config/hodor/config.toml:ro"),
+      "the grant layer must BE the global config so rules.d resolves beside it: {yaml}"
+    );
+    assert!(!yaml.contains("HODOR_CONFIG"), "{yaml}");
+  }
+
+  #[test]
   fn names_the_registry_states_no_hosts_for_split_out_of_the_active_rules() {
     let registry = generation_registry(None).unwrap();
     let decoys = vec![
@@ -1447,7 +1464,7 @@ users:
       .find(|mount| mount.container == Path::new("/home/eng/.gitconfig"))
       .unwrap();
     let twin = fs::read_to_string(&gitconfig_mount.host).unwrap();
-    assert!(twin.contains("extraHeader"), "{twin}");
+    assert!(twin.contains("helper = !sh /home/eng/.config/hodor/git-credential-hodor"), "{twin}");
     assert!(twin.contains("casualjim"), "{twin}");
     assert!(
       outputs.grants.iter().any(|grant| grant.fragment.contains("ssh://git.internal")),

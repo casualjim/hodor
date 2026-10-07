@@ -16,11 +16,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hodor_config::config::{HostTlsCfg, RewriteFormat};
+use hodor_config::config::{HostTlsCfg, RewriteFormat, fake_for};
 use hodor_config::grants::{EndpointScope, GuestTlsMode, Scheme, decoy_for_rule};
 use hodor_pki::ca::{CertAuthority, load_or_generate_client_pair};
-use serde::{Deserialize, Serialize};
-use serde_yaml::{Mapping, from_str};
+use serde::Deserialize;
+use serde_yaml::{Mapping, Value, from_str};
 
 use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment, rewrite_label};
 use crate::error::Error;
@@ -303,15 +303,15 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       ssh: BTreeMap::new(),
     },
   )?;
-  let decoy = render_decoy(&DecoyDoc::kube(
-    &doc.current_context,
-    cluster,
-    user,
+  let decoy = decoy_doc(
+    &text,
+    source,
     ca,
-    token.map(|_| decoy_token.as_str()),
     &blobs.guest_cert,
     &blobs.guest_key,
-  ))?;
+    &user.name,
+    token.map(|_| decoy_token.as_str()),
+  )?;
   Ok(Some(RewriteAdapted {
     fragment,
     decoy,
@@ -382,102 +382,95 @@ fn kube_blobs(
   })
 }
 
-/// The agent's decoy kubeconfig: same server, hodor CA, guest pair, and the
-/// decoy token when the real user carries one. Field order matches what
-/// kubectl emits for familiarity; unknown fields are absent.
-impl DecoyDoc {
-  /// The agent's decoy for one derived kube rule: same server, hodor CA,
-  /// guest pair, decoy token when the real user carries one.
-  fn kube(
-    context: &str,
-    cluster: &KubeClusterEntry,
-    user: &KubeUserEntry,
-    ca: &CertAuthority,
-    decoy_token: Option<&str>,
-    guest_cert: &[u8],
-    guest_key: &[u8],
-  ) -> Self {
-    Self {
-      api_version: "v1".to_string(),
-      kind: "Config".to_string(),
-      current_context: context.to_string(),
-      contexts: vec![DecoyContextEntry {
-        name: context.to_string(),
-        context: DecoyContextRef {
-          cluster: cluster.name.clone(),
-          user: user.name.clone(),
-        },
-      }],
-      clusters: vec![DecoyClusterEntry {
-        name: cluster.name.clone(),
-        cluster: DecoyCluster {
-          server: cluster.cluster.server.clone(),
-          certificate_authority_data: STANDARD.encode(ca.cert_pem()),
-        },
-      }],
-      users: vec![DecoyUserEntry {
-        name: user.name.clone(),
-        user: DecoyUser {
-          token: decoy_token.map(str::to_string),
-          client_certificate_data: STANDARD.encode(guest_cert),
-          client_key_data: STANDARD.encode(guest_key),
-        },
-      }],
+/// The agent's decoy kubeconfig: the parsed document verbatim, with trust
+/// and identity swapped in every entry — hodor's CA under every cluster,
+/// the guest pair and a decoy token in every user — because only decoys may
+/// cross into the agent. `exec` blocks and file-reference credentials are
+/// dropped from every user: they run host binaries or point at host paths
+/// the agent cannot see. Every other field, spec'd or not, round-trips
+/// unchanged.
+fn decoy_doc(
+  text: &str,
+  source: &Path,
+  ca: &CertAuthority,
+  guest_cert: &[u8],
+  guest_key: &[u8],
+  active_user: &str,
+  active_decoy: Option<&str>,
+) -> Result<String, Error> {
+  let mut root: Value = from_str(text).map_err(|err| Error::RewriteYaml {
+    file: source.to_path_buf(),
+    source: err,
+  })?;
+  let guest_ca = Value::String(STANDARD.encode(ca.cert_pem()));
+  let guest_cert = Value::String(STANDARD.encode(guest_cert));
+  let guest_key = Value::String(STANDARD.encode(guest_key));
+  for cluster in entries_mut(&mut root, "clusters") {
+    let Some(inner) = cluster
+      .get_mut(Value::String("cluster".to_string()))
+      .and_then(Value::as_mapping_mut)
+    else {
+      continue;
+    };
+    let ca_data = Value::String("certificate-authority-data".to_string());
+    if inner.contains_key(&ca_data) {
+      inner.insert(ca_data, guest_ca.clone());
     }
+    inner.remove(Value::String("certificate-authority".to_string()));
   }
+  for user in entries_mut(&mut root, "users") {
+    let name = user
+      .get(Value::String("name".to_string()))
+      .and_then(Value::as_str)
+      .unwrap_or_default()
+      .to_string();
+    let Some(inner) = user.get_mut(Value::String("user".to_string())).and_then(Value::as_mapping_mut) else {
+      continue;
+    };
+    let placeholder = || fake_for(&format!("KUBE_{}", name.to_uppercase().replace(['-', '.'], "_")), None);
+    if inner.contains_key(Value::String("token".to_string())) {
+      let decoy = if name == active_user {
+        active_decoy.map(str::to_string)
+      } else {
+        None
+      }
+      .unwrap_or_else(placeholder);
+      inner.insert(Value::String("token".to_string()), Value::String(decoy));
+    }
+    let cert_data = Value::String("client-certificate-data".to_string());
+    let key_data = Value::String("client-key-data".to_string());
+    if inner.contains_key(&cert_data) || inner.contains_key(&key_data) {
+      inner.insert(cert_data, guest_cert.clone());
+      inner.insert(key_data, guest_key.clone());
+    }
+    inner.remove(Value::String("client-certificate".to_string()));
+    inner.remove(Value::String("client-key".to_string()));
+    let auth_provider = Value::String("auth-provider".to_string());
+    if let Some(config) = inner
+      .get_mut(&auth_provider)
+      .and_then(Value::as_mapping_mut)
+      .and_then(|provider| provider.get_mut(Value::String("config".to_string())))
+      .and_then(Value::as_mapping_mut)
+      && config.contains_key(Value::String("access-token".to_string()))
+    {
+      config.insert(Value::String("access-token".to_string()), Value::String(placeholder()));
+    }
+    if inner.contains_key(Value::String("password".to_string())) {
+      inner.insert(Value::String("password".to_string()), Value::String(placeholder()));
+    }
+    inner.remove(Value::String("exec".to_string()));
+  }
+  render_decoy(&root)
 }
 
-#[derive(Serialize)]
-struct DecoyDoc {
-  #[serde(rename = "apiVersion")]
-  api_version: String,
-  kind: String,
-  #[serde(rename = "current-context")]
-  current_context: String,
-  contexts: Vec<DecoyContextEntry>,
-  clusters: Vec<DecoyClusterEntry>,
-  users: Vec<DecoyUserEntry>,
-}
-
-#[derive(Serialize)]
-struct DecoyContextEntry {
-  name: String,
-  context: DecoyContextRef,
-}
-
-#[derive(Serialize)]
-struct DecoyContextRef {
-  cluster: String,
-  user: String,
-}
-
-#[derive(Serialize)]
-struct DecoyClusterEntry {
-  name: String,
-  cluster: DecoyCluster,
-}
-
-#[derive(Serialize)]
-struct DecoyCluster {
-  server: String,
-  #[serde(rename = "certificate-authority-data")]
-  certificate_authority_data: String,
-}
-
-#[derive(Serialize)]
-struct DecoyUserEntry {
-  name: String,
-  user: DecoyUser,
-}
-
-#[derive(Serialize)]
-struct DecoyUser {
-  #[serde(skip_serializing_if = "Option::is_none")]
-  token: Option<String>,
-  #[serde(rename = "client-certificate-data")]
-  client_certificate_data: String,
-  #[serde(rename = "client-key-data")]
-  client_key_data: String,
+/// The `key` list of `root` as mutable mappings; entries that are not
+/// mappings contribute nothing.
+fn entries_mut<'a>(root: &'a mut Value, key: &str) -> Vec<&'a mut Mapping> {
+  root
+    .as_mapping_mut()
+    .and_then(|map| map.get_mut(Value::String(key.to_string())))
+    .and_then(Value::as_sequence_mut)
+    .map_or_else(Vec::new, |seq| seq.iter_mut().filter_map(Value::as_mapping_mut).collect())
 }
 
 #[cfg(test)]
@@ -587,6 +580,48 @@ users:
       "guest pair present: {}",
       adapted.decoy
     );
+  }
+
+  #[test]
+  fn decoy_round_trips_spec_fields_and_all_entries() {
+    let doc = "apiVersion: v1
+kind: Config
+preferences: {colors: true}
+current-context: k3s-local
+contexts:
+- name: k3s-local
+  context: {cluster: k3s, user: admin, namespace: platform}
+- name: staging
+  context: {cluster: stg, user: stg-user, namespace: stg-ns}
+clusters:
+- name: k3s
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=, tls-server-name: api.internal, insecure-skip-tls-verify: false}
+- name: stg
+  cluster: {server: https://10.1.0.1:6443, certificate-authority-data: Q1RFU1Q=}
+users:
+- name: admin
+  user: {token: k3s-admin-token, client-certificate-data: Q0VSVA==, client-key-data: S0VZ, username: ivan, as: platform-sa}
+- name: stg-user
+  user: {token: stg-real-token}
+";
+    let adapted = adapt_doc(doc);
+    let decoy = &adapted.decoy;
+    assert!(decoy.contains("namespace: platform"), "{decoy}");
+    assert!(decoy.contains("namespace: stg-ns"), "{decoy}");
+    assert!(decoy.contains("tls-server-name: api.internal"), "{decoy}");
+    assert!(decoy.contains("insecure-skip-tls-verify: false"), "{decoy}");
+    assert!(decoy.contains("preferences"), "{decoy}");
+    assert!(decoy.contains("server: https://10.1.0.1:6443"), "{decoy}");
+    assert!(decoy.contains("username: ivan"), "{decoy}");
+    assert!(decoy.contains("as: platform-sa"), "{decoy}");
+    assert!(!decoy.contains("k3s-admin-token"), "no real token survives: {decoy}");
+    assert!(!decoy.contains("stg-real-token"), "no real token survives in any user: {decoy}");
+    assert!(
+      !decoy.contains("Q0E=") && !decoy.contains("Q1RFU1Q="),
+      "no real CA survives in any cluster: {decoy}"
+    );
+    assert!(!decoy.contains("Q0VSVA=="), "no real pair survives: {decoy}");
+    assert_eq!(decoy.matches("token: ").count(), 2, "each user keeps a decoy token: {decoy}");
   }
 
   #[test]

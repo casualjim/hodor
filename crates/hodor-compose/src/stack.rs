@@ -43,8 +43,16 @@ use crate::talos;
 /// 5 mounts the global `rules.d` into the hodor service, so in-container rule
 /// derivation sees the same registry hosts as the host. Shape 6 derives
 /// the ambient sources — gitconfig, jj, ssh, kubeconfig, talosconfig — and
-/// mounts their decoy twins at the default paths.
-pub(crate) const STACK_SHAPE: u32 = 6;
+/// mounts their decoy twins at the default paths. Shape 7 mints the https
+/// decoy as a `credential.<url>.helper` instead of an `http.<url>.extraHeader`,
+/// so cargo's libgit2 fetch can authenticate too. Shape 8 mounts the grant
+/// layer at `/root/.config/hodor/config.toml` instead of the `HODOR_CONFIG`
+/// env: discovery derives `rules.d` from the config file's directory, so the
+/// env hid the host's global rules.d and the proxy served without its hosts.
+/// Shape 9 answers git credential lookups with one generated helper script
+/// instead of inline snippets, and drops host `credential.*.helper` entries
+/// naming binaries absent from the agent.
+pub(crate) const STACK_SHAPE: u32 = 9;
 
 /// The shape revision a generated stack carries, from its `# stack shape:`
 /// marker line; `None` for a file without a readable one, which is a stack
@@ -1283,11 +1291,6 @@ impl Stack<'_> {
   pub(crate) fn render(&self) -> String {
     let (serve, extra_caps, service_extra) = backend_service(self.backend, &self.project);
     let mut out = String::new();
-    let grants_env = if self.grants_mounts.is_empty() {
-      String::new()
-    } else {
-      format!("      HODOR_CONFIG: {GRANTS_STATE_DIR}/hodor.toml\n")
-    };
     let _ = write!(
       out,
       "# stack shape: {shape}\n\
@@ -1310,7 +1313,7 @@ impl Stack<'_> {
        \x20     # 8080 must stay free on loopback: agent dev servers default\n\
        \x20     # to it, and the explicit proxy's default bind would squat on\n\
        \x20     # 127.0.0.1:8080, leaving the fwd sidecar nothing to expose.\n\
-       \x20     HODOR_LISTEN: {listen}\n{grants_env}",
+       \x20     HODOR_LISTEN: {listen}\n",
       root = self.agent.root.display(),
       project = self.project,
       listen = EXPLICIT_LISTEN,
@@ -1355,6 +1358,15 @@ impl Stack<'_> {
     }
     for mount in &self.grants_mounts {
       let _ = writeln!(out, "      - {}:{}:ro", mount.host.display(), mount.container.display());
+      // The grant layer is the container's global config, mounted at the
+      // standard path rather than named by HODOR_CONFIG: config discovery
+      // derives `rules.d` from the config file's directory, so the env would
+      // point that at /hodor/grants and hide the host's global rules.d mount.
+      let _ = writeln!(
+        out,
+        "      - {}:/root/.config/hodor/config.toml:ro",
+        mount.host.join("hodor.toml").display()
+      );
     }
     out.push_str(&self.agent_service());
     out.push_str(&self.fwd_service());

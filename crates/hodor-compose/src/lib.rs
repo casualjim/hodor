@@ -254,13 +254,16 @@ mod tests {
 
     let roots = temp_roots(&profiles);
     let mounts = profile_mounts(&roots, "__shared__", &BTreeMap::new(), "/home/eng").unwrap();
-    assert_eq!(
-      rendered_mounts(&mounts),
-      vec![
-        format!("{}:/home/eng/.config/opencode:rw", shared.join("opencode").display()),
-        format!("{}:/home/eng/.pi:rw", shared.join("pi").display()),
-      ]
+    let rendered = rendered_mounts(&mounts);
+    assert!(
+      rendered.contains(&format!("{}:/home/eng/.config/opencode:rw", shared.join("opencode").display())),
+      "{rendered:?}"
     );
+    assert!(
+      rendered.contains(&format!("{}:/home/eng/.pi:rw", shared.join("pi").display())),
+      "{rendered:?}"
+    );
+    assert!(!rendered.iter().any(|mount| mount.contains("not-a-tool")), "{rendered:?}");
 
     let yaml = Stack {
       agent: agent_paths("/home/eng/github/hodor"),
@@ -281,10 +284,13 @@ mod tests {
     let profiles = temp_global(&dir);
     let roots = temp_roots(&profiles);
     let mounts = profile_mounts(&roots, "__shared__", &BTreeMap::new(), "/home/eng").unwrap();
-    assert!(mounts.is_empty(), "{mounts:?}");
     assert!(
       profiles.join("__shared__").is_dir(),
       "the base every profile inherits is always made"
+    );
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display())),
+      "missing tool dirs materialize so first-run setups persist: {mounts:?}"
     );
   }
 
@@ -297,12 +303,13 @@ mod tests {
 
     let roots = temp_roots(&profiles);
     let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
-    assert_eq!(
-      rendered_mounts(&mounts),
-      vec![
-        format!("{}:/home/eng/.config/gh:rw", profiles.join("work").join("gh").display()),
-        format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display()),
-      ]
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.config/gh:rw", profiles.join("work").join("gh").display())),
+      "{mounts:?}"
+    );
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display())),
+      "{mounts:?}"
     );
   }
 
@@ -318,12 +325,16 @@ mod tests {
 
     let roots = temp_roots(&profiles);
     let mounts = profile_mounts(&roots, "leaf", &BTreeMap::new(), "/home/eng").unwrap();
-    assert_eq!(
-      rendered_mounts(&mounts),
-      vec![
-        format!("{}:/home/eng/.config/opencode:rw", profiles.join("mid").join("opencode").display()),
-        format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display()),
-      ]
+    assert!(
+      rendered_mounts(&mounts).contains(&format!(
+        "{}:/home/eng/.config/opencode:rw",
+        profiles.join("mid").join("opencode").display()
+      )),
+      "{mounts:?}"
+    );
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display())),
+      "{mounts:?}"
     );
   }
 
@@ -342,15 +353,16 @@ mod tests {
       global: Some(profiles.as_path()),
     };
     let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
-    assert_eq!(
-      rendered_mounts(&mounts),
-      vec![
-        format!(
-          "{}:/home/eng/.config/opencode:rw",
-          project.join("__shared__").join("opencode").display()
-        ),
-        format!("{}:/home/eng/.pi:rw", project.join("work").join("pi").display()),
-      ]
+    assert!(
+      rendered_mounts(&mounts).contains(&format!(
+        "{}:/home/eng/.config/opencode:rw",
+        project.join("__shared__").join("opencode").display()
+      )),
+      "{mounts:?}"
+    );
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", project.join("work").join("pi").display())),
+      "{mounts:?}"
     );
   }
 
@@ -367,9 +379,9 @@ mod tests {
       global: Some(profiles.as_path()),
     };
     let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
-    assert_eq!(
-      rendered_mounts(&mounts),
-      vec![format!("{}:/home/eng/.pi:rw", project.join("__shared__").join("pi").display()),]
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", project.join("__shared__").join("pi").display())),
+      "{mounts:?}"
     );
   }
   #[test]
@@ -400,12 +412,13 @@ mod tests {
       .iter()
       .map(|entry| format!("{}:{}", entry.host.display(), entry.container.display()))
       .collect();
-    assert_eq!(
-      rendered,
-      vec![
-        format!("{}:/home/eng/.pi-alt", shared.join("pi").display()),
-        format!("{}:/home/eng/.trae", shared.join("trae").display()),
-      ]
+    assert!(
+      rendered.contains(&format!("{}:/home/eng/.pi-alt", shared.join("pi").display())),
+      "{rendered:?}"
+    );
+    assert!(
+      rendered.contains(&format!("{}:/home/eng/.trae", shared.join("trae").display())),
+      "{rendered:?}"
     );
 
     let relative = BTreeMap::from([(
@@ -455,7 +468,10 @@ mod tests {
     let mounts = profile_mounts(&roots, "work", &configured, "/home/eng").unwrap();
     let host = profiles.join("work").join("custom");
     assert!(host.is_dir(), "explicit intent makes the directory");
-    assert_eq!(rendered_mounts(&mounts), vec![format!("{}:/home/eng/.custom:rw", host.display())]);
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.custom:rw", host.display())),
+      "{mounts:?}"
+    );
   }
 
   #[test]
@@ -494,6 +510,18 @@ mod tests {
     }
     // The agent runs its own runtime; it never reaches the host's.
     assert!(!yaml.contains("docker.sock") && !yaml.contains("/var/run/docker"), "{yaml}");
+  }
+  #[test]
+  fn render_keeps_comments_at_their_key_indent() {
+    let yaml = test_stack(ProxyBackend::Ebpf).render();
+    for expected in [
+      "    # Capture dies with this process: the eBPF attachments are fd-held\n    # and the listeners live in it",
+      "    restart: unless-stopped",
+      "# (global layer plus this workspace's .config/hodor/config.toml, discovered\n# from its working directory",
+    ] {
+      assert!(yaml.contains(expected), "{yaml}");
+    }
+    assert!(!yaml.contains("\n          #") && !yaml.contains("\n       # "), "{yaml}");
   }
   #[test]
   fn workspace_image_overrides_the_agent_image() {

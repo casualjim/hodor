@@ -1,3 +1,13 @@
+## [0.3.6] - 2026-10-08
+
+### 🚀 Features
+
+- Default home, CA path, and derived rules
+- *(ebpf)* Reload bypass CIDRs from a shared file
+
+### 🐛 Bug Fixes
+
+- *(ebpf)* Satisfy clippy 1.99 and cargo metadata lints
 ## [0.3.5] - 2026-10-07
 
 ### 🚀 Features
@@ -7,6 +17,11 @@
 ### 🐛 Bug Fixes
 
 - *(compose)* Round-trip kube/talos twins and git credentials
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.5 [ci skip]
+- Release
 ## [0.3.4] - 2026-10-07
 
 ### 🐛 Bug Fixes

@@ -15,7 +15,7 @@ Serve the proxy.
 | Flag | Environment | Meaning |
 | --- | --- | --- |
 | `--listen <ADDR>` | `HODOR_LISTEN` | Explicit-proxy listen address. Default `127.0.0.1:8080`. |
-| `--ca-file <PATH>` | `HODOR_CA_FILE` | CA PEM path (certificate followed by key). Default `<config-dir>/hodor/ca.pem`. |
+| `--ca-file <PATH>` | `HODOR_CA_FILE` | CA PEM path (certificate followed by key). Default `/certs/ca.pem` when the generated stack mounted it there, else `<config-dir>/hodor/ca.pem`. |
 | `--proxy-backend <BACKEND>` | `HODOR_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only), `tun`, `tproxy`, or `ebpf`. Linux only; every backend is compiled in, so no build flags are needed. |
 | `--tproxy-allow-root-netns` | `HODOR_TPROXY_ALLOW_ROOT_NETNS` | With `--proxy-backend tproxy`, allow unscoped capture rules in the host network namespace. Disposable machines only. |
 | `--ebpf-cgroup <PATH>` | `HODOR_EBPF_CGROUP` | With `--proxy-backend ebpf`, the cgroup v2 directory whose member processes get captured, or the literal `enclosing` for the cgroup this process's own cgroup lives under (what a compose stack with one `cgroup_parent` per service uses). Required for that backend; otherwise hodor itself must live outside the named cgroup. |
@@ -54,7 +54,7 @@ Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document.
 
 ## `hodor init [--backend <BACKEND>] [WORKSPACE]`
 
-Generate the workspace stack as editable files: `[rules.*]` blocks in `<workspace>/.config/hodor/config.toml` when the workspace has none, the CA and the agent entrypoint when they are missing, and `<state-dir>/hodor/ws/<slug>/compose.yml`. Nothing existing is overwritten; the stack is regenerated when the workspace config or the generator's stack shape changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.
+Generate the workspace stack as editable files: the CA and the agent entrypoint when they are missing, and `<state-dir>/hodor/ws/<slug>/compose.yml`. Rules are not written anywhere: they derive at serve time from fnox declarations the registry knows, and config holds overrides only. Nothing existing is overwritten; the stack is regenerated when the workspace config or the generator's stack shape changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.
 
 ## `hodor agent [WORKSPACE] [--rm] [-- <COMMAND>...]`
 
@@ -72,7 +72,7 @@ Stop the layered compose project.
 
 Read the stack's logs. `--tail` defaults to `all`; no service means every service. `--workspace` defaults to the current directory and is a flag rather than a positional because the service names already take that slot.
 
-See [how to confine a workspace](../how-to/confine-a-workspace.md).
+See [how to secure your workspace](../how-to/confine-a-workspace.md).
 
 ## `hodor fwd`
 

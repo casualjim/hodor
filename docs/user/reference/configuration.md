@@ -18,7 +18,7 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 | Key | Default | Environment | Purpose |
 | --- | --- | --- | --- |
 | `listen` | `127.0.0.1:8080` | `HODOR_LISTEN` | Address the explicit proxy listens on. |
-| `ca_file` | `<config-dir>/hodor/ca.pem` | `HODOR_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `hodor ca` also writes `ca.crt` and `ca.key` beside it. |
+| `ca_file` | `/certs/ca.pem` when mounted there, else `<config-dir>/hodor/ca.pem` | `HODOR_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `hodor ca` also writes `ca.crt` and `ca.key` beside it. |
 | `root_certs` | `[]` | — | Extra upstream CA bundles trusted on egress, additive to webpki roots. Config file only, one path per bundle. Entries extend this further with their own `root_cert`. |
 | `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, and the upstream `SSLRequest` answer all share this budget. |
 
@@ -87,7 +87,7 @@ Controls the compose stack `hodor init` generates.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `home` | none | `$HOME` inside the agent container. Required for stack generation. Host paths under the host home translate into this prefix; other paths mount at their own path. |
+| `home` | `/home/eng` | `$HOME` inside the agent container. Host paths under the host home translate into this prefix; other paths mount at their own path. |
 | `name` | workspace path slug | Compose project name. |
 | `shell` | `sh` | Shell `hodor agent` runs in the container when no command is given. |
 | `init` | none | Init script inside the agent image that the generated entrypoint chains to after installing the CA (`HODOR_INIT`). The common entrypoint script names are tried when unset; the command runs directly otherwise. |
@@ -98,7 +98,7 @@ Controls the compose stack `hodor init` generates.
 
 ## Profiles
 
-Isolated tool-config namespaces for the confine stack. Global profiles live under `<config-dir>/hodor/profiles/<name>/`; project ones under `<workspace root>/.config/hodor/profiles/<name>/`. Each `<tool>/` directory inside a profile mounts into the agent container at the location that tool reads its own configuration from by default, so nothing has to set a config-directory variable. The workspace selects its profile with `[workspace] profile`; unset selects `__shared__`, the base every other profile inherits off and hodor always creates.
+Isolated tool-config namespaces for the secure stack. Global profiles live under `<config-dir>/hodor/profiles/<name>/`; project ones under `<workspace root>/.config/hodor/profiles/<name>/`. Each `<tool>/` directory inside a profile mounts into the agent container at the location that tool reads its own configuration from by default, so nothing has to set a config-directory variable. The workspace selects its profile with `[workspace] profile`; unset selects `__shared__`, the base every other profile inherits off and hodor always creates.
 
 ```toml
 [workspace]
@@ -171,7 +171,7 @@ direction = "request"
 
 ## `[tools.<name>]`
 
-Tool config mounts for the confine stack, by tool name.
+Tool config mounts for the secure stack, by tool name.
 
 | Key | Required | Purpose |
 | --- | --- | --- |

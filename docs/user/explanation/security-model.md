@@ -4,11 +4,11 @@ What hodor defends against, what it does not, and the edges you are choosing to 
 
 ## The property hodor buys you
 
-A credential that leaves the workload is the decoy. The workload holds only a format-valid fake. Concretely:
+A credential that leaves the agent is the decoy. The agent holds only a format-valid fake and works unchanged — the swap is transparent. Concretely:
 
 - **Exfiltration to a third party.** A prompt-injected tool, a curious dependency, or a log sink receives the decoy. Any host outside the allow entries gets the decoy and rejects it. The real value never travels there.
 - **Leaked environment or config.** A container dump, a screenshot, a paste of `env`: all carry decoys, which are deterministic and safe to commit.
-- **The token-issuance path.** When a rule's registry entry declares an OAuth2 flow, freshly issued tokens never reach the workload: the proxy rewrites the token response, the workload holds a minted decoy, and later requests swap it back. Rotating refresh tokens get one decoy per issued value.
+- **The token-issuance path.** When a rule's registry entry declares an OAuth2 flow, freshly issued tokens never reach the agent: the proxy rewrites the token response, the agent holds a minted decoy, and later requests swap it back. Rotating refresh tokens get one decoy per issued value.
 - **The response path.** hodor redacts real values back to decoys in responses, so even output from a granted host shows the client the fake.
 
 ## Runtime token minting

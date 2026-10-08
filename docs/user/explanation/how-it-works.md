@@ -4,9 +4,9 @@ The machinery behind the credential swap, and why each piece is shaped the way i
 
 ## The problem hodor solves
 
-A workload needs a credential to talk to an API. The moment the workload holds the real credential, every path it has to exfiltration (a prompt-injected `curl`, a dependency that phones home, a log line, a paste) carries the real value. You cannot fix this with a secret manager, because the manager hands the real value to exactly the party you do not fully trust.
+A coding agent needs credentials to talk to APIs. The moment the agent holds the real credential, every path it has to exfiltration (a prompt-injected `curl`, a dependency that phones home, a log line, a paste) carries the real value. You cannot fix this with a secret manager, because the manager hands the real value to exactly the party you do not fully trust.
 
-hodor inverts who holds what. The workload holds a decoy: deterministic for the env name, format-valid, and useless everywhere except the hosts you granted. The real value lives in hodor's config, resolved from fnox, and appears on the wire only to a granted authority. The workload never sees it, not even in memory.
+hodor inverts who holds what. The agent holds a decoy: deterministic for the env name, format-valid, and useless everywhere except the hosts you granted. The real value lives in fnox, resolved by hodor at serve time, and appears on the wire only to a granted authority. The agent never sees it, not even in memory — and because the swap happens in the proxy, the agent works unchanged.
 
 ## The life of a connection
 

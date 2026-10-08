@@ -1,19 +1,21 @@
 # hodor user documentation
 
-Pick by what you need right now. New here? Start with the tutorial.
+hodor keeps your coding agent productive while it protects your secrets. The agent holds only decoys and works as before. Real values stay in fnox. The proxy swaps them transparently on granted hosts.
+
+Pick by what you need right now. New here? Secure your workspace.
 
 | You want to | Go to |
 | --- | --- |
-| **Learn it, first time** | [Tutorial](tutorial.md) — one credential swap, end to end, both sides of the wire |
+| **Run an agent with decoys only** | [Secure your workspace](how-to/confine-a-workspace.md) — the primary flow. Your agent holds decoys and hodor swaps them transparently |
+| **Learn the raw swap, first time** | [Tutorial](tutorial.md) — one credential swap through the proxy, end to end, both sides of the wire |
 | **Get something done** | How-to guides, below |
 | **Look something up while working** | Reference, below |
 | **Understand why it works this way** | Explanation, below |
-
 ## How-to guides
 
 Directions for a working practitioner, one goal each:
 
-- [Confine a workspace](how-to/confine-a-workspace.md) — run a coding agent in a container that holds only decoys.
+- [Secure your workspace](how-to/confine-a-workspace.md) — run a coding agent in a container that holds only decoys.
 - [Capture traffic transparently](how-to/capture-traffic-transparently.md) — TPROXY or TUN capture, no client proxy setting, no bypass.
 - [Get values from fnox](how-to/get-values-from-fnox.md) — keep real secrets out of hodor's config entirely.
 - [Extend the known-host registry](how-to/extend-the-registry.md) — teach hodor a private endpoint or token shape.

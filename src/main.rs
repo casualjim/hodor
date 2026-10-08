@@ -8,7 +8,7 @@
 mod commands;
 mod fwd;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use hodor_config::cli::{Cli, CliCommand, ProxyBackend};
@@ -86,15 +86,20 @@ enum Command {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// Resolve the CA file path: config `ca_file` if set, else the default
+/// Resolve the CA file path: config `ca_file` if set, else `/certs/ca.pem`
+/// when the generated stack mounted it there, else the default
 /// `<config-dir>/hodor/ca.pem`.
 fn ca_path(proxy: &hodor_config::config::ProxyCfg) -> eyre::Result<PathBuf> {
-  match proxy.ca_file.clone() {
-    Some(path) => Ok(path),
-    None => dirs::config_dir()
-      .map(|dir: PathBuf| dir.join("hodor").join("ca.pem"))
-      .ok_or_else(|| eyre::eyre!("unable to resolve user config directory")),
+  if let Some(path) = proxy.ca_file.clone() {
+    return Ok(path);
   }
+  let mounted = Path::new("/certs/ca.pem");
+  if mounted.is_file() {
+    return Ok(mounted.to_path_buf());
+  }
+  dirs::config_dir()
+    .map(|dir: PathBuf| dir.join("hodor").join("ca.pem"))
+    .ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))
 }
 
 #[tokio::main]

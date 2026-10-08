@@ -56,7 +56,7 @@ Two different gaps behave differently:
 
 ## 4. Container deployments
 
-The generated confine stack mounts `~/.config/fnox/age.txt` into the hodor container read-only, so an age-encrypted store works with no extra wiring. Other providers need their own credentials reachable inside the container; mount them the same way through the compose layers.
+The generated secure stack mounts `~/.config/fnox/age.txt` into the hodor container read-only, so an age-encrypted store works with no extra wiring. Other providers need their own credentials reachable inside the container; mount them the same way through the compose layers.
 
 ## Check it works
 

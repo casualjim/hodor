@@ -626,9 +626,7 @@ async fn logs_workspace(root: &Path, args: &LogsArgs) -> Result<(), Error> {
 /// configured shell, or `command` when the caller passed one.
 async fn exec_agent(root: &Path, command: &[OsString]) -> Result<(), Error> {
   let config = workspace_config(root)?;
-  let home = config.workspace.home.clone().ok_or_else(|| Error::HomeRequired {
-    detail: "for the agent workdir".to_string(),
-  })?;
+  let home = config.workspace.container_home().to_string();
   let workdir = translate(root, home_dir().as_deref(), &home);
   warn_uncovered(root, &config);
   let uid = current_uid();

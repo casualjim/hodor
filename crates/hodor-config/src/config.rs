@@ -51,6 +51,10 @@ pub struct AppConfig {
 /// Selected when `[workspace] profile` is unset.
 pub const SHARED_PROFILE: &str = "__shared__";
 
+/// `$HOME` inside the agent container when `[workspace] home` is unset: the
+/// home every shipped example uses.
+pub const DEFAULT_CONTAINER_HOME: &str = "/home/eng";
+
 /// One tool config mount: the directory of this name under
 /// `profiles/<profile>/` mounts at `config_dir` inside the agent container,
 /// so the tool finds its own configuration where it looks by default.
@@ -85,7 +89,8 @@ pub struct WorkspaceCfg {
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub include: Vec<PathBuf>,
   /// `$HOME` inside the agent container; host paths under the host home
-  /// translate into this prefix, others mount at their own path.
+  /// translate into this prefix, others mount at their own path. Unset
+  /// means `/home/eng` (see `DEFAULT_CONTAINER_HOME`).
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub home: Option<String>,
   /// Profile selecting the isolated tool-config namespace the generated
@@ -148,6 +153,17 @@ impl WorkspaceCfg {
   #[must_use]
   pub fn profile_name(&self) -> &str {
     self.profile.as_deref().unwrap_or(SHARED_PROFILE)
+  }
+
+  /// `$HOME` inside the agent container: the stated `home`, or the default
+  /// when unset or empty.
+  #[must_use]
+  pub fn container_home(&self) -> &str {
+    self
+      .home
+      .as_deref()
+      .filter(|home| !home.is_empty())
+      .unwrap_or(DEFAULT_CONTAINER_HOME)
   }
 
   /// Every `$VAR` this workspace's settings reference: `include` entries,
@@ -262,9 +278,13 @@ pub struct ProxyCfg {
   #[config(default = "127.0.0.1:8080", env = "HODOR_LISTEN")]
   #[config(layer_attr(arg(long = "listen", help = "explicit-proxy listen address")))]
   pub listen: SocketAddr,
-  /// CA PEM path (default `<config-dir>/hodor/ca.pem`).
+  /// CA PEM path (default `/certs/ca.pem` when the generated stack mounted
+  /// it there, else `<config-dir>/hodor/ca.pem`).
   #[config(env = "HODOR_CA_FILE")]
-  #[config(layer_attr(arg(long = "ca-file", help = "CA PEM path (default <config-dir>/hodor/ca.pem)")))]
+  #[config(layer_attr(arg(
+    long = "ca-file",
+    help = "CA PEM path (default /certs/ca.pem when mounted there, else <config-dir>/hodor/ca.pem)"
+  )))]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub ca_file: Option<PathBuf>,
   /// SSH host key path (default `<config-dir>/hodor/ssh_host_ed25519`):
@@ -1604,6 +1624,23 @@ allow = ["https://b.example"]
       ..WorkspaceCfg::default()
     };
     assert_eq!(workspace.referenced_variables(&[]), BTreeSet::from(["REGISTRY_HOST".to_string()]));
+  }
+
+  /// Unset or empty `home` means the default container home; a stated home
+  /// wins.
+  #[test]
+  fn container_home_defaults_when_unset_or_empty() {
+    assert_eq!(WorkspaceCfg::default().container_home(), "/home/eng");
+    let explicit = WorkspaceCfg {
+      home: Some("/home/agent".to_string()),
+      ..WorkspaceCfg::default()
+    };
+    assert_eq!(explicit.container_home(), "/home/agent");
+    let empty = WorkspaceCfg {
+      home: Some(String::new()),
+      ..WorkspaceCfg::default()
+    };
+    assert_eq!(empty.container_home(), "/home/eng");
   }
 
   /// `hodor config` prints this: every setting, its default, and the doc

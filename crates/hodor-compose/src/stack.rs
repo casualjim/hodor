@@ -392,15 +392,12 @@ impl WorkspaceInputs {
   ///
   /// # Errors
   ///
-  /// Returns an error when the registry or config fails to load, when no
-  /// `[workspace] home` is stated, when value resolution fails, or when a
-  /// path fails to expand.
+  /// Returns an error when the registry or config fails to load, when value
+  /// resolution fails, or when a path fails to expand.
   fn resolve(root: &Path) -> Result<Self, Error> {
     let registry = generation_registry(Some(root))?;
     let config = workspace_config(root)?;
-    let raw_home = config.workspace.home.clone().ok_or_else(|| Error::HomeRequired {
-      detail: "for stack generation".to_string(),
-    })?;
+    let raw_home = config.workspace.container_home().to_string();
     let fnox = open_fnox()?;
     let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
     let env = block_on(resolution_env(&registry, fnox.as_ref(), &referenced))??;
@@ -1365,9 +1362,9 @@ impl Stack<'_> {
        \x20   working_dir: \"{root}\"\n\
        \x20   command: {serve}\n\
        {service_extra}\
-       \x20   environment:\n\
-       \x20     RUST_LOG: info\n\
-       \x20     HODOR_CA_FILE: /certs/ca.pem\n\
+      \x20   environment:\n\
+      \x20     RUST_LOG: info\n\
+      \x20     HODOR_CA_FILE: /certs/ca.pem\n\
        \x20     # 8080 must stay free on loopback: agent dev servers default\n\
        \x20     # to it, and the explicit proxy's default bind would squat on\n\
        \x20     # 127.0.0.1:8080, leaving the fwd sidecar nothing to expose.\n\

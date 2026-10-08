@@ -1,14 +1,12 @@
 # hodor
 
-hodor is a grant-scoped MITM proxy that swaps a workload's format-valid decoy credential for the real value only on hosts you allow.
+Give your coding agent fake credentials that work. hodor is a secure agent environment. Your agent holds only format-valid decoys and works exactly as before. The real secrets stay in fnox. hodor swaps a decoy for the real value transparently, only on hosts you allow, and swaps it back on the response. Protect your secrets without changing how you work.
 
-A workload points its HTTP proxy setting at hodor, or hodor captures its traffic transparently with `--proxy-backend`. Three backends, peers, chosen by mechanism: `tproxy` lets the kernel redirect TCP (nftables plus policy routing; UDP passes through) and `tun` runs a TUN device and an in-process TCP/IP stack, which also relays UDP itself. `ebpf` uses cgroup socket hooks — no netfilter at all — and captures TCP plus connected UDP (relayed, not substituted). Either way the workload holds a decoy credential, never the real one. The decoy is format-valid, so a tool that checks the shape of a token accepts it.
+A leaked prompt, a pasted log, or a dependency that phones home carries the decoy. The upstream rejects it everywhere except the grant. The real value appears on the wire only to a host you named.
 
-When a connection's host and port match an allow entry, hodor terminates TLS with a per-domain leaf certificate signed by its own CA. It replaces each decoy with its real value in headers, in basic auth, and in bodies, for both HTTP/1 and HTTP/2. On the response, it replaces real values with the decoy again, so the client sees only the decoy.
+One command drops you into that environment. `hodor agent` starts the stack and opens a shell in a container that holds only decoys. Every connection is captured transparently, so there is no proxy setting to find and no way around the proxy.
 
-Every other connection is spliced through byte for byte. hodor does not terminate TLS on those connections, and the client sees the real upstream certificate.
-
-That split is the point. A leaked or exfiltrated credential is the decoy. A request to any host outside the allow list carries the decoy, so the upstream rejects it. The real value appears only on the wire to a host you named.
+Underneath sits a grant-scoped proxy. A workload can also point its proxy settings at hodor, or hodor can capture its traffic with `--proxy-backend` (`tproxy`, `tun`, or `ebpf`). On a grant match hodor terminates TLS with a per-domain leaf signed by its own CA and swaps the decoy for the real value in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. On the response it swaps real values back to decoys. Every other connection is spliced byte for byte with the real upstream certificate untouched.
 
 ## Install
 
@@ -22,7 +20,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 **With mise**, which installs the release tarball for your platform:
 
 ```sh
-mise use github:casualjim/hodor
+mise use -g github:casualjim/hodor
 ```
 
 Or download a tarball from [the releases page](https://github.com/casualjim/hodor/releases) and put `hodor` on your `PATH`.
@@ -43,29 +41,45 @@ cargo build --release
 
 The `ebpf` backend additionally needs a nightly toolchain (the BPF target has no prebuilt `core`, so `aya-build` uses `-Z build-std`) and [`bpf-linker`](https://github.com/aya-rs/bpf-linker) to link the programs; both are pinned in `mise.toml`, so `mise run build` provides them.
 
-## Try it in ten minutes
+## Try it in 30 seconds
 
-The [tutorial](docs/user/tutorial.md) walks one request through hodor and shows the swap from both sides: the client sends `Bearer fd0c437df7ae...`, the upstream receives `Bearer real-secret-value-xyz`, and the response carries the decoy back. Then it repeats the trip over HTTPS so you exercise the CA trust step every real deployment needs.
+You need docker and your secrets in fnox. Install hodor, name your source directories once, then step into any workspace as a secure agent.
+
+```sh
+mise use -g github:casualjim/hodor
+mkdir -p ~/.config/hodor
+cat > ~/.config/hodor/config.toml <<'EOF'
+[workspace]
+# source directories you want beside your workspace
+include = ["~/projects"]
+EOF
+
+cd ~/projects/my-awesome-thing
+hodor agent
+# do work, exit the agent
+hodor down
+```
+
+Container home, shell, listener, and CA all default, so that file is the whole setup. `hodor agent` generates the stack, starts it, and drops you into the agent. The agent holds only decoys. Real values stay in fnox and reach only granted hosts. `hodor down` stops the devenv.
+
+To see the raw credential swap from both sides of the wire, follow the [tutorial](docs/user/tutorial.md).
 
 ## The shape of a config
 
 ```toml
-[proxy]
-listen = "127.0.0.1:8080"
-
 [rules.github_token]
 env = "GITHUB_TOKEN"          # decoy seed, registry key, fnox key
 allow = ["https://api.github.com"]
 ```
 
-Start the proxy, hand the workload its decoy, and the rule is live:
+That file is the whole config. The listener defaults to `127.0.0.1:8080` and the CA to `/certs/ca.pem` when the stack mounted it there, else `<config-dir>/hodor/ca.pem`. Start the proxy, hand your agent its decoy, and the rule is live:
 
 ```sh
 hodor serve
-hodor fake GITHUB_TOKEN    # the value the workload holds
+hodor fake GITHUB_TOKEN    # the value the agent holds
 ```
 
-`env = "GITHUB_TOKEN"` alone is a complete rule when the bundled known-host registry knows the name: the registry supplies the hosts and the decoy shape, and [fnox](https://fnox.jdx.dev) supplies the real value at serve time (age, 1Password, Vault, Bitwarden, AWS Secrets Manager, the OS keychain, and the rest of its provider catalog; no fnox binary needed).
+`env = "GITHUB_TOKEN"` alone is a complete rule when the bundled known-host registry knows the name: the registry supplies the hosts and the decoy shape, and [fnox](https://fnox.jdx.dev) supplies the real value at serve time (age, 1Password, Vault, Bitwarden, AWS Secrets Manager, the OS keychain, and the rest of its provider catalog; no fnox binary needed). Most workspaces state no rules at all: every fnox-declared name the registry knows becomes a rule at serve time, and config holds overrides only.
 
 When the registry entry declares the service's OAuth2 flow, freshly issued tokens are covered too: the proxy rewrites the token endpoint's response so the agent holds a minted decoy, and swaps it back on every later request. `hodor registry from-oidc` / `from-openapi` turn a vendor's discovery or OpenAPI document into that entry.
 
@@ -73,19 +87,20 @@ When the registry entry declares the service's OAuth2 flow, freshly issued token
 
 Everything lives under [docs/user](docs/user/README.md), arranged by what you need:
 
-- [Tutorial](docs/user/tutorial.md) — learn it, first time.
-- How-to guides — [confine a workspace](docs/user/how-to/confine-a-workspace.md) (run a coding agent with decoys only), [capture traffic transparently](docs/user/how-to/capture-traffic-transparently.md), [get values from fnox](docs/user/how-to/get-values-from-fnox.md), [extend the registry](docs/user/how-to/extend-the-registry.md), [trust the CA](docs/user/how-to/trust-the-ca.md).
+- [Secure your workspace](docs/user/how-to/confine-a-workspace.md) — run a coding agent with decoys only. Start here.
+- [Tutorial](docs/user/tutorial.md) — one credential swap through the raw proxy, end to end, both sides of the wire.
+- How-to guides — [capture traffic transparently](docs/user/how-to/capture-traffic-transparently.md), [get values from fnox](docs/user/how-to/get-values-from-fnox.md), [extend the registry](docs/user/how-to/extend-the-registry.md), [trust the CA](docs/user/how-to/trust-the-ca.md).
 - Reference — [CLI](docs/user/reference/cli.md), [configuration](docs/user/reference/configuration.md), [allow entries](docs/user/reference/allow-entries.md), [decoy patterns](docs/user/reference/decoy-patterns.md), [registry](docs/user/reference/registry.md).
 - Explanation — [how hodor works](docs/user/explanation/how-it-works.md), [the security model](docs/user/explanation/security-model.md) (what it defends against and what it does not).
 
 Two runnable examples ship in the repository:
 
-- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to confine with `hodor up`: one hodor container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
+- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to secure with `hodor up`: one hodor container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
 - [integration](integration/README.md) — the compose demo behind `mise run demo`, asserting four substitution scenarios and one splice scenario.
 
 ## Where the limits are
 
-hodor matches the request authority, not the path. A workload that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust hodor's CA to reach a granted HTTPS host. Transparent capture needs root and Linux; the `tproxy` backend needs `CAP_NET_ADMIN`, the `tun` backend a TUN device, and the `ebpf` backend `CAP_BPF` + `CAP_NET_ADMIN`, kernel 5.15, and IPv4. [The security model](docs/user/explanation/security-model.md) states each of these with its consequence.
+hodor matches the request authority, not the path. An agent that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust hodor's CA to reach a granted HTTPS host. Transparent capture needs root and Linux; the `tproxy` backend needs `CAP_NET_ADMIN`, the `tun` backend a TUN device, and the `ebpf` backend `CAP_BPF` + `CAP_NET_ADMIN`, kernel 5.15, and IPv4. [The security model](docs/user/explanation/security-model.md) states each of these with its consequence.
 
 ## Contributing
 

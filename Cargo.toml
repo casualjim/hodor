@@ -3,11 +3,10 @@
 name = "hodor"
 version = "0.3.5"
 edition = "2024"
-description = "grant-scoped MITM proxy"
+description = "Secure your coding agent: decoy credentials that work, real secrets swapped in only on granted hosts"
 license = "Apache-2.0"
 repository = "https://github.com/casualjim/hodor"
-keywords = ["mitm", "proxy", "tls"]
-categories = ["network-programming"]
+keywords = ["agents", "secrets", "mitm", "proxy", "tls"]
 
 [package.metadata.dist]
 # hodor is a single static-friendly binary; container + tarballs ship from CI.

@@ -165,7 +165,7 @@ The request now completes. hodor terminated the TLS connection, substituted the 
 
 ## Where to go next
 
-- [Confine a workspace](how-to/confine-a-workspace.md) to run a coding agent with decoys only.
+- [Secure your workspace](how-to/confine-a-workspace.md) to run a coding agent with decoys only.
 - [Capture traffic transparently](how-to/capture-traffic-transparently.md) so clients need no proxy setting.
 - [The configuration reference](reference/configuration.md) for every key.
 - [How hodor works](explanation/how-it-works.md) when you want the machinery behind the swap.

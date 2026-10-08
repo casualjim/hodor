@@ -57,7 +57,7 @@ volumes:
   - ~/.config/hodor/ca.crt:/usr/local/share/ca-certificates/hodor-ca.crt:ro
 ```
 
-and run `update-ca-certificates` from the entrypoint when it exists. The confine-generated stack does exactly this.
+and run `update-ca-certificates` from the entrypoint when it exists. The generated secure stack does exactly this.
 
 ## 5. Rotate
 

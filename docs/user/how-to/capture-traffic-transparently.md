@@ -41,7 +41,7 @@ With `--proxy-backend tproxy`, hodor refuses unscoped capture rules when it runs
 
 Two accepted shapes:
 
-- Run hodor in its own network namespace (a container with `cap_add: NET_ADMIN`), and share that namespace with the workload. This is what a confined workspace (`hodor init` then `hodor up`) and the integration demo do.
+- Run hodor in its own network namespace (a container with `cap_add: NET_ADMIN`), and share that namespace with the workload. This is what a secured workspace (`hodor init` then `hodor up`) and the integration demo do.
 - Acknowledge the risk on a disposable machine with `--tproxy-allow-root-netns` or `HODOR_TPROXY_ALLOW_ROOT_NETNS=1`.
 
 `tun` has no such guard: the policy routes it installs name the TUN device, and the teardown guard removes them on exit.

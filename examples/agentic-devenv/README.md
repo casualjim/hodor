@@ -1,6 +1,6 @@
-# Confined agent workspace
+# Secure agent workspace
 
-This is a workspace you can confine. `.config/hodor/config.toml` is the whole input, and `hodor init` turns it into a two-service docker compose stack: hodor, and the agent. `hodor agent` does that, starts it, and drops you into the agent in one go.
+This is a workspace you can secure. `.config/hodor/config.toml` is the whole input, and `hodor init` turns it into a two-service docker compose stack: hodor, and the agent. `hodor agent` does that, starts it, and drops you into the agent in one go.
 
 The agent container holds decoy credentials and shares hodor's network namespace, so every connection it makes is captured, with no proxy setting to find and no way around the proxy. hodor swaps a decoy for the real value only on the hosts your rules allow, and puts the decoy back on the response.
 
@@ -9,7 +9,7 @@ The agent container holds decoy credentials and shares hodor's network namespace
 | Service | Job |
 | --- | --- |
 | `hodor` | Captures egress transparently (backend chosen by `hodor init --backend`, `ebpf` by default), terminates TLS on a grant match, swaps decoys for real values, redacts them back on the response. Holds the CA, and resolves real values from fnox itself. |
-| `agent` | Runs the agent behind an entrypoint that trusts hodor's CA, which is all it takes to make a confined agent work. Holds decoys only. |
+| `agent` | Runs the agent behind an entrypoint that trusts hodor's CA, which is all it takes to make a secure agent work. Holds decoys only. |
 
 ## Topology
 
@@ -27,7 +27,7 @@ The agent container holds decoy credentials and shares hodor's network namespace
 ## Before you start
 
 - docker with compose, and hodor on `PATH`.
-- The secrets this workspace uses, declared to fnox under the names in `.config/hodor/config.toml`.
+- The secrets this workspace uses, declared to fnox. The registry supplies their hosts and decoy shapes, so no `[rules.*]` blocks are needed.
 - Your fnox setup readable by the hodor container: the stack mounts your fnox config directory and hodor's fnox files read-only, and forwards the provider credentials in your environment, so a value that resolves here resolves there.
 
 ## Run it
@@ -35,8 +35,8 @@ The agent container holds decoy credentials and shares hodor's network namespace
 From this directory:
 
 ```sh
-hodor rules            # fnox declarations ∩ registry, as [rules.*] blocks — `hodor init` writes these when the workspace has no config
-hodor init             # rules config, the stack, the CA, and the entrypoint (--backend ebpf by default)
+hodor rules            # preview what derives: fnox declarations ∩ registry, as [rules.*] blocks
+hodor init             # the stack, the CA, and the entrypoint (--backend ebpf by default)
 hodor up               # start both services
 hodor logs -f          # the stack's logs, following
 hodor agent            # init, up, and a shell in the agent — one idempotent command
@@ -92,4 +92,4 @@ substituted label=anthropic location=Header
 - Each `profiles/<name>/<tool>/` directory mounts into the agent at that tool's default config location, writable. `__shared__` is the base every profile inherits.
 - Recreate the two services together. The agent shares hodor's network namespace, so recreating hodor alone leaves it attached to a dead namespace and its DNS stops resolving.
 
-[How to confine a workspace](../../docs/user/how-to/confine-a-workspace.md) covers the whole flow, and the [main README](../../README.md) covers allow entries, decoy patterns, and the rest of the configuration.
+[How to secure your workspace](../../docs/user/how-to/confine-a-workspace.md) covers the whole flow, and the [main README](../../README.md) covers allow entries, decoy patterns, and the rest of the configuration.

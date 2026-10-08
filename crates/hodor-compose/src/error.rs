@@ -25,12 +25,6 @@ pub enum Error {
   /// An I/O failure with no extra context.
   #[error(transparent)]
   Io(#[from] IoError),
-  /// `[workspace] home` is missing.
-  #[error("[workspace] home is required {detail}")]
-  HomeRequired {
-    /// What needs the home directory.
-    detail: String,
-  },
   /// A `[workspace] include` entry does not exist.
   #[error("[workspace] include `{}` does not exist; docker would mount an empty directory in its place", entry.display())]
   IncludeMissing {

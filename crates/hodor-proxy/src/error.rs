@@ -244,19 +244,47 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
-  /// The guest Postgres TLS handshake fails.
+  /// A guest Postgres TLS handshake fails.
   #[error("guest postgres TLS: {source}")]
   GuestPostgresTls {
     /// Underlying handshake failure.
     #[source]
     source: IoError,
   },
-  /// The server Postgres TLS handshake fails.
+  /// A server Postgres TLS handshake fails.
   #[error("server postgres TLS: {source}")]
   ServerPostgresTls {
     /// Underlying handshake failure.
     #[source]
     source: IoError,
+  },
+  /// A Postgres upstream name cannot become a TLS server name.
+  #[error("postgres server name: {source}")]
+  PostgresServerName {
+    /// Underlying name failure.
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
+  },
+  /// A guest Redis TLS handshake fails.
+  #[error("guest redis TLS: {source}")]
+  GuestRedisTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// A server Redis TLS handshake fails.
+  #[error("server redis TLS: {source}")]
+  ServerRedisTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// A Redis upstream name cannot become a TLS server name.
+  #[error("redis server name: {source}")]
+  RedisServerName {
+    /// Underlying name failure.
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
   },
   /// The configured client identity is empty.
   #[error("client identity `{path}` is empty", path = path.display())]
@@ -272,13 +300,6 @@ pub enum Error {
     /// Underlying build failure.
     #[source]
     source: RustlsError,
-  },
-  /// A Postgres server name is unusable.
-  #[error("postgres server name: {source}")]
-  PostgresServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
   },
   /// The mTLS guest roots do not build.
   #[error("mtls guest roots: {source}")]

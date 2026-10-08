@@ -300,7 +300,7 @@ impl RulePass<'_> {
     let keys = config
       .rules
       .iter()
-      .filter(|(_, rule)| rule.value.is_none() || rule.is_database())
+      .filter(|(_, rule)| rule.value.is_none() || rule.value_scheme().is_some())
       .map(|(label, rule)| (label.clone(), Self::fnox_key(rule)))
       .collect::<Vec<_>>();
     for (label, key) in keys {
@@ -323,19 +323,19 @@ impl RulePass<'_> {
       tracing::info!(label, env = %rule.env, "ssh rule resolved: key material from the config");
       return Ok(false);
     }
-    if rule.is_database() {
-      return self.database(label, rule);
+    if rule.value_scheme().is_some() {
+      return self.connection_string(label, rule);
     }
     self.token(label, rule)
   }
 
-  /// Database rule: `value` holds the stated fake string; the real
+  /// Connection-string rule: `value` holds the stated fake string; the real
   /// connection string comes from fnox and never overwrites it. No
   /// registry hosts, no pattern — the connection string is the grant.
-  fn database(&mut self, label: &str, rule: &mut RuleCfg) -> Result<bool, Error> {
+  fn connection_string(&mut self, label: &str, rule: &mut RuleCfg) -> Result<bool, Error> {
     if let Some(value) = self.values.remove(label).flatten() {
       rule.real = Some(SecretString::from(value));
-      tracing::info!(label, env = %rule.env, "database rule resolved: stated fake string, real connection string from fnox");
+      tracing::info!(label, env = %rule.env, "connection-string rule resolved: stated fake string, real connection string from fnox");
       return Ok(false);
     }
     let what = if self.fnox.is_some() {

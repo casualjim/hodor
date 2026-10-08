@@ -1,6 +1,15 @@
 //! Grant model: a credential is one real secret, and a grant says what kind
 //! of endpoints that secret may be presented at. A rule is one kind, inferred
-//! from the URL schemes of its `allow` entries.
+//! from the URL schemes of its `allow` entries. The protocol verticals
+//! (`postgres`, `redis`) own their scope types and their connection-string
+//! laws; this module owns the enum, the matching dispatch, and the
+//! collection of rules into grants.
+
+mod postgres;
+mod redis;
+
+pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
+pub use redis::{RedisLeg, RedisScope};
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -48,158 +57,6 @@ impl HostPat {
   }
 }
 
-/// One parsed `postgres://` connection string: the connection facts both
-/// legs of a database rule share, plus the upstream TLS policy the string
-/// may state.
-#[derive(Debug)]
-struct ParsedDbString {
-  host: String,
-  port: u16,
-  user: Option<String>,
-  password: SecretString,
-  database: Option<String>,
-  ssl: SslMode,
-  negotiation: SslNegotiation,
-  root_cert: Option<RootCert>,
-  client_cert: Option<PathBuf>,
-  client_key: Option<PathBuf>,
-}
-
-/// Parse one libpq connection string, honored exactly. The password is
-/// required — a string with no credential maps nothing.
-fn parse_db_string(entry: &str) -> Result<ParsedDbString, String> {
-  if !entry.starts_with("postgres://") {
-    return Err(format!("bad connection string `{entry}`: expected `postgres://`"));
-  }
-  let url = Url::parse(entry).map_err(|err| format!("bad connection string `{entry}`: {err}"))?;
-  let host = url
-    .host()
-    .map(|host| host.to_string())
-    .ok_or_else(|| format!("bad connection string `{entry}`: empty host"))?;
-  let port = url.port().unwrap_or(5432);
-  let user = (!url.username().is_empty()).then(|| url.username().to_string());
-  let password = url
-    .password()
-    .filter(|password| !password.is_empty())
-    .ok_or_else(|| format!("bad connection string `{entry}`: the password is required — a string with no credential maps nothing"))?;
-  let password = SecretString::from(password.to_string());
-  let mut ssl = SslMode::Prefer;
-  let mut negotiation = SslNegotiation::Postgres;
-  let mut root_cert = None;
-  let mut client_cert = None;
-  let mut client_key = None;
-  for (key, value) in url.query_pairs() {
-    match key.as_ref() {
-      "sslmode" | "ssl" => {
-        ssl = match value.as_ref() {
-          "disable" => SslMode::Disable,
-          "allow" => SslMode::Allow,
-          "prefer" => SslMode::Prefer,
-          "require" => SslMode::Require,
-          "verify-ca" => SslMode::VerifyCa,
-          "verify-full" => SslMode::VerifyFull,
-          _ => {
-            return Err(format!(
-              "bad connection string `{entry}`: sslmode is disable, allow, prefer, require, verify-ca or verify-full"
-            ));
-          }
-        };
-      }
-      "sslnegotiation" => {
-        negotiation = match value.as_ref() {
-          "postgres" => SslNegotiation::Postgres,
-          "direct" => SslNegotiation::Direct,
-          _ => return Err(format!("bad connection string `{entry}`: sslnegotiation is postgres or direct")),
-        };
-      }
-      "sslrootcert" => {
-        if value.is_empty() {
-          return Err(format!("bad connection string `{entry}`: sslrootcert needs a path"));
-        }
-        root_cert = Some(if value == "system" {
-          RootCert::System
-        } else {
-          RootCert::Path(PathBuf::from(value.as_ref()))
-        });
-      }
-      "sslcert" => {
-        if value.is_empty() {
-          return Err(format!("bad connection string `{entry}`: sslcert needs a path"));
-        }
-        client_cert = Some(PathBuf::from(value.as_ref()));
-      }
-      "sslkey" => {
-        if value.is_empty() {
-          return Err(format!("bad connection string `{entry}`: sslkey needs a path"));
-        }
-        client_key = Some(PathBuf::from(value.as_ref()));
-      }
-      _ => return Err(format!("bad connection string `{entry}`: unknown query `{key}`")),
-    }
-  }
-  if client_cert.is_some() != client_key.is_some() {
-    return Err(format!("bad connection string `{entry}`: sslcert and sslkey come together"));
-  }
-  let database = match url.path() {
-    "" | "/" => None,
-    path => match path.strip_prefix('/').filter(|rest| !rest.contains('/')) {
-      Some(name) if !name.is_empty() => Some(name.to_string()),
-      _ => return Err(format!("bad connection string `{entry}`: database is one path segment")),
-    },
-  };
-  Ok(ParsedDbString {
-    host,
-    port,
-    user,
-    password,
-    database,
-    ssl,
-    negotiation,
-    root_cert,
-    client_cert,
-    client_key,
-  })
-}
-
-impl DatabaseScope {
-  /// Both legs of a database rule from its two connection strings: the fake
-  /// the rule states, the real the secret source resolved. The real
-  /// string's TLS parameters state the upstream policy.
-  ///
-  /// # Errors
-  /// Either string is not a `postgres://` connection string, or the real
-  /// one names a verifying sslmode with no `sslrootcert` to verify against.
-  pub fn from_strings(fake: &str, real: &str) -> Result<Self, String> {
-    let fake = parse_db_string(fake)?;
-    let real = parse_db_string(real)?;
-    if matches!(real.ssl, SslMode::VerifyCa | SslMode::VerifyFull) && real.root_cert.is_none() {
-      return Err("sslmode needs `sslrootcert=<path>` to verify against".to_string());
-    }
-    Ok(Self {
-      downstream: DbLeg {
-        host: fake.host,
-        port: fake.port,
-        user: fake.user,
-        password: fake.password,
-        database: fake.database,
-      },
-      upstream: DbLeg {
-        host: real.host,
-        port: real.port,
-        user: real.user,
-        password: real.password,
-        database: real.database,
-      },
-      ssl: real.ssl,
-      negotiation: real.negotiation,
-      root_cert: real.root_cert,
-      client_cert: real.client_cert,
-      client_key: real.client_key,
-      guest_tls: GuestTlsMode::default(),
-    })
-  }
-}
-
 /// Parse a user-facing host string: `*` is any host, `*.`-prefixed
 /// strings are wildcards, everything else matches exactly. Infallible.
 impl FromStr for HostPat {
@@ -227,47 +84,13 @@ pub enum Scheme {
   Tcp,
   /// Postgres wire protocol. TLS comes from the `sslmode` query.
   Postgres,
+  /// Cleartext Redis. Each connection string states its own leg's transport.
+  Redis,
+  /// TLS Redis. Each connection string states its own leg's transport.
+  Rediss,
   /// SSH. The proxy terminates the protocol on both legs; port defaults
   /// to 22 the way ssh itself defaults it.
   Ssh,
-}
-
-/// Postgres TLS negotiation, read from the entry's `sslmode` query.
-///
-/// The values are libpq's, because the entry URL is the user's statement about
-/// how this endpoint is reached, not a place for the proxy's own policy. The
-/// mode governs the leg to the real server; the guest leg answers what the
-/// guest asks for, the way a real server does.
-///
-/// A `require` verifies the chain only when the entry also names a
-/// `sslrootcert`, which is what libpq does. `verify-ca` and `verify-full` need
-/// one, because there is no other source of trust this proxy could use without
-/// inventing one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SslMode {
-  /// Never TLS.
-  Disable,
-  /// Cleartext first; TLS when the server refuses cleartext.
-  Allow,
-  /// TLS when the server accepts it, cleartext when it refuses.
-  Prefer,
-  /// TLS only; a server that refuses it fails the connection.
-  Require,
-  /// TLS only, verifying the server certificate chain.
-  VerifyCa,
-  /// TLS only, verifying the chain and the host name.
-  VerifyFull,
-}
-
-/// How the entry asks a server for TLS, from its `sslnegotiation` query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SslNegotiation {
-  /// The 8-byte `SSLRequest`, then its one-byte answer. Every server since
-  /// forever.
-  Postgres,
-  /// TLS straight away, with the `postgresql` ALPN identifier. PostgreSQL 17
-  /// and later only.
-  Direct,
 }
 
 /// One real secret and the decoy that stands in for it. Shared by every
@@ -342,50 +165,6 @@ pub enum RootCert {
   System,
 }
 
-/// One leg of a database rule: the connection facts of one connection
-/// string. The downstream leg comes from the rule's stated fake string; the
-/// upstream leg comes from the resolved real connection string.
-#[derive(Debug, Clone)]
-pub struct DbLeg {
-  /// Dial host.
-  pub host: String,
-  /// Dial port.
-  pub port: u16,
-  /// User this leg presents.
-  pub user: Option<String>,
-  /// Password this leg presents.
-  pub password: SecretString,
-  /// Database name, when the string names one.
-  pub database: Option<String>,
-}
-
-/// A database rule's scope: both legs of its one connection-string mapping.
-/// The real string states the upstream TLS policy; the rule's `tls` table
-/// states the guest leg's mode, keyed by the rule's env name.
-#[derive(Debug, Clone)]
-pub struct DatabaseScope {
-  /// The guest's leg, from the rule's stated fake connection string: the
-  /// guest dials this host and port — the port is the rule's match key —
-  /// and presents this user and password.
-  pub downstream: DbLeg,
-  /// The server's leg, from the resolved real connection string: hodor
-  /// dials this host and port and presents this user and password.
-  pub upstream: DbLeg,
-  /// TLS mode for the leg to the real server.
-  pub ssl: SslMode,
-  /// How TLS is asked for, when the entry states it.
-  pub negotiation: SslNegotiation,
-  /// Trust anchor for server verification, when the entry names one: a PEM
-  /// path, or the platform store via `sslrootcert=system`.
-  pub root_cert: Option<RootCert>,
-  /// PEM client certificate for upstream mTLS, when the entry names one.
-  pub client_cert: Option<PathBuf>,
-  /// PEM client key for upstream mTLS, when the entry names one.
-  pub client_key: Option<PathBuf>,
-  /// How the guest leg treats client certificates (rule table, not the URL).
-  pub guest_tls: GuestTlsMode,
-}
-
 /// Parse one `allow` entry into typed parts. The `url` crate does the
 /// work: every field is read off the parsed [`url::Url`]. The only special
 /// case is the `*` host marker, which cannot survive URL parsing, so a
@@ -415,7 +194,7 @@ impl FromStr for EndpointScope {
       "https" => Scheme::Https,
       "tcp" => Scheme::Tcp,
       "ssh" => Scheme::Ssh,
-      "postgres" => {
+      "postgres" | "redis" | "rediss" => {
         return Err(format!(
           "bad allow entry `{entry}`: database rules state no allow entries — the connection string is the grant"
         ));
@@ -451,6 +230,7 @@ impl FromStr for EndpointScope {
       (None, Scheme::Https) => 443,
       (None, Scheme::Tcp) => return Err("tcp grant requires an explicit port".to_string()),
       (None, Scheme::Postgres) => 5432,
+      (None, Scheme::Redis | Scheme::Rediss) => 6379,
       (None, Scheme::Ssh) => 22,
     };
     reject_endpoint_query(entry, &url)?;
@@ -558,12 +338,21 @@ pub enum Grant {
     /// `OAuth2` token-issuer flow, when this grant's rule declares one.
     oauth2: Option<crate::registry::OAuthFlow>,
   },
-  /// One connection-string mapping: fake connection string to real, 1:1.
-  Database {
+  /// One postgres connection-string mapping: fake connection string to
+  /// real, 1:1. The real string's query states the upstream TLS policy.
+  Postgres {
     /// The wire needles: the fake password and the real password.
     credential: Credential,
     /// The one scope this rule maps, carrying both legs' facts.
-    scope: Box<DatabaseScope>,
+    scope: Box<PostgresScope>,
+  },
+  /// One redis connection-string mapping: fake string to real, 1:1. Each
+  /// string states its own leg's transport in its scheme.
+  Redis {
+    /// The wire needles: the fake password and the real password.
+    credential: Credential,
+    /// The one scope this rule maps, carrying both legs' facts.
+    scope: Box<RedisScope>,
   },
   /// One SSH identity mapping: the guest presents the decoy key, hodor
   /// presents the real key upstream. No wire substitution, so no credential.
@@ -579,7 +368,7 @@ impl Grant {
   #[must_use]
   pub fn credential(&self) -> Option<&Credential> {
     match self {
-      Grant::Token { credential, .. } | Grant::Database { credential, .. } => Some(credential),
+      Grant::Token { credential, .. } | Grant::Postgres { credential, .. } | Grant::Redis { credential, .. } => Some(credential),
       Grant::Ssh { .. } => None,
     }
   }
@@ -589,7 +378,8 @@ impl Grant {
   pub fn matches(&self, scheme: Scheme, host: &str, port: u16) -> bool {
     match self {
       Grant::Token { allow, .. } => allow.iter().any(|entry| endpoint_match(entry, scheme, host, port)),
-      Grant::Database { scope, .. } => database_match(scope, scheme, host, port),
+      Grant::Postgres { scope, .. } => PostgresScope::matches(scope, scheme, host, port),
+      Grant::Redis { scope, .. } => RedisScope::matches(scope, scheme, host, port),
       Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
   }
@@ -607,12 +397,23 @@ impl Grant {
       .find(|entry| entry.scheme == scheme && entry.port == port && host.is_none_or(|host| entry.host.matches(host)))
   }
 
-  /// The database scope whose downstream (guest-side) port and host cover a
+  /// The postgres scope whose downstream (guest-side) port and host cover
+  /// a destination, `host` optional as above: transparent capture knows the
+  /// port before it knows the host.
+  #[must_use]
+  pub fn postgres(&self, host: Option<&str>, port: u16) -> Option<&PostgresScope> {
+    let Grant::Postgres { scope, .. } = self else {
+      return None;
+    };
+    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+  }
+
+  /// The redis scope whose downstream (guest-side) port and host cover a
   /// destination, `host` optional as above: transparent capture knows the
   /// port before it knows the host.
   #[must_use]
-  pub fn database(&self, host: Option<&str>, port: u16) -> Option<&DatabaseScope> {
-    let Grant::Database { scope, .. } = self else {
+  pub fn redis(&self, host: Option<&str>, port: u16) -> Option<&RedisScope> {
+    let Grant::Redis { scope, .. } = self else {
       return None;
     };
     (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
@@ -633,10 +434,6 @@ impl Grant {
 
 fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) -> bool {
   entry.scheme == scheme && host_port_match(&entry.host, entry.port, host, port)
-}
-
-fn database_match(scope: &DatabaseScope, scheme: Scheme, host: &str, port: u16) -> bool {
-  scheme == Scheme::Postgres && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
 }
 
 fn ssh_match(entry: &SshScope, scheme: Scheme, host: &str, port: u16) -> bool {
@@ -689,8 +486,10 @@ struct GrantCollector {
 impl GrantCollector {
   /// Fold one rule into the set, dispatching on the rule's kind.
   fn collect(&mut self, label: &str, rule: &RuleCfg) -> Result<(), Error> {
-    if rule.is_database() {
-      return self.database(label, rule);
+    // A rule whose stated value is a connection string names its protocol;
+    // the vertical owns the rest of that rule's law.
+    if let Some(scheme) = rule.value_scheme() {
+      return self.connection_string(label, rule, scheme);
     }
     let parsed = Self::parse_entries(label, rule)?;
     if parsed.is_empty() {
@@ -706,6 +505,37 @@ impl GrantCollector {
       return self.ssh(label, rule, parsed);
     }
     self.token(label, rule, parsed);
+    Ok(())
+  }
+
+  /// Connection-string rule: the rule states the fake string in `value`;
+  /// the real one resolved from the secret source into `real`. No allow
+  /// entries — the connection string is the grant. The protocol vertical
+  /// assembles the grant.
+  fn connection_string(&mut self, label: &str, rule: &RuleCfg, scheme: Scheme) -> Result<(), Error> {
+    if !rule.allow.is_empty() {
+      return Err(Error::ConnectionStringAllow { label: label.to_string() });
+    }
+    let Some(real) = rule.real.clone() else {
+      // The secret source did not resolve this name; no grant rather than
+      // a rule that swaps in nothing.
+      tracing::warn!(label, env = %rule.env, "rule has no resolved real connection string; no grant");
+      return Ok(());
+    };
+    if rule.value.is_none() {
+      return Err(Error::ConnectionStringValueMissing { label: label.to_string() });
+    }
+    let grant = match scheme {
+      Scheme::Postgres => postgres::grant(label, rule, real.expose_secret()),
+      Scheme::Redis | Scheme::Rediss => redis::grant(label, rule, real.expose_secret()),
+      _ => {
+        return Err(Error::ConnectionStringScheme {
+          label: label.to_string(),
+          scheme,
+        });
+      }
+    }?;
+    self.grants.push(grant);
     Ok(())
   }
 
@@ -751,60 +581,6 @@ impl GrantCollector {
       }
     }
     Ok(parsed)
-  }
-
-  /// Database rule: the rule states the fake connection string in `value`;
-  /// the real one resolved from the secret source into `real`. No allow
-  /// entries — the connection string is the grant.
-  fn database(&mut self, label: &str, rule: &RuleCfg) -> Result<(), Error> {
-    if !rule.allow.is_empty() {
-      return Err(Error::DatabaseAllow { label: label.to_string() });
-    }
-    let Some(real) = rule.real.clone() else {
-      // The secret source did not resolve this name; no grant rather than
-      // a rule that swaps in nothing.
-      tracing::warn!(label, env = %rule.env, "rule has no resolved real connection string; no grant");
-      return Ok(());
-    };
-    let Some(fake) = rule.value.as_ref() else {
-      return Err(Error::DatabaseValueMissing { label: label.to_string() });
-    };
-    let fake = fake.expose_secret();
-    let mut scope = DatabaseScope::from_strings(fake, real.expose_secret()).map_err(|err| Error::DatabaseScope {
-      label: label.to_string(),
-      detail: err,
-    })?;
-    // The rule table states the guest leg only; the upstream identity
-    // lives in the real string's libpq URL.
-    for (key, tls) in &rule.tls {
-      if key != &rule.env {
-        return Err(Error::TlsEnvMismatch {
-          label: label.to_string(),
-          key: key.clone(),
-          env: rule.env.clone(),
-        });
-      }
-      if tls.client_cert.is_some() || tls.client_key.is_some() {
-        return Err(Error::PostgresIdentity { label: label.to_string() });
-      }
-      if tls.root_cert.is_some() {
-        return Err(Error::PostgresTrust { label: label.to_string() });
-      }
-      scope.guest_tls = tls.guest_tls_mode;
-    }
-    // The wire needles are the credentials: fake password in, real
-    // password out; the legs' users swap when they differ (the wire
-    // machine rewrites the startup's `user` parameter).
-    let credential = Credential {
-      label: label.to_string(),
-      fake: scope.downstream.password.expose_secret().to_string(),
-      value: scope.upstream.password.clone(),
-    };
-    self.grants.push(Grant::Database {
-      credential,
-      scope: Box::new(scope),
-    });
-    Ok(())
   }
 
   /// SSH rule: every entry ssh, key material from the `ssh` table, and no
@@ -963,19 +739,171 @@ mod tests {
     }
   }
 
-  /// A resolved database scope, through [`resolve`] exactly as serve does.
-  fn database_scope(fake: &str, real: &str) -> DatabaseScope {
+  /// A resolved postgres scope, through [`resolve`] exactly as serve does.
+  fn postgres_scope(fake: &str, real: &str) -> PostgresScope {
     let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
-    let Some(Grant::Database { scope, .. }) = resolved.grants.first() else {
-      panic!("a database rule resolves to a database grant");
+    let Some(Grant::Postgres { scope, .. }) = resolved.grants.first() else {
+      panic!("a postgres rule resolves to a postgres grant");
     };
     (**scope).clone()
   }
 
-  /// A resolved database grant.
-  fn database_grant(fake: &str, real: &str) -> Grant {
+  /// A resolved postgres grant.
+  fn postgres_grant(fake: &str, real: &str) -> Grant {
     let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
     resolved.grants.into_iter().next().unwrap()
+  }
+
+  /// A resolved redis scope, through [`resolve`] exactly as serve does.
+  fn redis_scope(fake: &str, real: &str) -> RedisScope {
+    let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
+    let Some(Grant::Redis { scope, .. }) = resolved.grants.first() else {
+      panic!("a redis rule resolves to a redis grant");
+    };
+    (**scope).clone()
+  }
+
+  /// A resolved redis grant.
+  fn redis_grant(fake: &str, real: &str) -> Grant {
+    let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
+    resolved.grants.into_iter().next().unwrap()
+  }
+
+  #[test]
+  fn redis_grant_answers_for_redis_schemes() {
+    let grant = redis_grant(
+      "redis://app:fake@db.internal:6379/0", // betterleaks:allow
+      "redis://app:real@db.internal:6379/0", // betterleaks:allow
+    );
+    assert!(grant.matches(Scheme::Redis, "db.internal", 6379));
+    assert!(grant.matches(Scheme::Rediss, "db.internal", 6379));
+    assert!(!grant.matches(Scheme::Tcp, "db.internal", 6379));
+    assert!(!grant.matches(Scheme::Redis, "db.internal", 6380));
+    assert!(!grant.matches(Scheme::Redis, "other.internal", 6379));
+    assert!(grant.endpoint(Scheme::Redis, Some("db.internal"), 6379).is_none());
+    assert!(grant.postgres(Some("db.internal"), 6379).is_none());
+    let credential = grant.credential().expect("a redis grant swaps a credential");
+    assert_eq!(credential.label, "t");
+    assert_eq!(credential.fake, "fake");
+  }
+
+  #[test]
+  fn redis_legs_come_from_their_own_strings() {
+    let scope = redis_scope(
+      "redis://guest:fake@fake.internal:6380/0", // betterleaks:allow
+      "rediss://svc:real@db.internal:6381/1",    // betterleaks:allow
+    );
+    assert_eq!(scope.downstream.host, "fake.internal");
+    assert_eq!(scope.downstream.port, 6380);
+    assert_eq!(scope.downstream.user.as_deref(), Some("guest"));
+    assert_eq!(scope.upstream.host, "db.internal");
+    assert_eq!(scope.upstream.port, 6381);
+    assert_eq!(scope.upstream.user.as_deref(), Some("svc"));
+    assert_eq!(scope.upstream.database.as_deref(), Some("1"));
+  }
+
+  #[test]
+  fn redis_default_port_is_6379() {
+    let scope = redis_scope(
+      "redis://app:fake@db.internal/0",  // betterleaks:allow
+      "rediss://app:real@db.internal/0", // betterleaks:allow
+    );
+    assert_eq!(scope.downstream.port, 6379);
+    assert_eq!(scope.upstream.port, 6379);
+  }
+
+  #[test]
+  fn redis_strings_need_their_credentials() {
+    let cfg = cfg_with_db("redis://app@db.internal:6379/0", "redis://app:real@db.internal:6379/0"); // betterleaks:allow
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("the password is required"), "{err}");
+    let cfg = cfg_with_db("redis://app:fake@db.internal:6379/0", "redis://app@db.internal:6379/0"); // betterleaks:allow
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("the password is required"), "{err}");
+  }
+
+  #[test]
+  fn redis_strings_reject_libpq_transport_queries() {
+    let cfg = cfg_with_db(
+      "redis://app:fake@db.internal:6379/0",                 // betterleaks:allow
+      "redis://app:real@db.internal:6379/0?sslmode=require", // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("sslmode"), "{err}");
+  }
+
+  #[test]
+  fn redis_trust_and_identity_ride_the_real_string() {
+    let scope = redis_scope(
+      "redis://app:fake@db.internal:6379/0",                                        // betterleaks:allow
+      "rediss://app:real@h:6380/0?sslrootcert=system&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
+    );
+    assert_eq!(scope.root_cert, Some(RootCert::System));
+    assert_eq!(scope.client_cert, Some(PathBuf::from("/c.pem")));
+    assert_eq!(scope.client_key, Some(PathBuf::from("/c.key")));
+    let cfg = cfg_with_db(
+      "redis://app:fake@db.internal:6379/0",       // betterleaks:allow
+      "rediss://app:real@h:6380/0?sslcert=/c.pem", // betterleaks:allow
+    );
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("come together"), "{err}");
+  }
+
+  #[test]
+  fn redis_rules_state_no_allow_entries() {
+    let mut cfg = cfg_with_db(
+      "redis://app:fake@db.internal:6379/0", // betterleaks:allow
+      "redis://app:real@db.internal:6379/0", // betterleaks:allow
+    );
+    cfg.rules.get_mut("t").unwrap().allow = vec!["https://api.github.com".to_string()];
+    resolve(&cfg).unwrap_err();
+  }
+
+  #[test]
+  fn redis_schemes_are_not_endpoint_grants() {
+    "redis://db.internal:6379".parse::<EndpointScope>().unwrap_err();
+    "rediss://db.internal:6380".parse::<EndpointScope>().unwrap_err();
+  }
+
+  #[test]
+  fn rule_table_for_a_redis_rule_keys_by_its_env() {
+    let mut cfg = cfg_with_db(
+      "redis://app:fake@db.internal:6379/0", // betterleaks:allow
+      "redis://app:real@db.internal:6379/0", // betterleaks:allow
+    );
+    let entry = || HostTlsCfg {
+      client_cert: None,
+      client_key: None,
+      root_cert: None,
+      guest_tls_mode: GuestTlsMode::Mtls,
+      guest_cert: Some(PathBuf::from("/in/cert.pem")),
+      guest_key: Some(PathBuf::from("/in/key.pem")),
+    };
+    // A wrong key names nothing; the rule's env is the key.
+    let mut tls = BTreeMap::new();
+    tls.insert("REDIS_PASSWORD".to_string(), entry());
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("the rule's env is `DATABASE_URL`"), "{err}");
+    // The table states the guest leg, never the upstream identity or trust —
+    // the connection string already owns those.
+    let mut tls = BTreeMap::new();
+    let mut e = entry();
+    e.client_cert = Some(PathBuf::from("/c.pem"));
+    e.client_key = Some(PathBuf::from("/c.key"));
+    tls.insert("DATABASE_URL".to_string(), e);
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("never in the rule table"), "{err}");
+    // Keyed correctly, the guest-leg mode lands on the scope.
+    let mut tls = BTreeMap::new();
+    tls.insert("DATABASE_URL".to_string(), entry());
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let resolved = resolve(&cfg).unwrap();
+    let Some(Grant::Redis { scope, .. }) = resolved.grants.first() else {
+      panic!("a redis rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
   }
 
   fn cfg_with_rule(entries: &[&str]) -> AppConfig {
@@ -1153,7 +1081,7 @@ mod tests {
   fn client_identity_is_stated_by_the_real_string() {
     // libpq's own grammar carries the client identity on the real string —
     // the upstream leg's policy; endpoint URLs carry nothing of the kind.
-    let pg = database_scope(
+    let pg = postgres_scope(
       "postgres://app:fake@db.internal:5432/main", // betterleaks:allow
       "postgres://app:real@db.internal:5432/main?sslmode=require&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
     );
@@ -1224,7 +1152,7 @@ mod tests {
     tls.insert("DATABASE_URL".to_string(), entry());
     cfg.rules.get_mut("t").unwrap().tls = tls;
     let resolved = resolve(&cfg).unwrap();
-    let Some(Grant::Database { scope, .. }) = resolved.grants.first() else {
+    let Some(Grant::Postgres { scope, .. }) = resolved.grants.first() else {
       panic!("a database rule");
     };
     assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
@@ -1250,12 +1178,12 @@ mod tests {
 
   #[test]
   fn system_names_the_platform_trust_store() {
-    let pg = database_scope(
+    let pg = postgres_scope(
       "postgres://app:fake@db.internal:5432/main",                         // betterleaks:allow
       "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=system", // betterleaks:allow
     );
     assert_eq!(pg.root_cert, Some(RootCert::System));
-    let path = database_scope(
+    let path = postgres_scope(
       "postgres://app:fake@db.internal:5432/main",                          // betterleaks:allow
       "postgres://app:real@h:5432?sslmode=verify-full&sslrootcert=/ca.pem", // betterleaks:allow
     );
@@ -1282,7 +1210,7 @@ mod tests {
 
   #[test]
   fn a_database_rule_maps_two_connection_strings() {
-    let scope = database_scope(
+    let scope = postgres_scope(
       "postgres://app:fake@fake.internal:5433/main", // betterleaks:allow
       "postgres://app:real@db.internal:5432/main?sslmode=verify-full&sslrootcert=/ca.pem", // betterleaks:allow
     );
@@ -1303,19 +1231,19 @@ mod tests {
   }
 
   #[test]
-  fn database_grant_answers_only_for_postgres() {
-    let grant = database_grant(
+  fn postgres_grant_answers_only_for_postgres() {
+    let grant = postgres_grant(
       "postgres://app:fake@db.internal:5432/main",                 // betterleaks:allow
       "postgres://app:real@db.internal:5432/main?sslmode=require", // betterleaks:allow
     );
     assert!(grant.matches(Scheme::Postgres, "db.internal", 5432));
     assert!(!grant.matches(Scheme::Https, "db.internal", 5432));
-    assert!(grant.database(Some("db.internal"), 5432).is_some());
-    assert!(grant.database(None, 5432).is_some());
-    assert!(grant.database(Some("db.internal"), 5433).is_none());
+    assert!(grant.postgres(Some("db.internal"), 5432).is_some());
+    assert!(grant.postgres(None, 5432).is_some());
+    assert!(grant.postgres(Some("db.internal"), 5433).is_none());
     // The wire needles are the two passwords: fake in, real out.
-    let Grant::Database { credential, .. } = &grant else {
-      panic!("a database grant");
+    let Grant::Postgres { credential, .. } = &grant else {
+      panic!("a postgres grant");
     };
     assert_eq!(credential.fake, "fake");
     assert_eq!(credential.value.expose_secret(), "real");
@@ -1334,7 +1262,7 @@ mod tests {
       "postgres://app:real@db.internal:5432/main?sslmode=disable", // betterleaks:allow
     );
     let resolved = resolve(&cfg).unwrap();
-    let Grant::Database { scope, .. } = &resolved.grants[0] else {
+    let Grant::Postgres { scope, .. } = &resolved.grants[0] else {
       panic!("database rule must resolve to a database grant");
     };
     // The real string states the upstream policy.

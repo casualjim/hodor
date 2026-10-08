@@ -9,7 +9,7 @@ use httlib_hpack::{Decoder, Encoder};
 use hodor_config::grants::{Grant, Scheme};
 use hodor_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Verdict};
 
-use super::{
+use crate::transports::engine::{
   CredentialPair, Direction, Hit, Location, MAX_MINT_BODY, MintPlan, Rewritten, Wire, eligible_pairs, max_tail_size, mint_and_redact,
   mint_plan_for, minted_pairs, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
 };
@@ -1127,7 +1127,7 @@ mod h2_tests {
     input.extend_from_slice(&promise);
     let (out, hits) = machine.substitute(&input).await;
     assert_eq!(out.into_owned(), input);
-    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
+    assert_eq!(hits, [] as [Hit; 0]);
   }
 
   #[tokio::test]

@@ -9,9 +9,9 @@ use std::borrow::Cow;
 
 use hodor_config::grants::{Grant, Scheme};
 
-use super::{
-  CredentialPair, Direction, Hit, Rewritten, Wire, eligible_pairs, find_crossing, find_new_match, max_tail_size, needle_prefix_suffix_len,
-  needle_safe_emit_len, replace_in,
+use crate::transports::engine::{
+  CredentialPair, Direction, Hit, Location, Rewritten, Wire, eligible_pairs, find_crossing, find_new_match, max_tail_size,
+  needle_prefix_suffix_len, needle_safe_emit_len, replace_in,
 };
 
 /// Equal-length byte substitution over one direction.
@@ -80,7 +80,7 @@ impl Wire for Raw {
     // Emit past every complete match so none is sliced by the hold-back.
     let emit_len = needle_safe_emit_len(&combined, &self.pairs, self.tail_size);
     self.held = combined.split_off(emit_len);
-    let (new_emit, hits) = replace_in(&combined, &self.pairs, super::Location::Body);
+    let (new_emit, hits) = replace_in(&combined, &self.pairs, Location::Body);
     std::future::ready((Rewritten::Emit(Cow::Owned(new_emit.into_owned())), hits))
   }
 }
@@ -199,7 +199,7 @@ mod tests {
     let mut full = out;
     full.extend_from_slice(&flush);
     assert_eq!(full, b"xxSHORTyy");
-    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
+    assert_eq!(hits, [] as [Hit; 0]);
   }
 
   #[tokio::test]

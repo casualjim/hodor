@@ -7,7 +7,7 @@ use base64::Engine as _;
 use hodor_config::grants::{Grant, Scheme};
 use hodor_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Verdict};
 
-use super::{
+use crate::transports::engine::{
   CredentialPair, Direction, Hit, Location, MAX_MINT_BODY, MintPlan, Rewritten, Wire, eligible_pairs, max_tail_size, mint_and_redact,
   mint_plan_for, minted_pairs, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
 };
@@ -1735,7 +1735,7 @@ mod tests {
     let mut opaque = Http::opaque(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream);
     let (first, second) = FAKE.split_at(20);
     let (_, hits1) = opaque.substitute(first.as_bytes()).await;
-    assert_eq!(hits1, [] as [crate::wire::Hit; 0]);
+    assert_eq!(hits1, [] as [Hit; 0]);
     let (out2, hits2) = opaque.substitute(second.as_bytes()).await;
     assert_eq!(out2.as_ref(), second.as_bytes());
     assert_eq!(hits2.len(), 1);
@@ -1776,7 +1776,7 @@ mod tests {
     let input = b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n";
     let (out, hits) = req.substitute(input).await;
     assert!(matches!(out, Cow::Borrowed(_)));
-    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
+    assert_eq!(hits, [] as [Hit; 0]);
   }
 
   #[tokio::test]
@@ -1870,7 +1870,7 @@ mod tests {
     let (out, hits) = req.substitute(body).await;
     assert!(matches!(out, Cow::Borrowed(_)));
     assert!(matches!(req.state, State::Opaque));
-    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
+    assert_eq!(hits, [] as [Hit; 0]);
   }
 
   #[tokio::test]
@@ -1909,7 +1909,7 @@ mod tests {
     assert_eq!(hits.len(), 1);
     let (flush, flush_hits) = resp.substitute(&[]).await;
     assert!(flush.is_empty());
-    assert_eq!(flush_hits, [] as [crate::wire::Hit; 0]);
+    assert_eq!(flush_hits, [] as [Hit; 0]);
     assert!(!resp.must_close());
   }
 
@@ -1920,7 +1920,7 @@ mod tests {
     assert!(matches!(resp.state, State::Opaque), "{:?}", resp.state);
     let (out, hits) = resp.substitute(b"body-bytes").await;
     assert!(matches!(out, Cow::Borrowed(_)));
-    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
+    assert_eq!(hits, [] as [Hit; 0]);
   }
 
   #[tokio::test]
@@ -1934,7 +1934,7 @@ mod tests {
     let (out, hits) = resp.substitute(head.as_bytes()).await;
     let out = out.into_owned();
     assert!(out.ends_with(b"\r\n\r\n"));
-    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
+    assert_eq!(hits, [] as [Hit; 0]);
     let (_out, hits) = resp.substitute(body.as_bytes()).await;
     assert_eq!(hits.len(), 1);
     assert!(resp.must_close(), "compressed body hit must fail closed");
@@ -2256,7 +2256,7 @@ mod tests {
     let (out, hits) = resp.substitute(input.as_bytes()).await;
     let out = String::from_utf8(out.into_owned()).unwrap();
     assert_eq!(out, input, "unparseable body is untouched");
-    assert_eq!(hits, [] as [crate::wire::Hit; 0]);
+    assert_eq!(hits, [] as [Hit; 0]);
     assert!(store.snapshot_pairs().is_empty());
   }
 

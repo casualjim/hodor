@@ -9,6 +9,8 @@ use toml::de::Error as TomlError;
 use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 
+use crate::grants::Scheme;
+
 /// Every way config loading, validation, and grant resolution can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -75,10 +77,10 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
-  /// A database rule states no fake `value` string; the connection string
-  /// is the grant and one side cannot be missing.
-  #[error("rule `{label}`: a database rule states no `value` string")]
-  DatabaseValueMissing {
+  /// A connection-string rule states no fake `value` string; the connection
+  /// string is the grant and one side cannot be missing.
+  #[error("rule `{label}`: a connection-string rule states no `value` string")]
+  ConnectionStringValueMissing {
     /// Rule label.
     label: String,
   },
@@ -129,19 +131,36 @@ pub enum Error {
     /// Offending host port.
     port: u16,
   },
-  /// A database rule states `allow` entries; the connection string is the grant.
-  #[error("rule `{label}`: a database rule states no allow entries; the connection string is the grant")]
-  DatabaseAllow {
+  /// A connection-string rule states `allow` entries; the connection string
+  /// is the grant.
+  #[error("rule `{label}`: a connection-string rule states no allow entries; the connection string is the grant")]
+  ConnectionStringAllow {
     /// Rule label.
     label: String,
   },
-  /// A database connection string does not parse.
+  /// A postgres connection string does not parse.
   #[error("rule `{label}`: {detail}")]
-  DatabaseScope {
+  PostgresScope {
     /// Rule label.
     label: String,
     /// Parse failure.
     detail: String,
+  },
+  /// A redis connection string does not parse.
+  #[error("rule `{label}`: {detail}")]
+  RedisScope {
+    /// Rule label.
+    label: String,
+    /// Parse failure.
+    detail: String,
+  },
+  /// A connection-string rule names a scheme no vertical owns.
+  #[error("rule `{label}`: scheme `{scheme:?}` owns no connection-string grant")]
+  ConnectionStringScheme {
+    /// Rule label.
+    label: String,
+    /// The scheme the rule's value stated.
+    scheme: Scheme,
   },
   /// A `tls` entry names an env that is not the rule's own.
   #[error("rule `{label}`: tls config names `{key}` but the rule's env is `{env}`")]
@@ -388,6 +407,18 @@ pub enum Error {
   /// A postgres rule states its upstream trust outside the libpq URL.
   #[error("rule `{label}`: postgres states upstream trust in its libpq URL (`sslrootcert`), never in the rule table")]
   PostgresTrust {
+    /// Rule label.
+    label: String,
+  },
+  /// A redis rule states its upstream identity outside the connection string.
+  #[error("rule `{label}`: redis states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
+  RedisIdentity {
+    /// Rule label.
+    label: String,
+  },
+  /// A redis rule states its upstream trust outside the connection string.
+  #[error("rule `{label}`: redis states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
+  RedisTrust {
     /// Rule label.
     label: String,
   },

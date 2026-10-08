@@ -6,11 +6,14 @@
 //! recorded here. The decoy is what the guest holds. Later requests swap
 //! the decoy back to the real value through the ordinary substitution path.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use dashmap::DashMap;
+use secrecy::SecretString;
 
 use crate::Error;
-use secrecy::SecretString;
 
 /// One minted pair: the real freshly issued value and the decoy standing in
 /// for it on the guest side. Keyed on the real value so rotation mints a new
@@ -29,7 +32,7 @@ pub struct MintedPair {
 // holds and forces re-auth. Persist beside the CA if that ceiling bites.
 #[derive(Debug, Default)]
 pub struct MintStore {
-  pairs: std::sync::Mutex<BTreeMap<String, MintedPair>>,
+  pairs: DashMap<String, MintedPair>,
 }
 
 /// A handle to the store handed to each substitution machine.
@@ -54,12 +57,13 @@ impl MintStore {
     if value.is_empty() {
       return Err(Error::MintEmpty);
     }
-    let mut pairs = self.pairs.lock().expect("mint store poisoned");
-    if let Some(pair) = pairs.get(value) {
+    if let Some(pair) = self.pairs.get(value) {
       return Ok(pair.decoy.clone());
     }
     let decoy = hodor_config::config::fake_for(value, pattern);
-    pairs.insert(
+    // A racing mint of the same value computes the same seed-stable decoy,
+    // so last-writer-wins is idempotent, not a conflict.
+    self.pairs.insert(
       value.to_string(),
       MintedPair {
         label: label.to_string(),
@@ -74,10 +78,13 @@ impl MintStore {
   /// union into their pair set at construction time.
   #[must_use]
   pub fn snapshot_pairs(&self) -> Vec<(String, SecretString, String)> {
-    let pairs = self.pairs.lock().expect("mint store poisoned");
-    pairs
+    self
+      .pairs
       .iter()
-      .map(|(real, pair)| (pair.decoy.clone(), SecretString::from(real.clone()), pair.label.clone()))
+      .map(|entry| {
+        let (real, pair) = entry.pair();
+        (pair.decoy.clone(), SecretString::from(real.clone()), pair.label.clone())
+      })
       .collect()
   }
 }
@@ -104,6 +111,64 @@ impl MintHandle {
   pub fn pairs(&self) -> Vec<(String, SecretString, String)> {
     self.store.snapshot_pairs()
   }
+}
+
+/// On-demand issuance burst guard: at most this many fresh leaves per
+/// window. Bounds remote-triggered issuance (Any-host grants, SNI rotation).
+/// Two atomics, no lock: the window rolls by compare-exchange, the count by
+/// fetch-add. A lost rollover race undercounts by a hair (fail-open); the
+/// count never overshoots past in-flight increments (fail-closed).
+const MINT_BURST: usize = 20;
+const MINT_WINDOW_SECS: u64 = 10;
+
+#[derive(Debug)]
+pub(crate) struct MintBucket {
+  /// Epoch seconds the current window started.
+  window: AtomicU64,
+  /// Leaves minted in the current window.
+  count: AtomicUsize,
+}
+
+impl MintBucket {
+  #[must_use]
+  pub(crate) fn new() -> Self {
+    Self {
+      window: AtomicU64::new(epoch_secs()),
+      count: AtomicUsize::new(0),
+    }
+  }
+
+  /// Check and record one issuance in a single call: every `true` already
+  /// spent the budget it approved, so the old allow-then-record split (and
+  /// its double-spend race) is gone.
+  pub(crate) fn allow(&self) -> bool {
+    let now = epoch_secs();
+    loop {
+      let start = self.window.load(Ordering::Acquire);
+      if now.saturating_sub(start) >= MINT_WINDOW_SECS {
+        if self
+          .window
+          .compare_exchange(start, now, Ordering::AcqRel, Ordering::Acquire)
+          .is_ok()
+        {
+          self.count.store(1, Ordering::Release);
+          return true;
+        }
+        continue;
+      }
+      if self.count.fetch_add(1, Ordering::AcqRel) < MINT_BURST {
+        return true;
+      }
+      self.count.fetch_sub(1, Ordering::AcqRel);
+      return false;
+    }
+  }
+}
+
+/// Wall-clock epoch seconds for the burst window. Skew backwards saturates
+/// the age to zero, which only keeps counting the current window.
+fn epoch_secs() -> u64 {
+  SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |age| age.as_secs())
 }
 
 #[cfg(test)]
@@ -151,8 +216,7 @@ mod tests {
   fn mint_records_the_label() {
     let store = MintStore::default();
     store.mint("my-rule", None, "access_token", "v", Some(900)).unwrap();
-    let pairs = store.pairs.lock().unwrap();
-    let pair = pairs.get("v").expect("pair recorded");
+    let pair = store.pairs.get("v").expect("pair recorded");
     assert_eq!(pair.label, "my-rule");
   }
 

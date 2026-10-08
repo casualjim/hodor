@@ -1,22 +1,51 @@
-//! What the config says a destination is, and how the peer names itself.
+//! What the config says a destination is, and the one place a strategy is
+//! picked.
 //!
 //! The grant scopes covering a destination name the protocol, so the arm that
 //! serves a connection comes from the config and never from the shape of its
 //! bytes. Identity, the hostname those scopes are matched against, is read
 //! from the opening bytes of the protocol the config named, because a
-//! transparent capture destination is an IP.
+//! transparent capture destination is an IP. `Expect::serve` is the only
+//! `match` on the picked protocol in the crate; every arm lives in its
+//! vertical under `transports/`.
 
-use hodor_config::grants::{DatabaseScope, Grant, Scheme, SshScope};
+use hodor_config::grants::{Grant, PostgresScope, RedisScope, ResolvedConfig, Scheme, SshScope};
 use rama::tls::client::{ClientHello, ClientHelloHandshakePrefix, parse_client_hello_handshake_prefix};
-use tokio::io::{AsyncRead, AsyncReadExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 
 use std::time::Duration;
 
 use crate::Error;
+use crate::ProxyState;
+use crate::transports::ServeStream;
+use crate::transports::Transport;
+use crate::transports::http::MAX_HEAD;
+use crate::transports::tcp::splice;
 
 /// Hard cap for a single `ClientHello` (RFC 8446 §5.1: a record payload is at
 /// most 2^14 bytes, plus the 5-byte record header).
 const MAX_HELLO: usize = 16 * 1024 + 5;
+
+/// Connection-gating context for one candidate stream: targets, identity
+/// material, and the replay buffer. A struct, not eight params.
+#[derive(Clone, Copy)]
+pub(crate) struct CandidateParams<'a> {
+  /// Shared proxy state (mint guard, plugins, dial mark).
+  pub(crate) state: &'a ProxyState,
+  /// Live config snapshot.
+  pub(crate) snapshot: &'a ResolvedConfig,
+  /// Upstream TCP target.
+  pub(crate) dial_host: &'a str,
+  /// Upstream port.
+  pub(crate) port: u16,
+  /// Identity the ingress already knows, or None when only the capture
+  /// destination is known and the identity has to be read from the protocol.
+  pub(crate) host: Option<&'a str>,
+  /// Hostname for raw `tcp://` scope matching.
+  pub(crate) raw_host: &'a str,
+  /// Pipelined bytes read past the ingress head.
+  pub(crate) initial: &'a [u8],
+}
 
 /// How a destination is served, from the grant scopes that cover it.
 #[derive(Debug, Clone, Copy)]
@@ -29,7 +58,10 @@ pub(crate) enum Expect<'a> {
   Raw,
   /// A `postgres://` scope: pgwire framing, over whatever transport the entry
   /// states for the far side and the guest asks for on this side.
-  Postgres(&'a DatabaseScope),
+  Postgres(&'a PostgresScope),
+  /// A `redis://` or `rediss://` scope: RESP framing, each string stating
+  /// its own leg's transport.
+  Redis(&'a RedisScope),
   /// An `ssh://` scope: the guest leg terminates here against a decoy key.
   Ssh(&'a SshScope),
   Splice,
@@ -49,6 +81,7 @@ impl PartialEq for Expect<'_> {
   fn eq(&self, other: &Self) -> bool {
     match (self, other) {
       (Expect::Postgres(a), Expect::Postgres(b)) => std::ptr::eq(*a, *b),
+      (Expect::Redis(a), Expect::Redis(b)) => std::ptr::eq(*a, *b),
       (Expect::Ssh(a), Expect::Ssh(b)) => std::ptr::eq(*a, *b),
       (Expect::Tls, Expect::Tls) | (Expect::Plain, Expect::Plain) | (Expect::Raw, Expect::Raw) | (Expect::Splice, Expect::Splice) => true,
       _ => false,
@@ -60,8 +93,11 @@ impl Eq for Expect<'_> {}
 
 #[must_use]
 pub(crate) fn expect<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> Expect<'a> {
-  if let Some(scope) = grants.iter().find_map(|grant| grant.database(host, port)) {
+  if let Some(scope) = grants.iter().find_map(|grant| grant.postgres(host, port)) {
     return Expect::Postgres(scope);
+  }
+  if let Some(scope) = grants.iter().find_map(|grant| grant.redis(host, port)) {
+    return Expect::Redis(scope);
   }
   if let Some(scope) = grants.iter().find_map(|grant| grant.ssh(host, port)) {
     return Expect::Ssh(scope);
@@ -76,6 +112,42 @@ pub(crate) fn expect<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> 
     }
   }
   Expect::Splice
+}
+
+impl<'a> Expect<'a> {
+  /// The one pick: route one candidate stream to the transport retained
+  /// for the protocol the grants stated. The only `match` on `Expect` in
+  /// the crate.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a leg cannot be settled; malformed guest
+  /// traffic closes quietly instead.
+  pub(crate) async fn serve<G>(self, guest: G, params: CandidateParams<'a>) -> Result<(), Error>
+  where
+    G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+  {
+    let state = params.state;
+    let CandidateParams {
+      dial_host, port, initial, ..
+    } = params;
+    match self {
+      // No scope covers this destination: copy the bytes unchanged.
+      Expect::Splice => splice(guest, dial_host, port, state.fwmark, initial).await,
+      // Opaque bytes: nothing is read, the machines scan as the stream arrives.
+      Expect::Raw => state.tcp.serve(ServeStream { guest, params, scope: &() }).await,
+      // Declared HTTP: the `Host` head names the peer.
+      Expect::Plain => state.http.serve(ServeStream { guest, params, scope: &() }).await,
+      // Declared TLS: the ClientHello names the peer.
+      Expect::Tls => state.https.serve(ServeStream { guest, params, scope: &() }).await,
+      // Declared Postgres: each leg's transport settles in the vertical.
+      Expect::Postgres(scope) => state.postgres.serve(ServeStream { guest, params, scope }).await,
+      // Declared Redis: each connection string states its own leg's transport.
+      Expect::Redis(scope) => state.redis.serve(ServeStream { guest, params, scope }).await,
+      // Declared ssh: the guest leg terminates here against a decoy key.
+      Expect::Ssh(scope) => state.ssh.serve(ServeStream { guest, params, scope }).await,
+    }
+  }
 }
 
 /// A complete TLS `ClientHello`, with the SNI when it carries one.
@@ -94,7 +166,20 @@ pub(crate) enum Hello {
   Unnamed {
     /// Every byte read so far, replayed into the relay.
     buf: Vec<u8>,
+    /// The parsed hello, when the bytes completed one. Callers mirror it
+    /// instead of re-parsing the buffer they were just handed.
+    hello: Option<ClientHello>,
   },
+}
+
+/// An SNI-less TLS opening: the buffer plus its parsed hello when the bytes
+/// completed one. `None` when the bytes never opened as a TLS record.
+fn unnamed(buf: Vec<u8>) -> Option<Hello> {
+  let hello = hello_complete(&buf);
+  buf
+    .first()
+    .is_some_and(|byte| *byte == 0x16)
+    .then_some(Hello::Unnamed { buf, hello })
 }
 
 /// Read until a `ClientHello` completes. None when the bytes are not TLS, or
@@ -121,22 +206,22 @@ pub(crate) async fn read_client_hello<G: AsyncRead + Unpin>(
     // A complete hello without SNI is final: IP-literal clients never send
     // one, so waiting out the budget would stall every such handshake.
     if hello_complete(&buf).is_some() {
-      return Ok(buf.first().is_some_and(|byte| *byte == 0x16).then_some(Hello::Unnamed { buf }));
+      return Ok(unnamed(buf));
     }
     let over_cap = buf.len() > MAX_HELLO;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if over_cap || remaining.is_zero() {
       // Bytes that opened as a TLS record but never completed: no SNI to
       // name the peer with, so the caller falls back to its authority.
-      return Ok(buf.first().is_some_and(|byte| *byte == 0x16).then_some(Hello::Unnamed { buf }));
+      return Ok(unnamed(buf));
     }
     let read = tokio::time::timeout(remaining, guest.read(&mut chunk)).await;
     let Ok(n) = read else {
-      return Ok(buf.first().is_some_and(|byte| *byte == 0x16).then_some(Hello::Unnamed { buf }));
+      return Ok(unnamed(buf));
     };
     let n = n?;
     if n == 0 {
-      return Ok(buf.first().is_some_and(|byte| *byte == 0x16).then_some(Hello::Unnamed { buf }));
+      return Ok(unnamed(buf));
     }
     buf.extend_from_slice(&chunk[..n]);
     if buf.first() != Some(&0x16) {
@@ -166,7 +251,7 @@ pub(crate) async fn read_http_head<G: AsyncRead + Unpin>(
     if let Some((host, port)) = http_head_host(&buf, default_port) {
       return Ok(Some((buf, host, port)));
     }
-    let over_cap = buf.len() > super::protocol::MAX_HEAD;
+    let over_cap = buf.len() > MAX_HEAD;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if over_cap || remaining.is_zero() {
       return Ok(None);
@@ -220,47 +305,10 @@ fn head_len(head: &[u8]) -> Option<usize> {
   head.windows(4).position(|w| w == b"\r\n\r\n").map(|pos| pos + 4)
 }
 
-/// On-demand issuance burst guard: at most this many fresh MITM relays per
-/// window. Bounds remote-triggered issuance (Any-host grants, SNI rotation).
-const MINT_BURST: usize = 20;
-const MINT_WINDOW_SECS: u64 = 10;
-
-#[derive(Debug)]
-pub(crate) struct MintBucket {
-  mints: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
-}
-
-impl MintBucket {
-  #[must_use]
-  pub(crate) fn new() -> Self {
-    Self {
-      mints: std::sync::Mutex::new(std::collections::VecDeque::new()),
-    }
-  }
-
-  pub(crate) fn allow(&self) -> bool {
-    let mut mints = self.mints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // `None` means the monotonic clock has not yet run for a full window
-    // (uptime under `MINT_WINDOW_SECS`), so no recorded relay can be older
-    // than the cutoff and there is nothing to evict.
-    if let Some(cutoff) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(MINT_WINDOW_SECS)) {
-      while mints.front().is_some_and(|at| *at < cutoff) {
-        mints.pop_front();
-      }
-    }
-    mints.len() < MINT_BURST
-  }
-
-  pub(crate) fn record(&self) {
-    let mut mints = self.mints.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    mints.push_back(std::time::Instant::now());
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-  use hodor_config::grants::{Credential, SslMode};
+  use hodor_config::grants::{Credential, GuestTlsMode, HostPat, PostgresLeg, SslMode, SslNegotiation};
   use secrecy::SecretString;
   use std::time::Instant;
 
@@ -277,22 +325,22 @@ mod tests {
     }]
   }
 
-  fn database_grant(port: u16, ssl: SslMode) -> Vec<Grant> {
-    vec![Grant::Database {
+  fn postgres_grant(port: u16, ssl: SslMode) -> Vec<Grant> {
+    vec![Grant::Postgres {
       credential: Credential {
         label: "pg".into(),
         fake: "fake".into(),
         value: SecretString::from("value"),
       },
-      scope: Box::new(DatabaseScope {
-        downstream: hodor_config::grants::DbLeg {
+      scope: Box::new(PostgresScope {
+        downstream: PostgresLeg {
           host: "db.internal".to_string(),
           port,
           user: None,
           password: SecretString::from("fake"),
           database: None,
         },
-        upstream: hodor_config::grants::DbLeg {
+        upstream: PostgresLeg {
           host: "db.internal".to_string(),
           port,
           user: None,
@@ -300,11 +348,11 @@ mod tests {
           database: None,
         },
         ssl,
-        negotiation: hodor_config::grants::SslNegotiation::Postgres,
+        negotiation: SslNegotiation::Postgres,
         root_cert: None,
         client_cert: None,
         client_key: None,
-        guest_tls: hodor_config::grants::GuestTlsMode::default(),
+        guest_tls: GuestTlsMode::default(),
       }),
     }]
   }
@@ -333,7 +381,7 @@ mod tests {
 
   #[test]
   fn a_database_scope_carries_its_sslmode() {
-    let grants = database_grant(5432, SslMode::Require);
+    let grants = postgres_grant(5432, SslMode::Require);
     let Expect::Postgres(scope) = expect(&grants, Some("db.internal"), 5432) else {
       panic!("a database scope resolves to the postgres arm")
     };
@@ -350,7 +398,7 @@ mod tests {
     // (transparent capture); nothing else may reach it.
     let grants = vec![Grant::Ssh {
       allow: vec![SshScope {
-        host: hodor_config::grants::HostPat::Exact("git.example".to_string()),
+        host: HostPat::Exact("git.example".to_string()),
         port: 22,
         identity: std::path::PathBuf::from("/hodor/grants/rules.d/t.identity"),
         guest_key: std::path::PathBuf::from("/hodor/grants/rules.d/t.guest_key"),

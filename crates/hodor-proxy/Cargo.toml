@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
 hodor-config = { workspace = true }
 hodor-pki = { workspace = true }
 hodor-plugin = { workspace = true }

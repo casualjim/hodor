@@ -16,7 +16,7 @@ use validator::{Validate, ValidationError};
 
 use crate::cli::Cli;
 use crate::error::Error;
-use crate::grants::{EndpointScope, GuestTlsMode, HostPat};
+use crate::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use crate::plugins::{PluginCfg, PluginDirection};
 use crate::registry::{FlowKind, OAuthFlow, validate_flow};
 use code_workspace::{Workspace, resolve_root};
@@ -400,14 +400,20 @@ pub struct RuleCfg {
 }
 
 impl RuleCfg {
-  /// A database rule states its fake as a `postgres://` connection string in
-  /// `value`; endpoint rules carry bare tokens.
+  /// The protocol a connection-string rule's `value` states, from its URL
+  /// scheme; endpoint rules carry bare tokens and state none.
   #[must_use]
-  pub fn is_database(&self) -> bool {
-    self
-      .value
-      .as_ref()
-      .is_some_and(|value| value.expose_secret().starts_with("postgres://"))
+  pub fn value_scheme(&self) -> Option<Scheme> {
+    let value = self.value.as_ref()?.expose_secret();
+    if value.starts_with("postgres://") {
+      Some(Scheme::Postgres)
+    } else if value.starts_with("redis://") {
+      Some(Scheme::Redis)
+    } else if value.starts_with("rediss://") {
+      Some(Scheme::Rediss)
+    } else {
+      None
+    }
   }
 
   /// An ssh rule's allow entries are all `ssh://` and its secret is key

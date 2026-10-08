@@ -88,7 +88,17 @@ pub(crate) struct SshLegsFiles<'a> {
   pub(crate) known_hosts: &'a Path,
 }
 
-impl SshLegs {
+/// Disk-loaded keys shared across connections on the same key files: the
+/// guest host key, the decoy admission key, and the real upstream identity.
+/// Key files are config-immutable at runtime, so one load per file triple.
+#[derive(Clone)]
+pub(crate) struct LegKeys {
+  host_key: Arc<PrivateKey>,
+  decoy: PublicKey,
+  identity: Arc<PrivateKey>,
+}
+
+impl LegKeys {
   /// Load every key the two legs need: the guest host key (generated on
   /// first run, the CA's load-or-generate contract), the real identity, and
   /// the decoy admission key from the grant's blobs.
@@ -97,7 +107,7 @@ impl SshLegs {
   ///
   /// Returns an error when the host key cannot be generated or loaded, or
   /// when either key file cannot be read or parsed.
-  pub(crate) fn load(files: SshLegsFiles<'_>, upstream: Upstream) -> Result<Self, Error> {
+  pub(crate) fn load(files: SshLegsFiles<'_>) -> Result<Self, Error> {
     let host_key = Arc::new(hodor_pki::load_or_generate_host_key(files.host_key)?.into_private());
     let identity_text = std::fs::read_to_string(files.identity).map_err(|source| Error::SshRead {
       path: files.identity.to_path_buf(),
@@ -110,13 +120,46 @@ impl SshLegs {
     })?;
     let blob = guest_line.split(' ').nth(1).unwrap_or_default();
     let decoy = parse_public_key_base64(blob).map_err(RusshError::from)?;
-    Ok(Self {
-      host_key,
-      decoy,
-      identity,
-      known_hosts: files.known_hosts.to_path_buf(),
+    Ok(Self { host_key, decoy, identity })
+  }
+
+  /// Legs for one connection's dial target over these shared keys.
+  fn assemble(&self, known_hosts: &Path, upstream: Upstream) -> SshLegs {
+    SshLegs {
+      host_key: Arc::clone(&self.host_key),
+      decoy: self.decoy.clone(),
+      identity: Arc::clone(&self.identity),
+      known_hosts: known_hosts.to_path_buf(),
       upstream,
-    })
+    }
+  }
+}
+
+impl SshLegs {
+  /// Load every key the two legs need: the guest host key (generated on
+  /// first run, the CA's load-or-generate contract), the real identity, and
+  /// the decoy admission key from the grant's blobs.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the host key cannot be generated or loaded, or
+  /// when either key file cannot be read or parsed.
+  pub(crate) fn load(files: SshLegsFiles<'_>, upstream: Upstream) -> Result<Self, Error> {
+    Ok(LegKeys::load(files)?.assemble(files.known_hosts, upstream))
+  }
+
+  /// Legs over already-loaded keys: the transport's per-file cache path.
+  pub(crate) fn from_keys(keys: &LegKeys, known_hosts: &Path, upstream: Upstream) -> Self {
+    keys.assemble(known_hosts, upstream)
+  }
+
+  /// The disk-loaded keys behind these legs, for the transport cache.
+  pub(crate) fn keys(&self) -> LegKeys {
+    LegKeys {
+      host_key: Arc::clone(&self.host_key),
+      decoy: self.decoy.clone(),
+      identity: Arc::clone(&self.identity),
+    }
   }
 
   /// Terminate the guest's session and bridge its channels upstream.

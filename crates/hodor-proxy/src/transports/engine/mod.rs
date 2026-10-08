@@ -1,23 +1,17 @@
-//! Wire formats: one trait, one module per protocol.
-//!
-//! A wire format owns its framing and its credential rewriting. The
-//! connection layer owns bytes, TLS, and backpressure. The scope a destination
-//! matched picks the format, and inside an HTTPS scope the ALPN TLS negotiated
-//! picks between HTTP/1, HTTP/2, and raw. No plaintext byte is read to choose.
+//! Substitution engine: the shared needle machinery every framing machine
+//! is built on — pair eligibility, mint plans, and the scan/replace
+//! primitives. Protocol-agnostic by construction; the framing machines
+//! that use it live in their protocol verticals.
 
 #[cfg(test)]
 mod fuzz_props;
-mod h2;
-mod http;
-mod postgres;
-mod raw;
-mod ssh;
 
-pub(crate) use h2::H2;
-pub(crate) use http::Http;
-pub(crate) use postgres::{GuestOpening, Postgres, read_guest_opening, request_upstream_tls};
-pub(crate) use raw::Raw;
-pub(crate) use ssh::{SshLegs, SshLegsFiles, Upstream};
+pub(crate) use super::http::h2::H2;
+pub(crate) use super::http::machine::Http;
+pub(crate) use super::postgres::machine::{GuestOpening, Postgres, read_guest_opening, request_upstream_tls};
+pub(crate) use super::redis::machine::Redis;
+pub(crate) use super::ssh::legs::{LegKeys, SshLegs, SshLegsFiles, Upstream};
+pub(crate) use super::tcp::machine::Raw;
 
 use std::borrow::Cow;
 
@@ -84,55 +78,12 @@ pub(crate) trait Wire {
   fn apply_peer_note(&mut self, _n: usize) {}
 }
 
-/// The wire format chosen by a rule URL's scheme.
-pub(crate) enum AnyWire {
-  /// HTTP/1-family.
-  Http(Http),
-  /// HTTP/2.
-  H2(H2),
-  /// Postgres wire protocol.
-  Postgres(Postgres),
-  /// No format: equal-length swap only.
-  Raw(Raw),
-}
-
-impl Wire for AnyWire {
-  async fn feed<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
-    match self {
-      Self::Http(w) => w.feed(chunk).await,
-      Self::H2(w) => w.feed(chunk).await,
-      Self::Postgres(w) => w.feed(chunk).await,
-      Self::Raw(w) => w.feed(chunk).await,
-    }
-  }
-  fn take_reply(&mut self) -> Option<Vec<u8>> {
-    match self {
-      Self::Postgres(w) => w.take_reply(),
-      _ => None,
-    }
-  }
-  fn take_peer_note(&mut self) -> usize {
-    match self {
-      Self::Http(w) => w.take_peer_note(),
-      Self::H2(w) => w.take_peer_note(),
-      _ => 0,
-    }
-  }
-  fn apply_peer_note(&mut self, n: usize) {
-    match self {
-      Self::Http(w) => w.apply_peer_note(n),
-      Self::H2(w) => w.apply_peer_note(n),
-      _ => {}
-    }
-  }
-}
-
 /// One needle→replacement pair for a connection direction.
 #[derive(Clone)]
 pub(crate) struct CredentialPair {
-  needle: Vec<u8>,
-  replacement: Vec<u8>,
-  label: String,
+  pub(crate) needle: Vec<u8>,
+  pub(crate) replacement: Vec<u8>,
+  pub(crate) label: String,
 }
 
 /// Eligible pairs for one connection endpoint. The scheme picks the grants;
@@ -206,7 +157,7 @@ pub(crate) fn mint_plan_for(grants: &[Grant], scheme: Scheme, host: &str, port: 
 fn grant_pattern(grant: &Grant) -> Option<String> {
   match grant {
     Grant::Token { pattern, .. } => pattern.clone(),
-    Grant::Database { .. } | Grant::Ssh { .. } => None,
+    Grant::Postgres { .. } | Grant::Redis { .. } | Grant::Ssh { .. } => None,
   }
 }
 

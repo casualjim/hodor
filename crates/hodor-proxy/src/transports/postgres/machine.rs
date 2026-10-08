@@ -19,8 +19,8 @@ use pgwire::messages::Message;
 use pgwire::messages::startup::{GssEncRequest, SslRequest, Startup};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use super::{Direction, Hit, Raw, Rewritten, Wire};
 use crate::Error;
+use crate::transports::engine::{Direction, Hit, Raw, Rewritten, Wire};
 
 /// Cap for one greeting message. Real `StartupMessages` are hundreds of
 /// bytes; anything past this is a drip or an attack, never a greeting.
@@ -61,7 +61,7 @@ impl Postgres {
       state,
       inner: Raw::new(grants, Scheme::Postgres, host, port, dir),
       reply: None,
-      user_rewrite: grants.iter().find_map(|grant| grant.database(Some(host), port)).and_then(|scope| {
+      user_rewrite: grants.iter().find_map(|grant| grant.postgres(Some(host), port)).and_then(|scope| {
         if scope.upstream.user.is_some() && scope.upstream.user != scope.downstream.user {
           scope.upstream.user.clone()
         } else {
@@ -366,18 +366,18 @@ const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 #[cfg(test)]
 mod tests {
   use super::*;
-  use hodor_config::grants::Credential;
+  use hodor_config::grants::{Credential, PostgresScope};
   use secrecy::SecretString;
 
   fn pg_grant() -> Grant {
-    Grant::Database {
+    Grant::Postgres {
       credential: Credential {
         label: "pg".to_string(),
         fake: "FAKEFAKE".to_string(),
         value: SecretString::from("REALREAL"),
       },
       scope: Box::new(
-        hodor_config::grants::DatabaseScope::from_strings(
+        PostgresScope::from_strings(
           "postgres://app:FAKEFAKE@db.internal:5432",                 // betterleaks:allow
           "postgres://app:REALREAL@db.internal:5432?sslmode=disable", // betterleaks:allow
         )

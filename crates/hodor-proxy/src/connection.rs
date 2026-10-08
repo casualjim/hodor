@@ -1,46 +1,35 @@
 //! Connection layer: guest adapters, the terminated-TLS pump, dialing.
 //! Knows bytes and TLS; nothing of wire formats.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use rama::Service;
-use rama::error::BoxError;
 use rama::extensions::{Extensions, ExtensionsRef};
-use rama::io::BridgeIo;
 use rama::net::address::{Host, HostWithPort};
 use rama::net::client::ConnectorTarget;
 use rama::net::socket::SocketOptions;
 use rama::service::service_fn;
 use rama::tcp::client::TcpStreamConnector;
-use rama::tls::boring::TlsStream;
 use rama::tls::boring::client::ConnectorConfigClientAuth;
 use rama::tls::boring::core::ssl::SslCredential;
 use rama::tls::boring::core::x509::store::X509Store;
 use rama::tls::boring::proxy::client_auth::{TlsMitmClientAuthInput, TlsMitmClientAuthPlan, TlsMitmClientAuthPolicy};
-use rama::tls::client::{ClientAuth, ClientAuthData, NegotiatedTlsParameters};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rama::tls::client::{ClientAuth, ClientAuthData};
 use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::Error as PemError};
-use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::Error as PemError};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use hodor_config::grants::{DatabaseScope, EndpointScope, GuestTlsMode, ResolvedConfig, RootCert, SslMode, SslNegotiation};
-use hodor_pki::ca::CertAuthority;
+use hodor_config::grants::{EndpointScope, GuestTlsMode};
 
 use crate::Error;
-use crate::into_box_error;
-use crate::protocol::{PairCtx, https_framing};
-use crate::relay::relay_guarded;
-
+use crate::identity::{Hello, read_client_hello};
+use crate::mint::MintBucket;
 /// Guest-side adapter: any tokio stream plus a rama extension map. The relay
 /// reads the [`ConnectorTarget`] identity from these extensions to derive
 /// egress SNI and verification identity.
@@ -214,51 +203,6 @@ pub(crate) fn trust_anchors(path: &Path) -> Result<Vec<CertificateDer<'static>>,
   Ok(chain)
 }
 
-/// Byte-pump service: the relay hands paired TLS streams here, and the
-/// substitution machines pump them. Decoded-request middleware is deliberately
-/// not used: a `Request<Body>` round-trips through the HTTP codec and would
-/// break the byte-identical guarantee the verbatim tests pin.
-#[derive(Debug, Clone)]
-pub(crate) struct PumpService {
-  pub(crate) snapshot: Arc<ResolvedConfig>,
-  pub(crate) identity: String,
-  pub(crate) port: u16,
-  pub(crate) plugins: Arc<hodor_plugin::Registry>,
-  pub(crate) mint: Option<crate::mint::MintHandle>,
-}
-impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for PumpService
-where
-  GI: AsyncRead + AsyncWrite + Unpin + Send + 'static + ExtensionsRef,
-  GE: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-  type Output = ();
-  type Error = BoxError;
-
-  async fn serve(&self, input: BridgeIo<TlsStream<GI>, TlsStream<GE>>) -> Result<Self::Output, Self::Error> {
-    let BridgeIo(mut guest_tls, mut server_tls) = input;
-    // The scope that matched selected TLS termination; framing picks the legs.
-    // Schemes below are grant scopes (authorization), never selection.
-    let ctx = PairCtx {
-      grants: &self.snapshot.grants,
-      host: &self.identity,
-      port: self.port,
-      plugins: &self.plugins,
-      mint: self.mint.clone(),
-    };
-    // The relay handshook the upstream leg before the guest's, and answered
-    // the guest with what that leg agreed, so this one fact frames both
-    // directions. Nothing here reads a plaintext byte.
-    let negotiated = guest_tls
-      .extensions()
-      .get_ref::<NegotiatedTlsParameters>()
-      .and_then(|params| params.application_layer_protocol.as_ref());
-    let (mut downstream_machine, mut upstream_machine) = https_framing(&ctx, negotiated);
-    relay_guarded(&mut guest_tls, &mut server_tls, &mut downstream_machine, &mut upstream_machine, &[])
-      .await
-      .map_err(|err| into_box_error(&err))
-  }
-}
-
 /// Dial upstream, applying the fwmark when set (TUN self-exclusion).
 /// Mark failures are fatal: silently unmarked dials would loop back into TUN.
 ///
@@ -345,300 +289,57 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
   }
 }
 
-/// Postgres transport halves.
+/// Read a guest `ClientHello` under the budget, enforce the authority/SNI
+/// match, and mint-gate the leaf. The protocol verticals share this
+/// opening; the tuple is `(hello bytes, mint identity, server name)`.
 ///
-/// The guest's transport is the guest's choice, so this half answers what the
-/// guest asked for with a leaf minted for the name it asked for. The server's
-/// transport is the entry URL's statement, so that half negotiates, offers and
-/// verifies exactly what the URL says, and nothing this proxy would prefer.
-#[derive(Debug)]
-pub(crate) struct PgTransport {
-  ca: CertAuthority,
-  provider: Arc<rustls::crypto::CryptoProvider>,
-  leaves: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
-  roots: Mutex<HashMap<RootCert, Arc<RootCertStore>>>,
-}
-
-impl PgTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      // An own handle on the same CA: minting needs its signing key, and the
-      // caller's borrow ends with this call.
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      provider: rustls::crypto::CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider())),
-      leaves: Mutex::new(HashMap::new()),
-      roots: Mutex::new(HashMap::new()),
-    })
-  }
-
-  /// Accept the guest's TLS, minting the leaf for `sni` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
-  pub(crate) async fn accept_guest<G>(
-    &self,
-    sni: &str,
-    guest: G,
-    guest_tls: GuestTlsMode,
-  ) -> Result<tokio_rustls::server::TlsStream<G>, Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
+/// `None` closes the connection: no hello, a mismatched SNI, no name to
+/// mint for, or the burst guard tripping as an error.
+pub(crate) async fn guest_tls_opening<G>(
+  guest: &mut G,
+  initial: &[u8],
+  budget: std::time::Duration,
+  host: Option<&str>,
+  mint: &MintBucket,
+) -> Result<Option<(Vec<u8>, String, String)>, Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  let Some(read) = read_client_hello(guest, initial, budget).await? else {
+    return Ok(None);
+  };
+  let (hello_buf, sni) = match read {
+    Hello::Named { buf, sni, .. } => (buf, Some(sni)),
+    Hello::Unnamed { buf, .. } => (buf, None),
+  };
+  if let (Some(authority), Some(sni)) = (host, sni.as_deref())
+    && !sni.eq_ignore_ascii_case(authority)
   {
-    let config = match guest_tls {
-      GuestTlsMode::Tls => self.leaf(sni)?,
-      // `mtls` asks the guest for a client certificate and admits only ones
-      // this hodor's own CA signs — the same anchor that mints the leaves.
-      GuestTlsMode::Mtls => self.leaf_mtls(sni)?,
-    };
-    TlsAcceptor::from(config)
-      .accept(guest)
-      .await
-      .map_err(|err| Error::GuestPostgresTls { source: err })
+    tracing::debug!(authority, sni, "CONNECT authority differs from SNI; closing");
+    return Ok(None);
   }
-
-  /// Handshake the server, verifying only what the entry asked to verify.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the named trust anchor cannot be read, when the
-  /// server name is unusable, or when the handshake fails.
-  pub(crate) async fn connect_server<S>(
-    &self,
-    scope: &DatabaseScope,
-    server_name: &str,
-    server: S,
-  ) -> Result<tokio_rustls::client::TlsStream<S>, Error>
-  where
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let roots = match &scope.root_cert {
-      Some(root) => Some(self.roots_for(root)?),
-      None => None,
-    };
-    let verifier = EgressCertVerifier {
-      roots,
-      check_name: scope.ssl == SslMode::VerifyFull,
-      provider: Arc::clone(&self.provider),
-    };
-    let builder = rustls::ClientConfig::builder()
-      .dangerous()
-      .with_custom_certificate_verifier(Arc::new(verifier));
-    let mut config = match (&scope.client_cert, &scope.client_key) {
-      // The entry names the proxy's client identity, so the upstream leg
-      // presents it; nothing else invents one.
-      (Some(cert), Some(key)) => {
-        let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(Error::EmptyClientIdentity { path: cert.clone() });
-        };
-        builder
-          .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| Error::ClientIdentity {
-            path: cert.clone(),
-            source: err,
-          })?
-      }
-      _ => builder.with_no_client_auth(),
-    };
-    if scope.negotiation == SslNegotiation::Direct {
-      // Direct TLS is defined by this identifier, on both ends (RFC 9113 does
-      // the same for `h2`). A negotiated-shape client offers nothing.
-      config.alpn_protocols = vec![POSTGRESQL_ALPN.to_vec()];
-    }
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::PostgresServerName { source: err.into() })?;
-    TlsConnector::from(Arc::new(config))
-      .connect(name, server)
-      .await
-      .map_err(|err| Error::ServerPostgresTls { source: err })
+  let mut server_name = host.map(ToString::to_string);
+  server_name = server_name.or_else(|| sni.clone());
+  // The leaf has to carry the name the guest verified, so the guest's own
+  // SNI wins and the authority is the fallback for a hello without one.
+  let Some(identity) = sni.or_else(|| server_name.clone()) else {
+    tracing::debug!("guest TLS with no name to mint for; closing");
+    return Ok(None);
+  };
+  if !mint.allow() {
+    return Err(Error::BurstExceeded {
+      identity: identity.clone(),
+    });
   }
-
-  /// Leaf for one name, cached. Minted outside the lock so two guests naming
-  /// the same host keygen at most twice and never while a lock is held.
-  fn leaf(&self, sni: &str) -> Result<Arc<rustls::ServerConfig>, Error> {
-    if let Some(config) = self.lock_leaves().get(sni) {
-      return Ok(Arc::clone(config));
-    }
-    let mut config = (*self.ca.generate_domain_cert(sni)?.server_config).clone();
-    // A real server offers this identifier, and a direct-TLS client looks for
-    // it (PostgreSQL 17). Classic clients offer no ALPN and see none.
-    config.alpn_protocols = vec![POSTGRESQL_ALPN.to_vec()];
-    let config = Arc::new(config);
-    self.lock_leaves().insert(sni.to_string(), Arc::clone(&config));
-    Ok(config)
-  }
-
-  /// `mtls` variant of [`Self::leaf`]: the same leaf shape, presented by a
-  /// config that demands a client certificate this hodor's CA can verify.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the verifier cannot
-  /// be built.
-  fn leaf_mtls(&self, sni: &str) -> Result<Arc<rustls::ServerConfig>, Error> {
-    let cache_key = format!("{sni}|mtls");
-    if let Some(config) = self.lock_leaves().get(&cache_key) {
-      return Ok(Arc::clone(config));
-    }
-    let (chain, key_der) = hodor_pki::ca::generate_domain_pair(&self.ca, sni)?;
-    let mut roots = RootCertStore::empty();
-    roots
-      .add(self.ca.cert_der().clone())
-      .map_err(|err| Error::MtlsGuestRoots { source: err })?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-      .build()
-      .map_err(|err| Error::MtlsGuestVerifier { source: err.into() })?;
-    let mut config = rustls::ServerConfig::builder()
-      .with_client_cert_verifier(verifier)
-      .with_single_cert(chain, key_der)
-      .map_err(|err| Error::MtlsLeaf { source: err })?;
-    config.alpn_protocols = vec![POSTGRESQL_ALPN.to_vec()];
-    let config = Arc::new(config);
-    self.lock_leaves().insert(cache_key, Arc::clone(&config));
-    Ok(config)
-  }
-
-  /// Trust anchors from the entry's `sslrootcert`, read once per path.
-  fn roots_for(&self, root: &RootCert) -> Result<Arc<RootCertStore>, Error> {
-    if let Some(store) = self.lock_roots().get(root) {
-      return Ok(Arc::clone(store));
-    }
-    let store = match root {
-      RootCert::Path(path) => {
-        let pem = std::fs::read(path).map_err(|err| Error::SslRootCert {
-          path: path.clone(),
-          source: err.into(),
-        })?;
-        let mut store = RootCertStore::empty();
-        let mut anchors = 0usize;
-        for cert in CertificateDer::pem_slice_iter(&pem) {
-          let cert = cert.map_err(|err| Error::SslRootCert {
-            path: path.clone(),
-            source: err.into(),
-          })?;
-          store.add(cert).map_err(|err| Error::SslRootCert {
-            path: path.clone(),
-            source: err.into(),
-          })?;
-          anchors += 1;
-        }
-        if anchors == 0 {
-          return Err(Error::EmptyRootCert { path: path.clone() });
-        }
-        store
-      }
-      // `system` names the platform trust store exactly; an unreadable or
-      // empty store fails closed rather than silently verifying nothing.
-      RootCert::System => {
-        let mut native = rustls_native_certs::load_native_certs();
-        if !native.errors.is_empty() {
-          return Err(Error::SystemStore {
-            source: native.errors.remove(0).into(),
-          });
-        }
-        let mut store = RootCertStore::empty();
-        for cert in native.certs {
-          store.add(cert).map_err(|err| Error::SystemStore { source: err.into() })?;
-        }
-        if store.is_empty() {
-          return Err(Error::EmptySystemStore);
-        }
-        store
-      }
-    };
-    let store = Arc::new(store);
-    self.lock_roots().insert(root.clone(), Arc::clone(&store));
-    Ok(store)
-  }
-
-  fn lock_leaves(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<rustls::ServerConfig>>> {
-    self.leaves.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-  }
-
-  fn lock_roots(&self) -> std::sync::MutexGuard<'_, HashMap<RootCert, Arc<RootCertStore>>> {
-    self.roots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-  }
+  Ok(Some((hello_buf, identity, server_name.unwrap_or_default())))
 }
-
-/// ALPN identifier for direct Postgres TLS.
-const POSTGRESQL_ALPN: &[u8] = b"postgresql";
-
-/// Egress server verification shaped by the entry rather than by this proxy.
-/// The postgres leg builds it from the entry URL; the name stays neutral so
-/// other rustls egress legs can share it.
-///
-/// libpq verifies nothing when no trust anchor is named, which is what makes
-/// `require` usable against a private server; it verifies the chain once one
-/// is; and it checks the host name only for `verify-full`. Inventing an anchor
-/// here would fail the servers those modes exist to reach.
-#[derive(Debug)]
-struct EgressCertVerifier {
-  roots: Option<Arc<RootCertStore>>,
-  check_name: bool,
-  provider: Arc<rustls::crypto::CryptoProvider>,
-}
-
-impl ServerCertVerifier for EgressCertVerifier {
-  fn verify_server_cert(
-    &self,
-    end_entity: &CertificateDer<'_>,
-    intermediates: &[CertificateDer<'_>],
-    server_name: &ServerName<'_>,
-    _ocsp_response: &[u8],
-    now: UnixTime,
-  ) -> Result<ServerCertVerified, RustlsError> {
-    let Some(roots) = self.roots.as_ref() else {
-      return Ok(ServerCertVerified::assertion());
-    };
-    let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
-    rustls::client::verify_server_cert_signed_by_trust_anchor(
-      &cert,
-      roots,
-      intermediates,
-      now,
-      self.provider.signature_verification_algorithms.all,
-    )?;
-    if self.check_name {
-      rustls::client::verify_server_name(&cert, server_name)?;
-    }
-    Ok(ServerCertVerified::assertion())
-  }
-
-  fn verify_tls12_signature(
-    &self,
-    message: &[u8],
-    cert: &CertificateDer<'_>,
-    dss: &DigitallySignedStruct,
-  ) -> Result<HandshakeSignatureValid, RustlsError> {
-    rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
-  }
-
-  fn verify_tls13_signature(
-    &self,
-    message: &[u8],
-    cert: &CertificateDer<'_>,
-    dss: &DigitallySignedStruct,
-  ) -> Result<HandshakeSignatureValid, RustlsError> {
-    rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
-  }
-
-  fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-    self.provider.signature_verification_algorithms.supported_schemes()
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use rama::tls::boring::core::x509::store::X509StoreBuilder;
 
   use super::*;
   use hodor_config::grants::Scheme;
+  use hodor_pki::ca::CertAuthority;
 
   fn tls_scope() -> EndpointScope {
     EndpointScope {

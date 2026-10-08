@@ -14,8 +14,8 @@ pub mod registry;
 pub use config::{AppConfig, ProxyCfg, RuleCfg, fake_for, load};
 pub use error::Error;
 pub use grants::{
-  Credential, DatabaseScope, EndpointScope, Grant, HostPat, ResolvedConfig, Scheme, SslMode, SslNegotiation, decoy_for_rule, resolve,
-  uri_match,
+  Credential, EndpointScope, Grant, HostPat, PostgresLeg, PostgresScope, ResolvedConfig, Scheme, SslMode, SslNegotiation, decoy_for_rule,
+  resolve, uri_match,
 };
 pub use plugins::{PluginCfg, PluginDirection, ResolvedPlugin, resolve_plugins};
 pub use secrecy::ExposeSecret;

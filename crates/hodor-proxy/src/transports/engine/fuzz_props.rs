@@ -15,10 +15,8 @@ use proptest::prelude::*;
 
 use hodor_config::grants::{Credential, Grant, Scheme};
 
-use super::h2::{H2, H2_PREFACE};
-use super::http::Http;
-use super::raw::Raw;
-use super::{Direction, Rewritten, Wire};
+use super::{Direction, Http, Raw, Rewritten, Wire};
+use crate::transports::http::h2::{H2, H2_PREFACE};
 
 /// Needle decoy (request-direction needle) and its real value.
 const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

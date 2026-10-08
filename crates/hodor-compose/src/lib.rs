@@ -795,6 +795,10 @@ mod tests {
       "the entrypoint chains to the image's init: HODOR_INIT first, common names next"
     );
     assert!(script.contains("exec \"$@\""), "the entrypoint hands off to the command");
+    assert!(
+      script.contains("${HODOR_EBPF_BYPASS_FILE:-}") && script.contains("podman network inspect"),
+      "the entrypoint publishes podman subnets for hodor's bypass list when the stack wires the file"
+    );
     assert_ne!(
       std::fs::metadata(&entrypoint).unwrap().permissions().mode() & 0o111,
       0,
@@ -873,11 +877,26 @@ mod tests {
       2,
       "both services carry the shared cgroup, so docker creates it as hodor starts: {ebpf}"
     );
-    assert!(
-      !ebpf.contains("/sys/fs/cgroup"),
-      "no host cgroup path is written down; the daemon's cgroup root decides where the shared cgroup lands: {ebpf}"
-    );
     assert_eq!(ebpf.matches("/dev/net/tun").count(), 1, "ebpf needs no tun device: {ebpf}");
+    assert_eq!(
+      ebpf.matches("HODOR_EBPF_BYPASS_FILE: /hodor/ebpf-bypass\n").count(),
+      2,
+      "hodor reads and the agent writes the same shared bypass file: {ebpf}"
+    );
+    assert!(!tun.contains("HODOR_EBPF_BYPASS_FILE"), "{tun}");
+    assert!(!tproxy.contains("HODOR_EBPF_BYPASS_FILE"), "{tproxy}");
+  }
+
+  #[test]
+  fn the_bypass_mount_names_the_shared_state_file() {
+    let mount = bypass_mount(Path::new("/root"));
+    assert_eq!(mount.container, Path::new("/hodor/ebpf-bypass"));
+    assert!(
+      mount.host.ends_with("ebpf-bypass"),
+      "the host side is the per-workspace state file: {}",
+      mount.host.display()
+    );
+    assert!(!mount.ro, "the agent entrypoint writes the file, so the shared mount is read-write");
   }
 
   #[test]

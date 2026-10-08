@@ -233,8 +233,12 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
       .clone()
       .ok_or_else(|| eyre::eyre!("--ebpf-cgroup is required for --proxy-backend ebpf"))?;
     let capture = std::sync::Arc::clone(&state);
+    let bypass = args.ebpf_bypass.clone();
+    let bypass_file = args.ebpf_bypass_file.clone();
     return with_capture(listener, state, "eBPF", async move {
-      hodor_ebpf::run_ebpf(capture, cgroup).await.map_err(eyre::Report::from)
+      hodor_ebpf::run_ebpf(capture, cgroup, bypass, bypass_file)
+        .await
+        .map_err(eyre::Report::from)
     })
     .await;
   }

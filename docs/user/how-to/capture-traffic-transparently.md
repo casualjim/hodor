@@ -35,6 +35,10 @@ echo $$ | sudo tee /sys/fs/cgroup/hodor/cgroup.procs
 
 `HODOR_PROXY_BACKEND`, plus `HODOR_EBPF_CGROUP` for the cgroup path, are the environment equivalents.
 
+Destinations the loader's netns cannot reach must not be captured: `connect4` would fake a handshake and then hang until the dial budget runs out. The loader always bypasses its own non-loopback addresses, and `--ebpf-bypass` (`HODOR_EBPF_BYPASS`, repeat or comma-separate) bypasses more. Bypassed dials fail or succeed on their own routing instead of transiting the proxy.
+
+Podman networks need a runtime channel: they are created inside the agent long after hodor starts, so no startup flag can name them. The generated stack mounts a shared bypass file into both services (`HODOR_EBPF_BYPASS_FILE`, or `--ebpf-bypass-file` by hand): the agent entrypoint rewrites it from `podman network inspect`, and hodor reloads it live within seconds, no restart. One CIDR per line, `#` comments allowed.
+
 ## 2. Understand the safety guard
 
 With `--proxy-backend tproxy`, hodor refuses unscoped capture rules when it runs in the host network namespace itself. The rules reroute every outbound TCP packet, and an unclean exit would leave the machine without TCP egress until the rules are cleaned up by hand.

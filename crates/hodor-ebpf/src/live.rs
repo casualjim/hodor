@@ -21,12 +21,14 @@
 #![cfg(test)]
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hodor_config::config::ProxyCfg;
 use hodor_config::grants::{Credential, EndpointScope, Grant, ResolvedConfig, Scheme};
 use hodor_proxy::ProxyState;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 use crate::{Error, Options, SelfExclusion, run_ebpf_with};
@@ -143,6 +145,8 @@ async fn start_capture(
   cgroup: &TestCgroup,
   state: Arc<ProxyState>,
   upstream_override: Option<SocketAddr>,
+  bypass: Vec<(Ipv4Addr, u8)>,
+  bypass_file: Option<PathBuf>,
 ) -> JoinHandle<Result<(), Error>> {
   let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
   let capture = tokio::spawn(run_ebpf_with(
@@ -151,6 +155,8 @@ async fn start_capture(
       upstream_override,
       self_exclusion: SelfExclusion::Nothing,
       ready: Some(ready_tx),
+      bypass,
+      bypass_file,
       ..Options::default()
     },
     state,
@@ -231,7 +237,14 @@ async fn ebpf_live_tcp_mitm_substitutes() {
   );
 
   let cgroup = TestCgroup::create("tcp");
-  let capture = start_capture(&cgroup, state, Some(SocketAddr::from((Ipv4Addr::LOCALHOST, stub_port)))).await;
+  let capture = start_capture(
+    &cgroup,
+    state,
+    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, stub_port))),
+    Vec::new(),
+    None,
+  )
+  .await;
 
   let stub_task = tokio::spawn(async move {
     let (conn, _) = stub.accept().await.unwrap();
@@ -343,7 +356,7 @@ async fn ebpf_live_udp_relay_roundtrip() {
   });
 
   let cgroup = TestCgroup::create("udp");
-  let capture = start_capture(&cgroup, state, Some(stub_addr)).await;
+  let capture = start_capture(&cgroup, state, Some(stub_addr), Vec::new(), None).await;
 
   // Connected socket: only `connect()`ed UDP is captured at all, so this is the
   // shape the backend supports. An unconnected `sendto` would never be
@@ -400,7 +413,14 @@ async fn ebpf_live_ungranted_tcp_splices_byte_identical() {
   });
 
   let cgroup = TestCgroup::create("splice");
-  let capture = start_capture(&cgroup, state, Some(SocketAddr::from((Ipv4Addr::LOCALHOST, stub_port)))).await;
+  let capture = start_capture(
+    &cgroup,
+    state,
+    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, stub_port))),
+    Vec::new(),
+    None,
+  )
+  .await;
 
   let mut conn = tokio::time::timeout(
     Duration::from_secs(10),
@@ -455,7 +475,7 @@ async fn ebpf_live_unconnected_udp_passes_through() {
   });
 
   let cgroup = TestCgroup::create("udp-passthrough");
-  let capture = start_capture(&cgroup, state, None).await;
+  let capture = start_capture(&cgroup, state, None, Vec::new(), None).await;
 
   // No `connect()` anywhere: this socket must reach the stub directly.
   let client = tokio::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -567,8 +587,14 @@ async fn ebpf_live_nested_netns_connect_is_not_captured() {
     conn.write_all(&buf[..n]).await.unwrap();
     conn.shutdown().await.unwrap();
   });
-
-  let capture = start_capture(&cgroup, state, Some(SocketAddr::from((Ipv4Addr::LOCALHOST, control_port)))).await;
+  let capture = start_capture(
+    &cgroup,
+    state,
+    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, control_port))),
+    Vec::new(),
+    None,
+  )
+  .await;
 
   // Control: hodor's own namespace is captured as always. The sentinel can
   // only come back through hodor, so this proves the hooks fire and the
@@ -620,5 +646,290 @@ async fn ebpf_live_nested_netns_connect_is_not_captured() {
     "the nested connection must reach the stub directly, not through hodor"
   );
   netns_task.await.unwrap();
+  capture.abort();
+}
+
+/// A destination inside a configured bypass CIDR is never rewritten: the
+/// connect is refused by the kernel itself instead of fake-succeeding into
+/// hodor's listener.
+///
+/// The podman case from the agent devenv: `10.89.0.0/16` has no route from
+/// the loader netns, so a rewrite handshakes instantly and then hangs until
+/// the dial budget runs out. TEST-NET-2 stands in for the podman range here,
+/// assigned to `lo` after the capture starts: the closed port refuses alike
+/// on every machine, so the verdict never depends on the test machine's own
+/// route for the range (blackholed on some, refused on others).
+/// The control leg (TEST-NET-3, outside the bypass) round-trips through
+/// hodor's stub first, proving the hooks are live — without it a dead
+/// capture would make the bypassed leg below pass vacuously.
+///
+/// Needs root like every other live test in this file.
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_bypass_cidr_is_not_captured() {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+  /// Inside the bypass: TEST-NET-2, also assigned to `lo` below so the
+  /// kernel refuses it the same way on every machine.
+  const BYPASSED: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
+  /// The same address as a host route for the `ip` setup below.
+  const BYPASSED_CIDR: &str = "198.51.100.10/32";
+  /// Outside the bypass: TEST-NET-3, captured as always.
+  const CONTROL: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
+  const SENTINEL: &[u8] = b"bypass-control-sentinel";
+
+  let _live = LIVE_LOCK.lock().await;
+
+  hodor_pki::ca::install_crypto_provider();
+  let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
+  // No grants: both legs are relays, and substitution plays no part.
+  let state = state_with(Vec::new(), &ca);
+
+  let stub = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.unwrap();
+  let stub_port = stub.local_addr().unwrap().port();
+  let stub_task = tokio::spawn(async move {
+    let (mut conn, _) = stub.accept().await.unwrap();
+    let mut buf = [0u8; 128];
+    let n = conn.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], SENTINEL);
+    conn.write_all(&buf[..n]).await.unwrap();
+    conn.shutdown().await.unwrap();
+  });
+
+  let cgroup = TestCgroup::create("bypass");
+  let capture = start_capture(
+    &cgroup,
+    state,
+    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, stub_port))),
+    vec![(Ipv4Addr::new(198, 51, 100, 0), 24)],
+    None,
+  )
+  .await;
+
+  // The bypassed address answers locally: assigning it to `lo` after the
+  // capture started means the loader's own-address discovery cannot have
+  // seen it — only the configured bypass covers it — and the closed port
+  // refuses alike on every machine, whatever the ambient route for
+  // TEST-NET-2 does (blackholed here, refused elsewhere). A stale address
+  // from an interrupted run is removed first, best-effort.
+  let _ = run_ip(&["addr", "del", BYPASSED_CIDR, "dev", "lo"]);
+  expect_ip(&["addr", "add", BYPASSED_CIDR, "dev", "lo"]);
+
+  // Control: outside the bypass the sentinel only comes back through hodor,
+  // so this proves `connect4` rewrote it and the hooks are live.
+  let mut control = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(SocketAddr::from((CONTROL, stub_port))))
+    .await
+    .expect("captured connect within 10s")
+    .expect("connect4 must still rewrite destinations outside the bypass");
+  control.write_all(SENTINEL).await.unwrap();
+  let mut echoed = vec![0u8; SENTINEL.len()];
+  let _ = tokio::time::timeout(Duration::from_secs(10), control.read_exact(&mut echoed))
+    .await
+    .expect("spliced reply within 10s")
+    .unwrap();
+  assert_eq!(echoed, SENTINEL, "destinations outside the bypass must still be captured");
+  stub_task.await.unwrap();
+  // Bypassed: the address is local now, so the kernel refuses the closed
+  // port itself — the same verdict on every machine, whatever the ambient
+  // route for TEST-NET-2 does. A rewrite would have handshaked instead (the
+  // listener is up — the control just proved it), turning this `expect_err`
+  // into a failure. The timeout only bounds the wait against a broken hook.
+  let bypassed = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(SocketAddr::from((BYPASSED, stub_port)))).await;
+  let err = bypassed
+    .expect("a bypassed destination must fail fast against its own closed port")
+    .expect_err("a bypassed destination must not be rewritten to hodor's listener");
+  assert!(
+    err.raw_os_error().is_some(),
+    "the kernel reports its own errno for a bypassed dial: {err}"
+  );
+  // Best-effort: the next run removes a stale address up front anyway.
+  let _ = run_ip(&["addr", "del", BYPASSED_CIDR, "dev", "lo"]);
+  capture.abort();
+}
+
+/// A connect at this netns's own non-loopback address reaches its listener
+/// directly: no `ORIG_DST` entry, no proxy relay.
+///
+/// The pasta case from the agent devenv: podman relays dial the devenv by
+/// bridge IP, and rewriting those dials sends every local connection on a
+/// double hop through hodor — coupling local connectivity to proxy health.
+/// The bypassed address is discovered, not configured: the loader lists its
+/// own non-loopback addresses into the bypass itself, so the test names no
+/// explicit CIDR and the veth pair stands in for the compose bridge.
+///
+/// The recorder on loopback is the tripwire for a relay: with an upstream
+/// override set, a captured dial would land on the recorder, never on the
+/// real stub. Needs `ip` and root like the nested-netns test above.
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes, veth pair)"]
+async fn ebpf_live_local_address_reaches_listener_directly() {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+  const VETH_OUT: &str = "veth-loc";
+  const VETH_IN: &str = "veth-loc-peer";
+  const VETH_OUT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 251, 0, 1);
+
+  let _live = LIVE_LOCK.lock().await;
+
+  hodor_pki::ca::install_crypto_provider();
+  let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
+  // No grants: a captured dial would take the splice path to the override.
+  let state = state_with(Vec::new(), &ca);
+
+  // The pair first: the stub binds the outer address, and the loader must see
+  // the address at startup to bypass it. Names distinct from the nested test
+  // above, removed best-effort in case an interrupted run left them behind.
+  let cgroup = TestCgroup::create("local-bypass");
+  let _ = run_ip(&["link", "del", VETH_IN]);
+  let _ = run_ip(&["link", "del", VETH_OUT]);
+  expect_ip(&["link", "add", VETH_OUT, "type", "veth", "peer", "name", VETH_IN]);
+  expect_ip(&["addr", "add", "10.251.0.1/30", "dev", VETH_OUT]);
+  expect_ip(&["link", "set", VETH_OUT, "up"]);
+
+  // The real stub on the netns's own address.
+  let stub = TcpListener::bind(SocketAddr::from((VETH_OUT_ADDR, 0))).await.unwrap();
+  let stub_port = stub.local_addr().unwrap().port();
+  let stub_task = tokio::spawn(async move {
+    let (mut conn, peer) = tokio::time::timeout(Duration::from_secs(10), stub.accept())
+      .await
+      .expect("direct connect within 10s; a timeout means connect4 rewrote the dial to hodor's listener")
+      .unwrap();
+    assert_eq!(
+      peer.ip(),
+      VETH_OUT_ADDR,
+      "a relayed dial would arrive from hodor, not from the veth address"
+    );
+    let mut buf = [0u8; 4];
+    conn.read_exact(&mut buf).await.unwrap();
+    conn.write_all(b"pong").await.unwrap();
+    conn.shutdown().await.unwrap();
+  });
+
+  // The tripwire: any captured dial lands here via the upstream override, so
+  // an accept here means the bypass missed. Bound early (its address feeds
+  // the capture below) but accepted late: the window must cover the dial,
+  // not the seconds the loader takes to attach.
+  let recorder = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.unwrap();
+  let recorder_addr = recorder.local_addr().unwrap();
+
+  // No explicit bypass: the loader's own-address discovery must cover the
+  // veth address by itself.
+  let capture = start_capture(&cgroup, state, Some(recorder_addr), Vec::new(), None).await;
+  let recorder_task = tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(2), recorder.accept()).await.is_err() });
+
+  let mut conn = tokio::time::timeout(
+    Duration::from_secs(10),
+    TcpStream::connect(SocketAddr::from((VETH_OUT_ADDR, stub_port))),
+  )
+  .await
+  .expect("direct connect within 10s")
+  .expect("the netns's own address must not be captured");
+  conn.write_all(b"ping").await.unwrap();
+  let mut reply = [0u8; 4];
+  conn.read_exact(&mut reply).await.unwrap();
+  assert_eq!(&reply, b"pong");
+  stub_task.await.unwrap();
+  assert!(
+    recorder_task.await.unwrap(),
+    "the recorder must see no connection: the dial reached its listener directly, never through hodor"
+  );
+  capture.abort();
+}
+
+/// A CIDR written to the bypass file mid-capture takes effect without a
+/// restart: the next poll rewrites `CONFIG` and the address stops being
+/// captured.
+///
+/// The podman lifecycle from the agent devenv: networks appear inside the
+/// agent long after hodor starts, so only a runtime channel can cover them.
+/// The control leg proves capture is live first; then the test writes the
+/// file the way the agent entrypoint would and dials until the kernel
+/// refuses the connect. Each still-captured attempt fake-succeeds and is
+/// dropped unanswered, so the loop only exits when the bypass lands — and a
+/// deadline bounds it, so a broken watcher fails the test instead of
+/// hanging it.
+///
+/// Needs root like every other live test in this file.
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_bypass_file_update_applies_without_restart() {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+  /// The "podman range": TEST-NET-1, captured until the file names it.
+  const TARGET: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
+  /// Outside any bypass: TEST-NET-3, captured throughout.
+  const CONTROL: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
+  const SENTINEL: &[u8] = b"bypass-file-sentinel";
+
+  let _live = LIVE_LOCK.lock().await;
+
+  hodor_pki::ca::install_crypto_provider();
+  let ca = hodor_pki::ca::CertAuthority::generate().unwrap();
+  // No grants: both legs are relays, and substitution plays no part.
+  let state = state_with(Vec::new(), &ca);
+
+  let stub = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.unwrap();
+  let stub_port = stub.local_addr().unwrap().port();
+  let stub_task = tokio::spawn(async move {
+    let (mut conn, _) = stub.accept().await.unwrap();
+    let mut buf = [0u8; 128];
+    let n = conn.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], SENTINEL);
+    conn.write_all(&buf[..n]).await.unwrap();
+    conn.shutdown().await.unwrap();
+  });
+
+  // The file starts without the range: everything is captured.
+  let dir = tempfile::tempdir().unwrap();
+  let file = dir.path().join("bypass");
+  std::fs::write(&file, "# no podman networks yet\n").unwrap();
+
+  let cgroup = TestCgroup::create("bypass-file");
+  let capture = start_capture(
+    &cgroup,
+    state,
+    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, stub_port))),
+    Vec::new(),
+    Some(file.clone()),
+  )
+  .await;
+
+  // Control: the sentinel only comes back through hodor, proving the hooks
+  // are live before the file changes anything.
+  let mut control = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(SocketAddr::from((CONTROL, stub_port))))
+    .await
+    .expect("captured connect within 10s")
+    .expect("everything is captured while the file names nothing");
+  control.write_all(SENTINEL).await.unwrap();
+  let mut echoed = vec![0u8; SENTINEL.len()];
+  let _ = tokio::time::timeout(Duration::from_secs(10), control.read_exact(&mut echoed))
+    .await
+    .expect("spliced reply within 10s")
+    .unwrap();
+  assert_eq!(echoed, SENTINEL);
+  stub_task.await.unwrap();
+
+  // A podman network appears: the agent rewrites the file, hodor's next poll
+  // picks it up. Atomic write, like the entrypoint does.
+  let tmp = dir.path().join("bypass.tmp");
+  std::fs::write(&tmp, "198.51.100.0/24\n").unwrap();
+  std::fs::rename(&tmp, &file).unwrap();
+
+  let deadline = Instant::now() + Duration::from_secs(30);
+  loop {
+    match TcpStream::connect(SocketAddr::from((TARGET, stub_port))).await {
+      Err(err) => {
+        assert!(
+          err.raw_os_error().is_some(),
+          "the kernel reports its own errno once the bypass lands: {err}"
+        );
+        break;
+      }
+      // Still captured: drop the fake connection and wait for the next poll.
+      Ok(_) => {
+        assert!(Instant::now() < deadline, "bypass file update did not apply within 30s");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+      }
+    }
+  }
   capture.abort();
 }

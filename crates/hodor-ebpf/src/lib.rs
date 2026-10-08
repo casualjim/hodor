@@ -8,17 +8,18 @@
 //! Nothing here touches netfilter or the routing table: the exclusion mechanism
 //! is the cgroup a program is attached to, plus the recorded proxy PID.
 
-use std::fs::File;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
 use aya::{
   Ebpf,
   maps::{Array, MapData},
   programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr},
 };
 use hodor_proxy::ProxyState;
+use std::fs::File;
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 mod error;
 mod flow;
@@ -94,7 +95,25 @@ pub(crate) struct Options {
   /// Which process the programs skip, so hodor's own upstream dials are never
   /// re-captured.
   pub self_exclusion: SelfExclusion,
+  /// Extra bypass CIDRs as `(network, prefix_len)`, from `--ebpf-bypass`.
+  /// The loader always adds its own non-loopback addresses (as `/32`s) and
+  /// best-effort podman ranges on top; see [`build_bypass`].
+  pub bypass: Vec<(Ipv4Addr, u8)>,
+  /// File holding runtime bypass CIDRs, one per line, re-read while capture
+  /// runs. The agent entrypoint rewrites it from `podman network inspect`;
+  /// absent means no runtime entries, never an error.
+  pub bypass_file: Option<PathBuf>,
 }
+
+/// How many bypass CIDRs [`Config`] carries. Must match
+/// `hodor-ebpf-programs::MAX_BYPASS`; the layout test pins both sides.
+pub(crate) const MAX_BYPASS: usize = 8;
+
+/// How often the bypass file is re-read while capture runs. Podman networks
+/// are created at human scale, so seconds of delay are invisible — and a
+/// shared-volume file is polled rather than watched, because inotify over
+/// container mounts is unreliable.
+const BYPASS_POLL: Duration = Duration::from_secs(5);
 
 /// Which process the programs skip.
 ///
@@ -189,12 +208,243 @@ fn own_netns_cookie() -> u64 {
   }
   cookie
 }
+/// Parse one `--ebpf-bypass` CIDR (`10.89.0.0/16`) into `(network, prefix_len)`.
+///
+/// The single parser for bypass CIDRs: the face uses it as the clap
+/// `value_parser`, so an invalid entry fails the CLI before capture starts
+/// and the loader never parses twice. The network need not be masked —
+/// [`Config::from_bypass`] masks it — but the prefix must be `1..=32`: `0`
+/// would bypass all capture, which is never what an override means.
+///
+/// # Errors
+///
+/// Returns a message for a missing `/`, an unparseable address, or a prefix
+/// outside `1..=32`.
+pub fn parse_bypass_cidr(s: &str) -> Result<(Ipv4Addr, u8), String> {
+  let (addr, len) = s
+    .split_once('/')
+    .ok_or_else(|| format!("expected CIDR `address/prefix_len`, got `{s}`"))?;
+  let addr: Ipv4Addr = addr.parse().map_err(|_| format!("invalid bypass network address `{addr}`"))?;
+  let len: u8 = len.parse().map_err(|_| format!("invalid bypass prefix length `{len}`"))?;
+  if len == 0 || len > 32 {
+    return Err(format!("bypass prefix length must be 1..=32, got `{len}`"));
+  }
+  Ok((addr, len))
+}
+
+/// Host-order mask for `len` prefix bits: `mask_prefix(24)` is `255.255.255.0`.
+/// A zero length masks nothing; the loader never stores it (it rejects prefix
+/// `0`), so this arm only guards the helper itself.
+pub(crate) fn mask_prefix(len: u8) -> u32 {
+  if len == 0 {
+    0
+  } else if len >= 32 {
+    u32::MAX
+  } else {
+    u32::MAX << (32 - len)
+  }
+}
+
+/// Assemble the bypass list [`configure`] writes: explicit `--ebpf-bypass`
+/// CIDRs, then the bypass file's entries, then this netns's own non-loopback
+/// addresses (as `/32`s) and best-effort podman ranges.
+///
+/// Explicit entries always survive: they state intent, so truncation drops
+/// automatic entries first, then file entries, and warns. An explicit list
+/// longer than [`MAX_BYPASS`] is kept whole here and refused loudly by
+/// [`Config::from_bypass`] instead — silently dropping an override would
+/// reintroduce the fake-success hang it was named to prevent.
+pub(crate) fn build_bypass(mut explicit: Vec<(Ipv4Addr, u8)>, mut file: Vec<(Ipv4Addr, u8)>) -> Vec<(Ipv4Addr, u8)> {
+  explicit.sort();
+  explicit.dedup();
+  file.sort();
+  file.dedup();
+  file.retain(|entry| !explicit.contains(entry));
+  let mut automatic: Vec<(Ipv4Addr, u8)> = local_ipv4_addrs().into_iter().map(|addr| (addr, 32)).collect();
+  automatic.extend(podman_cidrs());
+  automatic.sort();
+  automatic.dedup();
+  automatic.retain(|entry| !explicit.contains(entry) && !file.contains(entry));
+  let mut out = explicit;
+  for (tier, name) in [(file, "bypass-file"), (automatic, "discovered")] {
+    let room = MAX_BYPASS.saturating_sub(out.len());
+    if tier.len() > room {
+      tracing::warn!(
+        kept = out.len(),
+        dropped = tier.len() - room,
+        max = MAX_BYPASS,
+        tier = name,
+        "more bypass CIDRs than the programs carry: keeping the higher-precedence entries"
+      );
+      out.extend(tier.into_iter().take(room));
+    } else {
+      out.extend(tier);
+    }
+  }
+  out
+}
+
+/// Read runtime bypass CIDRs from `path`: one `address/prefix` per line,
+/// `#` comments and blank lines ignored.
+///
+/// A missing file is the ordinary "no runtime entries yet" case — the agent
+/// writes it after hodor starts — so it reads as empty without a log. Any
+/// other read failure degrades the same way with a debug log: capture must
+/// not fail for a file it only consults. Unparseable lines are skipped with
+/// a warning naming the line, so one bad entry never hides the rest.
+fn read_bypass_file(path: &Path) -> Vec<(Ipv4Addr, u8)> {
+  match std::fs::read_to_string(path) {
+    Ok(content) => parse_bypass_file(&content, path),
+    Err(err) if err.kind() == ErrorKind::NotFound => Vec::new(),
+    Err(err) => {
+      tracing::debug!(path = %path.display(), %err, "bypass file unreadable: runtime entries stay empty");
+      Vec::new()
+    }
+  }
+}
+
+/// Every valid CIDR in bypass-file `content`. Split out for tests: the
+/// watcher skips this entirely when the raw bytes are unchanged.
+fn parse_bypass_file(content: &str, path: &Path) -> Vec<(Ipv4Addr, u8)> {
+  let mut out = Vec::new();
+  for (index, line) in content.lines().enumerate() {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+      continue;
+    }
+    match parse_bypass_cidr(line) {
+      Ok(cidr) => out.push(cidr),
+      Err(detail) => tracing::warn!(path = %path.display(), line = index + 1, %detail, "ignoring invalid bypass-file entry"),
+    }
+  }
+  out
+}
+
+/// This netns's own non-loopback IPv4 addresses, one `/32` each in the bypass
+/// list: dials at the devenv by bridge IP (pasta relays, `fwd`-exposed ports)
+/// keep their own routing instead of taking a double hop through the proxy.
+/// Empty when the addresses cannot be listed — capture then proceeds without
+/// the local bypass rather than failing the backend for it.
+fn local_ipv4_addrs() -> Vec<Ipv4Addr> {
+  let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+  // SAFETY: `getifaddrs` writes the list head and nothing else the caller
+  // owns; every node is freed before this function returns.
+  if unsafe { libc::getifaddrs(&raw mut head) } != 0 {
+    tracing::debug!("getifaddrs failed: the local-address bypass stays empty");
+    return Vec::new();
+  }
+  struct List(*mut libc::ifaddrs);
+  impl Drop for List {
+    fn drop(&mut self) {
+      // SAFETY: the pointer is the head `getifaddrs` wrote.
+      unsafe { libc::freeifaddrs(self.0) };
+    }
+  }
+  let _list = List(head);
+  let mut out = Vec::new();
+  let mut cursor = head;
+  loop {
+    // SAFETY: `cursor` is null or a node of the list `_list` owns.
+    let entry = unsafe { cursor.as_ref() };
+    let Some(entry) = entry else {
+      break;
+    };
+    cursor = entry.ifa_next;
+    if i32::from(unsafe { entry.ifa_addr.as_ref() }.map_or(0, |addr| addr.sa_family)) != libc::AF_INET {
+      continue;
+    }
+    // SAFETY: an AF_INET entry stores a `sockaddr_in` at `ifa_addr`.
+    let Some(sa) = (unsafe { entry.ifa_addr.cast::<libc::sockaddr_in>().as_ref() }) else {
+      continue;
+    };
+    let addr = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+    if !addr.is_loopback() && !out.contains(&addr) {
+      out.push(addr);
+    }
+  }
+  out
+}
+
+/// Podman-managed CIDRs, best-effort: every `subnet` in the podman network
+/// definition files this mount namespace can see.
+///
+/// A loader sharing the agent's mounts (host runs, shared volumes) discovers
+/// the ranges on its own; a loader in the hodor service container cannot see
+/// the agent container's files, so inner-podman ranges still need an explicit
+/// `--ebpf-bypass`. Unreadable files and unparseable entries are skipped with
+/// a debug log — discovery is opportunistic, never fatal.
+fn podman_cidrs() -> Vec<(Ipv4Addr, u8)> {
+  let mut out = Vec::new();
+  for dir in podman_network_dirs() {
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+      continue;
+    };
+    for entry in entries.flatten() {
+      if entry.path().extension().is_none_or(|ext| ext != "json") {
+        continue;
+      }
+      let Ok(content) = std::fs::read_to_string(entry.path()) else {
+        continue;
+      };
+      out.extend(podman_subnets_in(&content));
+    }
+  }
+  out
+}
+
+/// Where podman keeps network definitions: the user config tree plus the
+/// system one. Runtime state under `/run` carries no subnet definitions, so
+/// only definition files are worth scanning.
+fn podman_network_dirs() -> Vec<PathBuf> {
+  let mut dirs = Vec::new();
+  if let Some(home) = std::env::var_os("HOME") {
+    dirs.push(PathBuf::from(home).join(".config/containers/podman/networks"));
+  }
+  dirs.push(PathBuf::from("/etc/containers/networks"));
+  dirs.push(PathBuf::from("/usr/local/etc/containers/networks"));
+  dirs
+}
+
+/// Every `"subnet": "A.B.C.D/L"` value in one network definition file.
+/// A string scan, not a JSON parse: the files are small, the key is stable,
+/// and a scan never fails the load on an unknown schema version.
+fn podman_subnets_in(content: &str) -> Vec<(Ipv4Addr, u8)> {
+  let mut out = Vec::new();
+  for chunk in content.split("\"subnet\"").skip(1) {
+    // The value is the first quoted string after the key: ` : "10.89.0.0/24"`.
+    let Some(quoted) = chunk.split('"').nth(1) else {
+      continue;
+    };
+    match parse_bypass_cidr(quoted) {
+      Ok(cidr) => out.push(cidr),
+      Err(detail) => tracing::debug!(subnet = quoted, %detail, "ignoring unparseable podman subnet"),
+    }
+  }
+  out
+}
+
+/// Render a bypass list for the startup log: `10.89.0.0/16, 172.21.0.2/32`.
+fn bypass_debug(bypass: &[(Ipv4Addr, u8)]) -> Vec<String> {
+  bypass.iter().map(|(addr, len)| format!("{addr}/{len}")).collect()
+}
 
 /// Attach the capture programs and serve captured traffic forever.
 ///
 /// `cgroup` is the directory whose member processes get captured. hodor itself
 /// must live outside it, or its own upstream dials would be redirected back
 /// into it; the recorded proxy PID is a second guard against that.
+///
+/// `bypass` holds extra `(network, prefix_len)` CIDRs `connect4` never
+/// rewrites — podman ranges, usually, from `--ebpf-bypass`. The loader always
+/// adds its own non-loopback addresses (as `/32`s) on top, so local relays
+/// stop transiting the proxy without anyone naming them.
+///
+/// `bypass_file` names a file with runtime CIDRs, one per line, that the
+/// loader re-reads while capture runs: podman networks are created inside
+/// the agent long after hodor starts, so no startup flag can name them. The
+/// agent entrypoint rewrites that file from `podman network inspect`; `None`
+/// means no runtime entries. Every applied list is logged, so a stale or
+/// surprising bypass is visible in hodor's own logs.
 ///
 /// # Errors
 ///
@@ -203,10 +453,17 @@ fn own_netns_cookie() -> u64 {
 /// cannot be bound. Every one of these is fatal for capture, so they surface
 /// rather than degrade: a silent failure here would leave traffic flowing
 /// unproxied while the operator believes it is captured.
-pub async fn run_ebpf(state: Arc<ProxyState>, cgroup: PathBuf) -> Result<(), Error> {
+pub async fn run_ebpf(
+  state: Arc<ProxyState>,
+  cgroup: PathBuf,
+  bypass: Vec<(Ipv4Addr, u8)>,
+  bypass_file: Option<PathBuf>,
+) -> Result<(), Error> {
   run_ebpf_with(
     Options {
       cgroup: Some(cgroup),
+      bypass,
+      bypass_file,
       ..Options::default()
     },
     state,
@@ -222,9 +479,13 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
   };
   let tcp_port = options.tcp_port.unwrap_or(TCP_LISTEN_PORT);
   let udp_port = options.udp_port.unwrap_or(UDP_LISTEN_PORT);
+  // The file is read once here so a list the agent already wrote applies
+  // from the first connection; the watcher below picks up later rewrites.
+  let file_initial = options.bypass_file.as_deref().map_or_else(Vec::new, read_bypass_file);
+  let bypass = build_bypass(options.bypass.clone(), file_initial);
 
   let mut bpf = Ebpf::load(PROGRAMS).map_err(|err| Error::LoadPrograms { origin: err })?;
-  configure(&mut bpf, tcp_port, udp_port, options.self_exclusion).map_err(|err| Error::WriteConfigMap { origin: err.into() })?;
+  configure(&mut bpf, tcp_port, udp_port, options.self_exclusion, &bypass).map_err(|err| Error::WriteConfigMap { origin: err.into() })?;
 
   // `bpf` is held on the stack for as long as this task lives, so the programs
   // stay attached: dropping `Ebpf` detaches them and unloads them, which means
@@ -238,39 +499,135 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
   if let Some(ready) = options.ready {
     let _ = ready.send(());
   }
-  tracing::info!(tcp_port, udp_port, cgroup = %cgroup.display(), "ebpf capturing");
-
-  // Both legs run for the life of the process; whichever fails first fails the
-  // backend, and `main` treats that as fatal because capture was requested.
-  tokio::select! {
-    result = tcp::serve(tcp_port, flow.clone(), state, options.upstream_override) => result,
-    result = udp::serve(udp_port, flow, options.upstream_override) => result,
+  tracing::info!(tcp_port, udp_port, cgroup = %cgroup.display(), bypass = ?bypass_debug(&bypass), "ebpf capturing");
+  // The file watcher only exists when a bypass file was named; without one
+  // the backend is two legs as before. Its `CONFIG` rewrites apply to the
+  // live programs with no reattach, so a podman network created mid-run
+  // stops being captured within one poll.
+  let watcher = options.bypass_file.map(|path| BypassWatch {
+    path,
+    explicit: options.bypass,
+    proxy_pid: options.self_exclusion.pid(),
+    proxy_cgroup: own_cgroup_id(),
+    tcp_port,
+    udp_port,
+    netns_cookie: own_netns_cookie(),
+  });
+  // All three legs run for the life of the process; whichever fails first
+  // fails the backend, and `main` treats that as fatal because capture was
+  // requested. The watcher itself never fails — a bad file only means stale
+  // entries until the next poll — so in practice it runs forever.
+  if let Some(watch) = watcher {
+    tokio::select! {
+      result = tcp::serve(tcp_port, flow.clone(), state, options.upstream_override) => result,
+      result = udp::serve(udp_port, flow, options.upstream_override) => result,
+      result = watch.run(&mut bpf, bypass) => result,
+    }
+  } else {
+    tokio::select! {
+      result = tcp::serve(tcp_port, flow.clone(), state, options.upstream_override) => result,
+      result = udp::serve(udp_port, flow, options.upstream_override) => result,
+    }
   }
 }
-
 /// Write the loader-side configuration the programs read at runtime.
-fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfExclusion) -> Result<(), Error> {
+///
+/// `bypass` is the output of [`build_bypass`]: explicit `--ebpf-bypass` CIDRs,
+/// then the bypass file's entries, then the loader's own addresses and
+/// discovered podman ranges.
+fn configure(bpf: &mut Ebpf, tcp_port: u16, udp_port: u16, self_exclusion: SelfExclusion, bypass: &[(Ipv4Addr, u8)]) -> Result<(), Error> {
   let netns_cookie = own_netns_cookie();
   if netns_cookie == 0 {
     tracing::warn!(
       "could not read this process's netns cookie (SO_NETNS_COOKIE): connect4 captures every namespace under the attached cgroup"
     );
   }
-  let config = Config {
-    proxy_pid: self_exclusion.pid(),
-    _pad: [0; 4],
-    proxy_cgroup: own_cgroup_id(),
-    tcp_port: u32::from(tcp_port),
-    udp_port: u32::from(udp_port),
-    netns_cookie,
-  };
-  config.validate()?;
+  let config = Config::from_bypass(self_exclusion.pid(), own_cgroup_id(), tcp_port, udp_port, netns_cookie, bypass)?;
+  write_config_map(bpf, &config)
+}
+
+/// Write one `CONFIG` entry. Split from [`configure`] so the bypass watcher
+/// can rewrite the entry while the programs run: map updates apply to live
+/// programs without reattaching anything.
+fn write_config_map(bpf: &mut Ebpf, config: &Config) -> Result<(), Error> {
   let map = bpf.map_mut("CONFIG").ok_or(Error::MapMissing { name: "CONFIG" })?;
   let mut map: Array<&mut MapData, Config> = map.try_into().map_err(|err| Error::UnexpectedMapType {
     name: "CONFIG",
     origin: err,
   })?;
-  map.set(0, config, 0).map_err(|err| Error::SetConfig { origin: err })
+  map.set(0, *config, 0).map_err(|err| Error::SetConfig { origin: err })
+}
+
+/// Live bypass-file tracking: re-reads the file, rebuilds the merged list,
+/// and rewrites the programs' `CONFIG` entry when it changed — so podman
+/// networks created inside the agent long after hodor starts stop being
+/// captured without anyone restarting hodor.
+///
+/// Only the bypass entries are rebuilt per poll; the pid, cgroup, ports, and
+/// netns cookie are startup facts that cannot change under a running loader.
+struct BypassWatch {
+  /// File the agent rewrites from `podman network inspect`, one CIDR per line.
+  path: PathBuf,
+  /// `--ebpf-bypass` entries: highest precedence, rebuilt around every time.
+  explicit: Vec<(Ipv4Addr, u8)>,
+  /// Everything [`configure`] wrote at startup except the bypass list.
+  proxy_pid: u32,
+  proxy_cgroup: u64,
+  tcp_port: u16,
+  udp_port: u16,
+  netns_cookie: u64,
+}
+
+impl BypassWatch {
+  /// Poll the file forever, applying its entries on change. Unchanged bytes
+  /// are not even parsed, so a steady file costs one small read per [`BYPASS_POLL`].
+  ///
+  /// Every failure degrades to "try again next poll" with a log, never to a
+  /// backend exit: a missing or malformed file means stale bypass entries,
+  /// not broken capture, and the next poll retries. `from_bypass` cannot fail
+  /// here — the explicit list passed [`configure`] at startup, and file plus
+  /// discovered entries are capped by [`build_bypass`] — so its error arm
+  /// only guards against future construction changes.
+  async fn run(&self, bpf: &mut Ebpf, initial: Vec<(Ipv4Addr, u8)>) -> Result<(), Error> {
+    let mut last = initial;
+    let mut last_raw: Option<String> = None;
+    loop {
+      tokio::time::sleep(BYPASS_POLL).await;
+      let raw = match std::fs::read_to_string(&self.path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => {
+          tracing::debug!(path = %self.path.display(), %err, "bypass file unreadable: keeping the applied list");
+          continue;
+        }
+      };
+      if last_raw.as_deref() == Some(raw.as_str()) {
+        continue;
+      }
+      last_raw = Some(raw.clone());
+      let merged = build_bypass(self.explicit.clone(), parse_bypass_file(&raw, &self.path));
+      if merged == last {
+        continue;
+      }
+      match Config::from_bypass(
+        self.proxy_pid,
+        self.proxy_cgroup,
+        self.tcp_port,
+        self.udp_port,
+        self.netns_cookie,
+        &merged,
+      ) {
+        Ok(config) => match write_config_map(bpf, &config) {
+          Ok(()) => {
+            tracing::info!(path = %self.path.display(), bypass = ?bypass_debug(&merged), "ebpf bypass list updated");
+            last = merged;
+          }
+          Err(err) => tracing::warn!(path = %self.path.display(), %err, "bypass update failed: retrying on the next poll"),
+        },
+        Err(err) => tracing::warn!(path = %self.path.display(), %err, "bypass update refused: retrying on the next poll"),
+      }
+    }
+  }
 }
 
 /// Configuration map layout; must match `hodor-ebpf-programs::Config`.
@@ -295,18 +652,59 @@ pub(crate) struct Config {
   /// connects from other namespaces — the containers the agent spawns — are
   /// then still rewritten, as before this guard existed.
   pub netns_cookie: u64,
+  /// How many of `bypass_nets`/`bypass_lens` are valid.
+  pub bypass_count: u32,
+  /// Bypass networks in host byte order, masked to their prefix length.
+  pub bypass_nets: [u32; MAX_BYPASS],
+  /// One prefix length per network above, `1..=32`.
+  pub bypass_lens: [u8; MAX_BYPASS],
+  /// Explicit tail padding: the layout is an ABI, no byte left to the compiler.
+  pub _pad2: [u8; 4],
 }
 
 impl Config {
-  /// Reject a configuration the programs could not use meaningfully.
+  /// Build a validated [`Config`], masking each bypass network to its prefix.
   ///
-  /// `proxy_pid` is not checked: [`SelfExclusion`] is the only way to set it,
-  /// and its production variant is this process's PID, which is never zero.
-  fn validate(self) -> Result<(), Error> {
-    if self.tcp_port == 0 || self.udp_port == 0 {
+  /// # Errors
+  ///
+  /// Returns [`Error::ListenPortsZero`] for a zero listen port and
+  /// [`Error::InvalidBypassPrefix`] for a prefix outside `1..=32` or more
+  /// entries than [`MAX_BYPASS`].
+  fn from_bypass(
+    proxy_pid: u32,
+    proxy_cgroup: u64,
+    tcp_port: u16,
+    udp_port: u16,
+    netns_cookie: u64,
+    bypass: &[(Ipv4Addr, u8)],
+  ) -> Result<Self, Error> {
+    if tcp_port == 0 || udp_port == 0 {
       return Err(Error::ListenPortsZero);
     }
-    Ok(())
+    if bypass.len() > MAX_BYPASS {
+      return Err(Error::TooManyBypasses { count: bypass.len() });
+    }
+    let mut nets = [0u32; MAX_BYPASS];
+    let mut lens = [0u8; MAX_BYPASS];
+    for (i, (addr, len)) in bypass.iter().enumerate() {
+      if *len == 0 || *len > 32 {
+        return Err(Error::InvalidBypassPrefix { prefix: *len });
+      }
+      nets[i] = u32::from(*addr) & mask_prefix(*len);
+      lens[i] = *len;
+    }
+    Ok(Self {
+      proxy_pid,
+      _pad: [0; 4],
+      proxy_cgroup,
+      tcp_port: u32::from(tcp_port),
+      udp_port: u32::from(udp_port),
+      netns_cookie,
+      bypass_count: bypass.len() as u32,
+      bypass_nets: nets,
+      bypass_lens: lens,
+      _pad2: [0; 4],
+    })
   }
 }
 
@@ -585,8 +983,7 @@ mod tests {
     assert_eq!(offset_of!(OrigDst, port), 4);
     assert_eq!(offset_of!(OrigDst, proto), 8);
     assert_eq!(offset_of!(OrigDst, _pad), 9);
-
-    assert_eq!(size_of::<Config>(), 32);
+    assert_eq!(size_of::<Config>(), 80);
     assert_eq!(align_of::<Config>(), 8);
     assert_eq!(offset_of!(Config, proxy_pid), 0);
     assert_eq!(offset_of!(Config, _pad), 4);
@@ -594,24 +991,127 @@ mod tests {
     assert_eq!(offset_of!(Config, tcp_port), 16);
     assert_eq!(offset_of!(Config, udp_port), 20);
     assert_eq!(offset_of!(Config, netns_cookie), 24);
+    assert_eq!(offset_of!(Config, bypass_count), 32);
+    assert_eq!(offset_of!(Config, bypass_nets), 36);
+    assert_eq!(offset_of!(Config, bypass_lens), 68);
+    assert_eq!(offset_of!(Config, _pad2), 76);
   }
 
-  /// A configuration the programs cannot act on must be refused before it is
-  /// written: a zero port would have `connect4` rewrite every destination to
-  /// port 0, where nothing is listening.
   #[test]
   fn config_validation_rejects_zero_ports() {
-    let base = Config {
-      proxy_pid: SelfExclusion::Proxy.pid(),
-      _pad: [0; 4],
-      proxy_cgroup: own_cgroup_id(),
-      tcp_port: u32::from(TCP_LISTEN_PORT),
-      udp_port: u32::from(UDP_LISTEN_PORT),
-      netns_cookie: own_netns_cookie(),
-    };
-    base.validate().expect("a fully populated config is valid");
-    assert!(Config { tcp_port: 0, ..base }.validate().is_err());
-    assert!(Config { udp_port: 0, ..base }.validate().is_err());
+    let pid = SelfExclusion::Proxy.pid();
+    let cgroup = own_cgroup_id();
+    let cookie = own_netns_cookie();
+    Config::from_bypass(pid, cgroup, TCP_LISTEN_PORT, UDP_LISTEN_PORT, cookie, &[]).expect("a fully populated config builds");
+    Config::from_bypass(pid, cgroup, 0, UDP_LISTEN_PORT, cookie, &[]).unwrap_err();
+    Config::from_bypass(pid, cgroup, TCP_LISTEN_PORT, 0, cookie, &[]).unwrap_err();
+  }
+
+  /// Bypass networks are masked to their prefix on the way in: the kernel
+  /// compares top bits, so a host address in `--ebpf-bypass` must still match
+  /// its range. Prefixes outside `1..=32` and overlong lists are refused
+  /// rather than written half-meaningfully.
+  #[test]
+  fn bypass_entries_are_masked_and_validated() {
+    let config = Config::from_bypass(
+      1,
+      2,
+      TCP_LISTEN_PORT,
+      UDP_LISTEN_PORT,
+      3,
+      &[(Ipv4Addr::new(10, 89, 0, 4), 16), (Ipv4Addr::new(172, 21, 0, 2), 32)],
+    )
+    .expect("two valid bypasses build");
+    assert_eq!(config.bypass_count, 2);
+    assert_eq!(config.bypass_nets[0], u32::from(Ipv4Addr::new(10, 89, 0, 0)));
+    assert_eq!(config.bypass_lens[0], 16);
+    assert_eq!(config.bypass_nets[1], u32::from(Ipv4Addr::new(172, 21, 0, 2)));
+    assert_eq!(config.bypass_lens[1], 32);
+
+    for bad in [(Ipv4Addr::new(10, 0, 0, 0), 0), (Ipv4Addr::new(10, 0, 0, 0), 33)] {
+      Config::from_bypass(1, 2, TCP_LISTEN_PORT, UDP_LISTEN_PORT, 3, &[bad]).unwrap_err();
+    }
+    let too_many = vec![(Ipv4Addr::new(10, 0, 0, 0), 8); MAX_BYPASS + 1];
+    Config::from_bypass(1, 2, TCP_LISTEN_PORT, UDP_LISTEN_PORT, 3, &too_many).unwrap_err();
+  }
+
+  /// `--ebpf-bypass` parsing accepts host addresses with a prefix and rejects
+  /// everything else — most importantly prefix `0`, which would bypass all
+  /// capture.
+  #[test]
+  fn bypass_cidr_parsing_accepts_ranges_and_rejects_nonsense() {
+    assert_eq!(parse_bypass_cidr("10.89.0.0/16"), Ok((Ipv4Addr::new(10, 89, 0, 0), 16)));
+    assert_eq!(parse_bypass_cidr("172.21.0.2/32"), Ok((Ipv4Addr::new(172, 21, 0, 2), 32)));
+    for bad in ["10.89.0.0", "10.89.0.0/0", "10.89.0.0/33", "10.89.0.0/abc", "999.0.0.0/16", ""] {
+      assert!(parse_bypass_cidr(bad).is_err(), "`{bad}` must not parse");
+    }
+  }
+
+  /// The podman scan reads `subnet` values out of network definition files
+  /// and skips what it cannot parse, so one odd file never hides the rest.
+  #[test]
+  fn podman_subnets_are_scanned_from_definition_files() {
+    let content = r#"{"subnets": [{"subnet": "10.89.0.0/24", "gateway": "10.89.0.1"},
+      {"subnet": "fd00::/64", "gateway": "fd00::1"}, {"subnet": "nonsense"}]}"#;
+    assert_eq!(podman_subnets_in(content), vec![(Ipv4Addr::new(10, 89, 0, 0), 24)]);
+    assert_eq!(podman_subnets_in("{}"), [] as [(std::net::Ipv4Addr, u8); 0]);
+  }
+
+  /// The bypass file holds one CIDR per line: comments and blanks are
+  /// ignored, and one bad line never hides the rest.
+  #[test]
+  fn bypass_file_parsing_ignores_comments_and_bad_lines() {
+    let path = Path::new("bypass");
+    let content = "# podman networks, rewritten by the agent entrypoint\n\n10.89.0.0/16\n  172.21.0.2/32  \nnope\n10.0.0.0/0\n";
+    assert_eq!(
+      parse_bypass_file(content, path),
+      vec![(Ipv4Addr::new(10, 89, 0, 0), 16), (Ipv4Addr::new(172, 21, 0, 2), 32)]
+    );
+    assert_eq!(parse_bypass_file("", path), [] as [(std::net::Ipv4Addr, u8); 0]);
+    assert_eq!(parse_bypass_file("# only a comment\n", path), [] as [(std::net::Ipv4Addr, u8); 0]);
+  }
+
+  /// Assembling the bypass keeps every explicit entry no matter what the
+  /// machine contributes: file entries and locals/podman ranges only fill
+  /// the room the explicit list leaves, so an override can never be pushed
+  /// out by a host with many interfaces. The assertions avoid naming machine
+  /// state, which differs per host — they pin the explicit and file entries'
+  /// survival, not the automatic tail.
+  #[test]
+  fn bypass_assembly_keeps_explicit_entries_within_capacity() {
+    let explicit = vec![(Ipv4Addr::new(198, 51, 100, 7), 32), (Ipv4Addr::new(198, 51, 100, 7), 32)];
+    let file = vec![(Ipv4Addr::new(10, 89, 0, 0), 16), (Ipv4Addr::new(198, 51, 100, 7), 32)];
+    let assembled = build_bypass(explicit, file);
+    assert!(
+      assembled.contains(&(Ipv4Addr::new(198, 51, 100, 7), 32)),
+      "explicit entries survive any machine state"
+    );
+    assert!(
+      assembled.contains(&(Ipv4Addr::new(10, 89, 0, 0), 16)),
+      "file entries survive any machine state"
+    );
+    assert_eq!(
+      assembled
+        .iter()
+        .filter(|entry| **entry == (Ipv4Addr::new(198, 51, 100, 7), 32))
+        .count(),
+      1,
+      "duplicates collapse to one entry, including across tiers"
+    );
+    assert!(assembled.len() <= MAX_BYPASS, "lower tiers fill only the room explicit leaves");
+
+    // More explicit entries than the programs carry stay whole here and fail
+    // loudly at `from_bypass`, instead of silently dropping an override.
+    let many: Vec<(Ipv4Addr, u8)> = (0..10u8).map(|i| (Ipv4Addr::new(198, 51, 100, i), 32)).collect();
+    let kept = build_bypass(many.clone(), Vec::new());
+    assert!(
+      many.iter().all(|entry| kept.contains(entry)),
+      "no explicit entry is dropped by assembly"
+    );
+    assert!(
+      Config::from_bypass(1, 2, TCP_LISTEN_PORT, UDP_LISTEN_PORT, 3, &kept).is_err(),
+      "the overflow surfaces as an error, not a silent cut"
+    );
   }
 
   /// Production must always exclude its own process: without it, hodor's

@@ -41,9 +41,31 @@ if [ "$(id -u)" = "0" ]; then
 elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
   sudo -n update-ca-certificates >/dev/null 2>&1 || true
 else
-  echo "hodor: not root and no passwordless sudo, so the CA is not in the system store;" >&2
   echo "hodor: run the agent as root or bake the certificate into the image" >&2
   echo "hodor: https://github.com/casualjim/hodor/blob/main/docs/user/how-to/trust-the-ca.md" >&2
+fi
+# Publish this container's podman subnets for hodor's eBPF bypass list.
+# Podman networks are created here long after hodor starts, so the loader
+# cannot know them up front: this loop rewrites the shared bypass file from
+# `podman network inspect` and hodor reloads it live. Only when the stack
+# wires the file (HODOR_EBPF_BYPASS_FILE); without podman the subshell exits
+# quietly, and a failing podman keeps the previous file. The temp-file plus
+# rename means hodor never reads a half-written list.
+if [ -n "${HODOR_EBPF_BYPASS_FILE:-}" ]; then
+  (
+    set +e
+    while true; do
+      if names=$(podman network ls --format '{{.Name}}' 2>/dev/null); then
+        if [ -z "$names" ]; then
+          : > "${HODOR_EBPF_BYPASS_FILE}.tmp" && mv "${HODOR_EBPF_BYPASS_FILE}.tmp" "$HODOR_EBPF_BYPASS_FILE"
+        elif out=$(printf '%s\n' "$names" | xargs -r podman network inspect --format '{{range .Subnets}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null); then
+          printf '%s\n' "$out" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' | sort -u > "${HODOR_EBPF_BYPASS_FILE}.tmp" \
+            && mv "${HODOR_EBPF_BYPASS_FILE}.tmp" "$HODOR_EBPF_BYPASS_FILE"
+        fi
+      fi
+      sleep 10
+    done
+  ) >/dev/null 2>&1 &
 fi
 # Hand over to the image's own init when there is one, so the container's real
 # startup (service supervisors, sockets, whatever the image ships) still runs:
@@ -133,6 +155,27 @@ pub(crate) fn report_created(files: &[(PathBuf, bool)]) {
       println!("wrote {}", path.display());
     }
   }
+}
+
+/// Skeleton content of a fresh bypass file: comments only, so hodor starts
+/// with no runtime entries and the agent entrypoint's first rewrite replaces
+/// the whole file atomically.
+const BYPASS_FILE_SKELETON: &str = "# Hodor eBPF bypass CIDRs, one per line.\n# The agent entrypoint rewrites this file from `podman network inspect`;\n# hodor reloads it live. Blank lines and `#` comments are ignored.\n";
+
+/// Create the runtime bypass file when missing; never overwrite it, since
+/// the agent rewrites it at runtime. Returns whether it was created, so
+/// callers can report it like the other support files.
+async fn ensure_bypass_file(path: &Path) -> Result<bool, Error> {
+  if path.exists() {
+    return Ok(false);
+  }
+  tokio::fs::write(path, BYPASS_FILE_SKELETON)
+    .await
+    .map_err(|source| Error::WriteFile {
+      path: path.to_path_buf(),
+      source,
+    })?;
+  Ok(true)
 }
 
 /// The capture backend the generated stack runs: `--backend` when given,
@@ -386,6 +429,13 @@ async fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bo
     path: state_ws.clone(),
     source,
   })?;
+  // The runtime bypass file the ebpf stack mounts must exist before compose
+  // starts: docker creates a directory at a missing file mount, which then
+  // breaks both the agent writer and hodor's reader. Created once, never
+  // overwritten — the agent owns its contents at runtime.
+  if backend == ProxyBackend::Ebpf && ensure_bypass_file(&state_ws.join("ebpf-bypass")).await? {
+    println!("wrote {}", state_ws.join("ebpf-bypass").display());
+  }
   let workspace = workspace_config(root)?;
   let registry = generation_registry(Some(root))?;
   let fnox = open_fnox()?;
@@ -584,6 +634,18 @@ fn record_build_digest(root: &Path, was_built: bool) -> Result<(), Error> {
 /// Start the layered project, making sure what it mounts exists first.
 async fn up_workspace(root: &Path, is_forced: bool) -> Result<(), Error> {
   report_created(&prepare_support_files(root)?);
+  // The bypass file an ebpf stack mounts must exist before compose starts,
+  // even when generation is skipped (a plain `up`): docker creates a
+  // directory at a missing file mount, which then breaks both the agent
+  // writer and hodor's reader. The generated backend decides, since `up`
+  // takes no backend flag.
+  let backend = tokio::fs::read_to_string(workspace_state_dir(root).join("compose.yml"))
+    .await
+    .ok()
+    .and_then(|body| generated_backend(&body));
+  if backend == Some(ProxyBackend::Ebpf) && ensure_bypass_file(&workspace_state_dir(root).join("ebpf-bypass")).await? {
+    println!("wrote {}", workspace_state_dir(root).join("ebpf-bypass").display());
+  }
   let will_build = should_build(root, is_forced)?;
   let mut command = compose_command(root)?;
   command.args(up_argv(will_build));

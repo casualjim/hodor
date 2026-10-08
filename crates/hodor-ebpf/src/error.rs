@@ -69,6 +69,20 @@ pub enum Error {
   /// programs would redirect into a closed socket.
   #[error("refusing to write an unusable CONFIG: listen ports must be non-zero")]
   ListenPortsZero,
+  /// The configuration refuses to write: a bypass prefix outside `1..=32`
+  /// would bypass everything (`0`) or match nothing, so it states a mistake.
+  #[error("refusing to write an unusable CONFIG: bypass prefix length must be 1..=32, got {prefix}")]
+  InvalidBypassPrefix {
+    /// Prefix length that was rejected.
+    prefix: u8,
+  },
+  /// The configuration refuses to write: more bypass CIDRs than the programs
+  /// carry (`MAX_BYPASS`), so one would be silently dropped.
+  #[error("refusing to write an unusable CONFIG: {count} bypass CIDRs exceed the programs' capacity")]
+  TooManyBypasses {
+    /// Bypass entries that were supplied.
+    count: usize,
+  },
   /// A map is missing from the eBPF object.
   #[error("{name} map missing from the eBPF object")]
   MapMissing {

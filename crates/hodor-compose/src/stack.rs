@@ -49,10 +49,14 @@ use crate::talos;
 /// layer at `/root/.config/hodor/config.toml` instead of the `HODOR_CONFIG`
 /// env: discovery derives `rules.d` from the config file's directory, so the
 /// env hid the host's global rules.d and the proxy served without its hosts.
-/// Shape 9 answers git credential lookups with one generated helper script
 /// instead of inline snippets, and drops host `credential.*.helper` entries
-/// naming binaries absent from the agent.
-pub(crate) const STACK_SHAPE: u32 = 9;
+/// naming binaries absent from the agent. Shape 10 restarts the hodor service
+/// unless stopped: capture dies with that process, so a crash silently ends
+/// all capture until the next `up` without it. Shape 11 shares the runtime
+/// bypass file between the services and publishes it in both environments:
+/// podman networks appear inside the agent after hodor starts, so only a
+/// file the agent rewrites and hodor reloads live can bypass them.
+pub(crate) const STACK_SHAPE: u32 = 11;
 
 /// The shape revision a generated stack carries, from its `# stack shape:`
 /// marker line; `None` for a file without a readable one, which is a stack
@@ -256,9 +260,26 @@ pub(crate) fn guest_identity_mounts(
 /// Fixed port the generated stack renders as `HODOR_LISTEN` instead of the
 /// `127.0.0.1:8080` default: the explicit proxy is loopback-bound in the
 /// shared netns, and 8080 is the port dev servers default to — squatted on
-/// by the proxy, an agent server could never bind its loopback listener and
-/// the `fwd` sidecar would have nothing to expose.
 pub(crate) const EXPLICIT_LISTEN: &str = "127.0.0.1:8099";
+
+/// Container path both services mount the runtime bypass file at: the agent
+/// entrypoint rewrites it from `podman network inspect`, and hodor's eBPF
+/// loader reloads it live into the programs' bypass list. The host side is
+/// `<workspace-state>/ebpf-bypass`, created at generation and never
+/// overwritten — the agent owns its contents at runtime.
+pub(crate) const BYPASS_CONTAINER_PATH: &str = "/hodor/ebpf-bypass";
+
+/// The shared bypass-file mount for ebpf stacks, rendered into both
+/// services: the agent entrypoint writes it, hodor only reads, and one
+/// read-write entry serves both because the `mounts` vec renders as-is in
+/// each service.
+pub(crate) fn bypass_mount(root: &Path) -> Mount {
+  Mount {
+    host: workspace_state_dir(root).join("ebpf-bypass"),
+    container: PathBuf::from(BYPASS_CONTAINER_PATH),
+    ro: false,
+  }
+}
 
 /// Generate the stack for a workspace directory: decoys for every
 /// fnox-declared name the registry knows (same selection as `hodor rules`)
@@ -502,6 +523,14 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
     .map(|build| resolve_build(root, build, host_home))
     .transpose()?;
   let agent_image = agent_image(&project, config.workspace.image.as_deref(), build_paths.is_some())?;
+  // The runtime bypass file both services share: the agent entrypoint
+  // rewrites it from `podman network inspect`, hodor reloads it live into
+  // the programs' bypass list. Ebpf only — other backends have no bypass
+  // list to feed.
+  let mut mounts = inputs.mounts;
+  if backend == ProxyBackend::Ebpf {
+    mounts.push(bypass_mount(root));
+  }
   Ok(
     Stack {
       backend,
@@ -517,7 +546,7 @@ pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, hodor_version: 
         image: &agent_image,
         build: build_paths.as_ref().map(|(context, dockerfile)| AgentBuild { context, dockerfile }),
       },
-      mounts: inputs.mounts,
+      mounts,
       tool_mounts,
       fnox,
       guest,
@@ -1360,11 +1389,15 @@ impl Stack<'_> {
        \x20 hodor:\n\
        \x20   image: ghcr.io/casualjim/hodor:{version}\n\
        \x20   working_dir: \"{root}\"\n\
-       \x20   command: {serve}\n\
+      \x20   command: {serve}\n\
        {service_extra}\
+      \x20   # Capture dies with this process: the eBPF attachments are fd-held
+      \x20   # and the listeners live in it, so a crash would silently end all
+      \x20   # capture until the next `up`. Restart instead, loudly — the
+      \x20   # restart count in `compose ps` is what makes flapping visible.
+      \x20   restart: unless-stopped\n\
       \x20   environment:\n\
       \x20     RUST_LOG: info\n\
-      \x20     HODOR_CA_FILE: /certs/ca.pem\n\
        \x20     # 8080 must stay free on loopback: agent dev servers default\n\
        \x20     # to it, and the explicit proxy's default bind would squat on\n\
        \x20     # 127.0.0.1:8080, leaving the fwd sidecar nothing to expose.\n\
@@ -1375,6 +1408,13 @@ impl Stack<'_> {
       version = self.hodor_version,
       shape = STACK_SHAPE
     );
+    if self.backend == ProxyBackend::Ebpf {
+      // The runtime bypass file, rewritten by the agent entrypoint from
+      // `podman network inspect` and reloaded live by the loader: podman
+      // networks are created inside the agent after hodor starts, so no
+      // startup flag can name them.
+      let _ = writeln!(out, "      HODOR_EBPF_BYPASS_FILE: {BYPASS_CONTAINER_PATH}");
+    }
     out.push_str(
       "    cap_add:\n\
        \x20     - NET_ADMIN\n",
@@ -1508,6 +1548,11 @@ impl Stack<'_> {
   /// passthrough interpolation, and every mount layer with the entrypoint,
   /// CA, and inner container storage last.
   fn agent_service_tail(&self, out: &mut String) {
+    if self.backend == ProxyBackend::Ebpf {
+      // Where the entrypoint publishes podman subnets for hodor's bypass
+      // list; the entrypoint only activates when this is set.
+      let _ = writeln!(out, "      HODOR_EBPF_BYPASS_FILE: {BYPASS_CONTAINER_PATH}");
+    }
     if let Some(init) = &self.init {
       let _ = writeln!(out, "      HODOR_INIT: \"{init}\"");
     }

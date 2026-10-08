@@ -60,7 +60,28 @@ pub struct Config {
   /// Zero means unknown, disabling the guard: the pid and cgroup checks
   /// then carry exclusion alone, as before this field existed.
   pub netns_cookie: u64,
+  /// How many of `bypass_nets`/`bypass_lens` are valid, `0..=MAX_BYPASS`.
+  /// Destinations inside one of those CIDRs are never rewritten: they fail
+  /// or succeed on their own routing instead of fake-succeeding into the
+  /// listener. The loader fills this with its own non-loopback addresses
+  /// (as `/32`s) plus the operator's podman-range overrides, so local
+  /// relays and nested-namespace addresses stop transiting the proxy.
+  pub bypass_count: u32,
+  /// Bypass networks in host byte order (`u32::from(Ipv4Addr)`), masked to
+  /// their prefix length by the loader. Compared against the destination
+  /// after `u32::from_be`, which undoes the kernel's address encoding.
+  pub bypass_nets: [u32; MAX_BYPASS],
+  /// Prefix lengths, `1..=32`, one per network above.
+  pub bypass_lens: [u8; MAX_BYPASS],
+  /// Explicit tail padding: the layout is an ABI with the userspace half.
+  pub _pad2: [u8; 4],
 }
+
+/// How many bypass CIDRs `Config` carries. Eight covers the loader's own
+/// addresses (usually one) plus a handful of podman ranges and manual
+/// overrides; a bounded array keeps the match loop unrollable for the
+/// verifier, where a variable-length map would cost a second lookup path.
+pub const MAX_BYPASS: usize = 8;
 
 /// Original destination recorded before the rewrite. Both fields keep the
 /// kernel's own encodings — `user_ip4` and `user_port` are network byte order —
@@ -172,6 +193,46 @@ fn is_loopback(addr: u32) -> bool {
   u32::from_be(addr) & 0xFF00_0000 == 0x7F00_0000
 }
 
+/// True when the destination is in one of the loader's bypass CIDRs, in the
+/// kernel's address encoding.
+///
+/// The loader stores networks masked to their prefix in host order, so the
+/// destination is decoded with `u32::from_be` first and the top `len` bits
+/// compared. A zero `len` matches everything and a `len` past 32 matches
+/// nothing — the loader never writes either (it rejects prefix 0), so those
+/// arms only guard against a stale or hand-written map.
+#[inline(always)]
+fn is_bypassed(addr: u32) -> bool {
+  let Some(config) = CONFIG.get(0) else {
+    return false;
+  };
+  let dst = u32::from_be(addr);
+  let count = if config.bypass_count as usize > MAX_BYPASS {
+    MAX_BYPASS
+  } else {
+    config.bypass_count as usize
+  };
+  let mut i = 0;
+  while i < count {
+    let len = config.bypass_lens[i];
+    if len == 0 {
+      return true;
+    }
+    if len <= 32 {
+      let net = config.bypass_nets[i];
+      if len >= 32 {
+        if dst == net {
+          return true;
+        }
+      } else if dst.wrapping_shr(32 - u32::from(len)) == net.wrapping_shr(32 - u32::from(len)) {
+        return true;
+      }
+    }
+    i += 1;
+  }
+  false
+}
+
 #[inline(always)]
 fn tcp_port() -> Option<u32> {
   CONFIG.get(0).map(|config| config.tcp_port)
@@ -197,6 +258,12 @@ fn redirect(ctx: &SockAddrContext, listener_port: u32) -> i32 {
   // Loopback already means either an explicit local service or a previous
   // rewrite; never redirect those, or hodor would capture its own listeners.
   if is_loopback(ip) {
+    return 1;
+  }
+  // Bypassed destinations — the loader's own addresses, podman ranges, manual
+  // overrides — keep their own routing: rewriting an address this netns cannot
+  // reach would fake a handshake and then hang until the dial budget runs out.
+  if is_bypassed(ip) {
     return 1;
   }
   // SAFETY: `ctx.as_ptr()` is the context the kernel supplied to this hook.

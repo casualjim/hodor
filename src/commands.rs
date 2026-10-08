@@ -5,6 +5,8 @@
 //! `hodor-compose` instead; [`serve`](crate::serve) keeps its backend
 //! machinery in the crate root and [`ServeArgs::run`] delegates to it.
 
+#[cfg(target_os = "linux")]
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use crate::{ca_path, fwd, generation_registry, serve};
@@ -57,6 +59,20 @@ pub struct ServeArgs {
   /// and the recorded proxy PID is what keeps its own sockets out of the loop.
   #[arg(long, env = "HODOR_EBPF_CGROUP")]
   pub ebpf_cgroup: Option<PathBuf>,
+  /// File with runtime bypass CIDRs for the eBPF backend, one per line,
+  /// re-read while capture runs. Podman networks are created inside the
+  /// agent long after hodor starts, so the generated stack has the agent
+  /// rewrite this file from `podman network inspect` and hodor applies it
+  /// live. CLI/env only, like the other backend switches.
+  #[arg(long, env = "HODOR_EBPF_BYPASS_FILE")]
+  pub ebpf_bypass_file: Option<PathBuf>,
+  /// Extra CIDRs the eBPF backend never captures (`10.89.0.0/16`), from the
+  /// operator: podman ranges inside the agent, usually. Repeat or
+  /// comma-separate; the loader always adds its own non-loopback addresses on
+  /// top. CLI/env only, like the other backend switches — never a file key.
+  #[cfg(target_os = "linux")]
+  #[arg(long = "ebpf-bypass", env = "HODOR_EBPF_BYPASS", value_delimiter = ',', value_parser = hodor_ebpf::parse_bypass_cidr)]
+  pub ebpf_bypass: Vec<(Ipv4Addr, u8)>,
 }
 
 impl CliCommand for ServeArgs {

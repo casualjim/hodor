@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::error::Error;
+use crate::expose::prune_workspace;
 use crate::paths::{expand, translate};
 use crate::stack::{
   STACK_SHAPE, current_uid, derivable_envs, generate_stack, generation_registry, open_fnox, stack_shape_in, uncovered_names,
-  uncovered_warning, workspace_config, workspace_file, workspace_state_dir,
+  uncovered_warning, workspace_config, workspace_file, workspace_slug, workspace_state_dir,
 };
 use clap::Args;
 use dirs::home_dir;
@@ -194,7 +195,7 @@ pub(crate) fn resolve_backend(backend: Option<ProxyBackend>) -> Result<ProxyBack
 }
 
 /// Canonicalize the workspace root the commands operate on.
-fn resolve_root(workspace: &Path) -> Result<PathBuf, Error> {
+pub(crate) fn resolve_root(workspace: &Path) -> Result<PathBuf, Error> {
   workspace.canonicalize().map_err(|source| Error::ResolveWorkspace {
     path: workspace.to_path_buf(),
     source,
@@ -422,7 +423,7 @@ pub(crate) fn generated_backend(compose: &str) -> Option<ProxyBackend> {
 /// Generate the workspace stack when it is absent, and regenerate it when the
 /// workspace config changed since it was generated; a stack whose config is
 /// unchanged is left alone, so hand edits survive until then.
-async fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool, hodor_version: &str) -> Result<(), Error> {
+pub(crate) async fn init_workspace(root: &Path, backend: ProxyBackend, explicit_backend: bool, hodor_version: &str) -> Result<(), Error> {
   let state_ws = workspace_state_dir(root);
   let ws_compose = state_ws.join("compose.yml");
   tokio::fs::create_dir_all(&state_ws).await.map_err(|source| Error::CreateDir {
@@ -494,7 +495,7 @@ fn compose_layers(root: &Path) -> Vec<PathBuf> {
 }
 
 /// A `docker compose` command over those layers.
-fn compose_command(root: &Path) -> Result<Command, Error> {
+pub(crate) fn compose_command(root: &Path) -> Result<Command, Error> {
   let layers = compose_layers(root);
   if layers.is_empty() {
     return Err(Error::NoComposeLayers { root: root.to_path_buf() });
@@ -632,7 +633,7 @@ fn record_build_digest(root: &Path, was_built: bool) -> Result<(), Error> {
 }
 
 /// Start the layered project, making sure what it mounts exists first.
-async fn up_workspace(root: &Path, is_forced: bool) -> Result<(), Error> {
+pub(crate) async fn up_workspace(root: &Path, is_forced: bool) -> Result<(), Error> {
   report_created(&prepare_support_files(root)?);
   // The bypass file an ebpf stack mounts must exist before compose starts,
   // even when generation is skipped (a plain `up`): docker creates a
@@ -799,7 +800,7 @@ pub struct AgentArgs {
 }
 
 /// The workspace a command names, or the current directory.
-fn workspace_arg(workspace: Option<&Path>) -> PathBuf {
+pub(crate) fn workspace_arg(workspace: Option<&Path>) -> PathBuf {
   workspace.unwrap_or(Path::new(".")).to_path_buf()
 }
 
@@ -905,7 +906,17 @@ impl CliCommand for DownArgs {
   /// Returns an error when the workspace cannot be resolved or when the compose
   /// command fails.
   async fn run(self, _cli: &Cli, _hodor_version: &str) -> Result<(), Self::Error> {
-    down_workspace(&resolve_root(&workspace_arg(self.workspace.as_deref()))?).await
+    let root = resolve_root(&workspace_arg(self.workspace.as_deref()))?;
+    down_workspace(&root).await?;
+    // Stopped publishings free their host ports: dropping the claims here
+    // keeps the registry from pinning ports no stack holds. A registry
+    // failure only warns — the stack is already down.
+    match prune_workspace(&workspace_slug(&root)) {
+      Ok(true) => println!("released expose claims for {}", root.display()),
+      Ok(false) => {}
+      Err(err) => tracing::warn!(%err, "could not release expose claims"),
+    }
+    Ok(())
   }
 }
 

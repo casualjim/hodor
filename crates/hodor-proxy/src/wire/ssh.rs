@@ -281,7 +281,6 @@ impl Guest {
 }
 
 async fn forward_guest_message(upstream: &ChannelWriteHalf<ClientMsg>, message: ChannelMsg) -> bool {
-  // (the channel closed, the send failed): either ends the pump.
   let (closed, failed) = match message {
     ChannelMsg::Exec { want_reply, command } => (false, upstream.exec(want_reply, command).await.is_err()),
     ChannelMsg::RequestShell { want_reply } => (false, upstream.request_shell(want_reply).await.is_err()),
@@ -612,8 +611,7 @@ mod tests {
   /// A real openssh client, not a russh mirror: it probes with an unsigned
   /// key offer before signing, negotiates current KEX, and verifies host
   /// keys exactly like a production agent. The russh-in-process tests above
-  /// cannot catch offer-phase incompatibilities — this one exists because
-  /// the container demo found one they all missed.
+  /// cannot catch offer-phase incompatibilities.
   #[test]
   fn openssh_client_exec_reaches_upstream_as_the_real_key() {
     let ssh = std::env::var_os("HODOR_TEST_SSH_BIN")

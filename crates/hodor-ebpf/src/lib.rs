@@ -119,9 +119,7 @@ const BYPASS_POLL: Duration = Duration::from_secs(5);
 ///
 /// The programs compare this against `bpf_get_current_pid_tgid() >> 32` and
 /// let a match through unredirected. Production has exactly one state, so a
-/// load that excludes nothing cannot be asked for by accident — an earlier
-/// `Option<u32>` spelled "skip nothing" as `Some(0)`, which then tripped a
-/// validation rule that separately rejected zero.
+/// load that excludes nothing cannot be asked for by accident.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum SelfExclusion {
   /// Skip this process. What every production run uses.
@@ -655,7 +653,7 @@ pub(crate) struct Config {
   pub udp_port: u32,
   /// Netns cookie of this process's network namespace, or 0 when unknown:
   /// connects from other namespaces — the containers the agent spawns — are
-  /// then still rewritten, as before this guard existed.
+  /// then still rewritten.
   pub netns_cookie: u64,
   /// How many of `bypass_nets`/`bypass_lens` are valid.
   pub bypass_count: u32,

@@ -8,6 +8,16 @@ One command drops you into that environment. `hodor agent` starts the stack and 
 
 Underneath sits a grant-scoped proxy. A workload can also point its proxy settings at hodor, or hodor can capture its traffic with `--proxy-backend` (`tproxy`, `tun`, or `ebpf`). On a grant match hodor terminates TLS with a per-domain leaf signed by its own CA and swaps the decoy for the real value in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. On the response it swaps real values back to decoys. Every other connection is spliced byte for byte with the real upstream certificate untouched.
 
+## Protocols
+
+| Protocol | Description |
+| --- | --- |
+| HTTP/1 | Headers, basic auth, and bodies rewritten both directions behind a per-domain TLS leaf. |
+| HTTP/2 | Same rewriting over HPACK heads and DATA frames, picked by ALPN. |
+| SSH | Terminates on decoy keys, presents the real identity upstream, never opens forwarding. |
+| PostgreSQL | Negotiation answered here, startup identity swapped, steady state equal-length relay. |
+| Raw TCP | Equal-length byte swap that never reframes; everything else splices untouched. |
+
 ## Install
 
 **From a release** (Linux, amd64 and arm64), with the installer script:

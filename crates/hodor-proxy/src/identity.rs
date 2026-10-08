@@ -346,9 +346,8 @@ mod tests {
 
   #[test]
   fn an_ssh_grant_routes_to_the_ssh_arm_and_only_its_port() {
-    // The demo spliced ssh traffic for a whole afternoon because nothing
-    // pinned the routing: an ssh grant must reach the ssh arm by host and
-    // by port alone (transparent capture), and nothing else may reach it.
+    // An ssh grant must reach the ssh arm by host and port alone
+    // (transparent capture); nothing else may reach it.
     let grants = vec![Grant::Ssh {
       allow: vec![SshScope {
         host: hodor_config::grants::HostPat::Exact("git.example".to_string()),

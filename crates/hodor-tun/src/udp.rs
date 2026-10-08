@@ -70,7 +70,6 @@ pub(super) fn ipv4_checksum(header: &[u8]) -> u16 {
   while sum >> 16 != 0 {
     sum = (sum & 0xffff) + (sum >> 16);
   }
-  // Folded to 16 bits above.
   !u16::try_from(sum).unwrap_or(u16::MAX)
 }
 

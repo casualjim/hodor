@@ -15,9 +15,8 @@ use hodor_config::cli::{Cli, CliCommand, ProxyBackend};
 use hodor_fnox::FnoxSource;
 
 use commands::{CaArgs, ConfigArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, ServeArgs};
-use hodor_compose::{AgentArgs, DownArgs, InitArgs, LogsArgs, UpArgs};
+use hodor_compose::{AgentArgs, DownArgs, ExposeArgs, InitArgs, LogsArgs, UpArgs};
 
-/// Command-line interface: global flags plus a subcommand.
 #[derive(Parser, Debug)]
 #[command(name = "hodor", about = "grant-scoped MITM proxy", version)]
 struct HodorCli {
@@ -29,9 +28,6 @@ struct HodorCli {
   command: Option<Command>,
 }
 
-/// Available subcommands. Each variant's args own a `run` method, so dispatch
-/// is one method call per variant — awaited for the genuinely asynchronous
-/// ones, plain for the rest.
 #[derive(Subcommand, Debug, Clone)]
 enum Command {
   /// Serve the proxy: the explicit listener, plus transparent capture when
@@ -77,6 +73,13 @@ enum Command {
   Fwd(FwdArgs),
   /// Start the layered compose project `hodor init` generated.
   Up(UpArgs),
+  /// Publish an agent port on the host, claiming the host port across
+  /// workspaces: `hodor expose <port> [--host <host-port>]` appends the
+  /// `[[workspace.expose]]` mapping, regenerates, and `up`s (recreating the
+  /// hodor service, so exec sessions drop). A host port another workspace
+  /// claimed fails naming that workspace. `hodor expose --list` reports
+  /// this workspace's publishings plus every workspace's claims.
+  Expose(ExposeArgs),
   /// Stop the layered compose project.
   Down(DownArgs),
   /// Read the stack's logs.
@@ -125,6 +128,7 @@ async fn main() -> eyre::Result<()> {
     Command::Agent(args) => args.run(&cli, hodor_version).await?,
     Command::Fwd(args) => args.run(&cli, hodor_version).await?,
     Command::Up(args) => args.run(&cli, hodor_version).await?,
+    Command::Expose(args) => args.run(&cli, hodor_version).await?,
     Command::Down(args) => args.run(&cli, hodor_version).await?,
     Command::Logs(args) => args.run(&cli, hodor_version).await?,
   }

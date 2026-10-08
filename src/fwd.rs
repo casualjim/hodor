@@ -43,7 +43,6 @@ use eyre::WrapErr as _;
 use tokio::io::copy_bidirectional;
 use tokio::sync::Mutex;
 
-/// How often the LISTEN tables are polled and the forwarders reconciled.
 const POLL: Duration = Duration::from_millis(500);
 
 /// The netns's own addresses the sidecar exposes on: the docker bridge IP
@@ -70,9 +69,7 @@ impl Binds {
 /// One loopback LISTEN row of the shared namespace.
 #[derive(Debug)]
 struct Row {
-  /// Local address the listener holds.
   addr: IpAddr,
-  /// Local port.
   port: u16,
   /// Socket inode, the key attribution resolves through `/proc/<pid>/fd`.
   inode: u64,

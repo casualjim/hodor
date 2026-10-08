@@ -58,7 +58,7 @@ pub struct Config {
   /// `SO_NETNS_COOKIE` reports it. Connects from a different network
   /// namespace — the containers the agent spawns — are never rewritten.
   /// Zero means unknown, disabling the guard: the pid and cgroup checks
-  /// then carry exclusion alone, as before this field existed.
+  /// then carry exclusion alone.
   pub netns_cookie: u64,
   /// How many of `bypass_nets`/`bypass_lens` are valid, `0..=MAX_BYPASS`.
   /// Destinations inside one of those CIDRs are never rewritten: they fail

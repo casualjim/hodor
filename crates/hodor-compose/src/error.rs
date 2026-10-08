@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use hodor_config::Error as ConfigError;
 use hodor_config::config::RewriteFormat;
 use hodor_fnox::Error as FnoxError;
+use serde_json::Error as JsonError;
 use serde_yaml::Error as YamlError;
 use toml::ser::Error as TomlSerializeError;
 use toml_edit::TomlError;
@@ -266,6 +267,60 @@ pub enum Error {
     /// Offending template.
     template: String,
   },
+  /// The expose registry does not parse.
+  #[error("read the expose registry: {source}")]
+  ExposeRegistry {
+    /// Underlying parse failure.
+    #[source]
+    source: JsonError,
+  },
+  /// An expose claim does not serialize.
+  #[error("writing the expose registry: {source}")]
+  SerializeExpose {
+    /// Underlying serialization failure.
+    #[source]
+    source: JsonError,
+  },
+  /// A host port is already exposed by another workspace.
+  #[error("host port {host} is already exposed by workspace {workspace} ({root}); rerun with `--host`", root = root.display())]
+  ExposeInUse {
+    /// Contested host port.
+    host: u16,
+    /// Owning workspace slug.
+    workspace: String,
+    /// Owning workspace root.
+    root: PathBuf,
+    /// Owning container port.
+    port: u16,
+  },
+  /// The project config does not parse.
+  #[error("parse {}: {source}", path.display())]
+  ExposeConfigParse {
+    /// Config file that could not be parsed.
+    path: PathBuf,
+    /// Underlying parse failure.
+    #[source]
+    source: TomlError,
+  },
+  /// The project config's `expose` is not `[[workspace.expose]]` tables.
+  #[error("parse {}: `expose` must be `[[workspace.expose]]` tables with `port` and `host`; fix or drop it", path.display())]
+  ExposeConfigType {
+    /// Offending config file.
+    path: PathBuf,
+  },
+  /// The published port does not verify after `up`.
+  #[error("verify 127.0.0.1:{host}: `docker compose port hodor {port}` {status}")]
+  ExposeVerify {
+    /// Host port that should be bound.
+    host: u16,
+    /// Container port it should reach.
+    port: u16,
+    /// Compose exit status.
+    status: String,
+  },
+  /// `expose` without a port or `--list` names nothing to do.
+  #[error("`hodor expose` needs a container port or `--list`")]
+  ExposeNoPort,
 }
 
 impl From<ConfigError> for Error {

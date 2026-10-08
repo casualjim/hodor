@@ -8,6 +8,7 @@ mod adapt;
 mod confine;
 mod error;
 mod expand;
+mod expose;
 mod git;
 mod jj;
 mod kube;
@@ -18,6 +19,7 @@ mod talos;
 
 pub use confine::{AgentArgs, DownArgs, InitArgs, LogsArgs, UpArgs};
 pub use error::Error;
+pub use expose::ExposeArgs;
 pub use stack::rules_command;
 
 #[cfg(test)]
@@ -29,7 +31,7 @@ mod tests {
   use std::slice::from_ref;
 
   use hodor_config::cli::{Cli, ProxyBackend};
-  use hodor_config::config::{FileRewrite, RewriteFormat, RuleCfg, ToolCfg, WorkspaceBuild, fake_for};
+  use hodor_config::config::{ExposeMap, FileRewrite, RewriteFormat, RuleCfg, ToolCfg, WorkspaceBuild, fake_for};
   use tempfile::tempdir;
 
   use crate::confine::*;
@@ -60,15 +62,15 @@ mod tests {
 
   /// Test agent spec: `root` inside the container, home `/home/eng`, and the
   /// workspace-state storage directory the agent service mounts.
-  fn agent_paths(root: &'static str) -> AgentSpec<'static> {
+  fn agent_paths(root: &str) -> AgentSpec {
     AgentSpec {
-      root: Path::new(root),
-      home: "/home/eng",
-      storage: Path::new("/state/hodor/ws/hodor/containers"),
+      root: PathBuf::from(root),
+      home: "/home/eng".to_string(),
+      storage: PathBuf::from("/state/hodor/ws/hodor/containers"),
       uid: 1000,
-      devices: &[],
-      cap_add: &[],
-      image: DEFAULT_AGENT_IMAGE,
+      devices: Vec::new(),
+      cap_add: Vec::new(),
+      image: DEFAULT_AGENT_IMAGE.to_string(),
       build: None,
     }
   }
@@ -77,7 +79,7 @@ mod tests {
   /// or a hardcoded version fails the assertion instead of passing silently.
   const TEST_VERSION: &str = "0.0.0-test";
   /// A default-ish stack to render in tests; override fields struct-update style.
-  fn test_stack(backend: ProxyBackend) -> Stack<'static> {
+  fn test_stack(backend: ProxyBackend) -> Stack {
     Stack {
       backend,
       project: "hodor".to_string(),
@@ -89,10 +91,13 @@ mod tests {
       guest: Vec::new(),
       init: None,
       ports: Vec::new(),
+      expose: Vec::new(),
+      networks: Vec::new(),
+      extra_hosts: Vec::new(),
       passthrough: Vec::new(),
       file_mounts: Vec::new(),
       grants_mounts: Vec::new(),
-      hodor_version: TEST_VERSION,
+      hodor_version: TEST_VERSION.to_string(),
     }
   }
 
@@ -526,7 +531,7 @@ mod tests {
   #[test]
   fn workspace_image_overrides_the_agent_image() {
     let mut stack = test_stack(ProxyBackend::Tproxy);
-    stack.agent.image = "ghcr.io/example/devenv:1.0";
+    stack.agent.image = "ghcr.io/example/devenv:1.0".to_string();
     let yaml = stack.render();
     assert!(yaml.contains("image: ghcr.io/example/devenv:1.0"), "{yaml}");
     assert!(!yaml.contains(DEFAULT_AGENT_IMAGE), "{yaml}");
@@ -536,8 +541,8 @@ mod tests {
   fn agent_build_renders_context_and_dockerfile() {
     let mut stack = test_stack(ProxyBackend::Tproxy);
     let build = AgentBuild {
-      context: Path::new("/ws/docker"),
-      dockerfile: Path::new("/ws/docker/Dockerfile.agent"),
+      context: PathBuf::from("/ws/docker"),
+      dockerfile: PathBuf::from("/ws/docker/Dockerfile.agent"),
     };
     stack.agent.build = Some(build);
     let yaml = stack.render();
@@ -592,10 +597,8 @@ mod tests {
   #[test]
   fn workspace_devices_and_caps_append_to_the_agent_builtin_set() {
     let mut stack = test_stack(ProxyBackend::Tproxy);
-    let devices = ["/dev/kvm".to_string()];
-    let cap_add = ["SYS_PTRACE".to_string()];
-    stack.agent.devices = &devices;
-    stack.agent.cap_add = &cap_add;
+    stack.agent.devices = vec!["/dev/kvm".to_string()];
+    stack.agent.cap_add = vec!["SYS_PTRACE".to_string()];
     let yaml = stack.render();
     assert!(yaml.contains("devices: [/dev/net/tun, /dev/kvm]"), "{yaml}");
     assert!(
@@ -609,8 +612,7 @@ mod tests {
     // The generated stack is parsed by docker's YAML loader, so a key at the
     // wrong depth is a hard failure, not a cosmetic one. In these literals a
     // `\`-continued line drops its leading whitespace while the first line
-    // keeps it, which is how `cap_add:` once landed at nine spaces inside
-    // `environment:` and `hodor up` died with "did not find expected key".
+    // keeps it.
     let yaml = test_stack(ProxyBackend::Tproxy).render();
     for expected in [
       "\n    cap_add:\n      - NET_ADMIN\n",
@@ -1158,6 +1160,63 @@ mod tests {
     );
     let empty = test_stack(ProxyBackend::Tproxy).render();
     assert!(!empty.contains("ports:"), "no ports key without declared ports: {empty}");
+  }
+
+  #[test]
+  fn workspace_networks_extra_hosts_and_expose_render() {
+    let yaml = Stack {
+      ports: vec![3000],
+      expose: vec![ExposeMap { port: 5173, host: 5174 }],
+      networks: vec!["headroom_default".to_string()],
+      extra_hosts: vec!["host.docker.internal:host-gateway".to_string()],
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    let hodor_block = &yaml[..yaml.find("\n  agent:\n").unwrap()];
+    assert!(
+      hodor_block.contains("      - \"127.0.0.1:3000:3000\"\n"),
+      "symmetric ports keep rendering: {hodor_block}"
+    );
+    assert!(
+      hodor_block.contains("      - \"127.0.0.1:5174:5173\"\n"),
+      "expose maps host onto container port: {hodor_block}"
+    );
+    assert!(
+      hodor_block.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
+      "hodor carries the hosts entry: {hodor_block}"
+    );
+    assert_eq!(
+      hodor_block.matches("host.docker.internal").count(),
+      1,
+      "a stated gateway is not repeated beside the automatic one: {hodor_block}"
+    );
+    assert!(
+      hodor_block.contains("    networks:\n      - \"headroom_default\"\n"),
+      "hodor joins the named network: {hodor_block}"
+    );
+    assert!(
+      yaml.contains("  networks:\n    \"headroom_default\":\n      external: true\n"),
+      "joined networks are declared external: {yaml}"
+    );
+    let agent_block = &yaml[yaml.find("\n  agent:\n").unwrap()..yaml.find("\n  fwd:\n").unwrap()];
+    assert!(
+      agent_block.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
+      "the agent resolves the same names (`network_mode` shares no hosts file): {agent_block}"
+    );
+    assert!(
+      !agent_block.contains("networks:"),
+      "a `network_mode` service takes no networks key: {agent_block}"
+    );
+    let empty = test_stack(ProxyBackend::Tproxy).render();
+    let empty_hodor = &empty[..empty.find("\n  agent:\n").unwrap()];
+    let empty_agent = &empty[empty.find("\n  agent:\n").unwrap()..empty.find("\n  fwd:\n").unwrap()];
+    for (name, block) in [("hodor", empty_hodor), ("agent", empty_agent)] {
+      assert!(
+        block.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
+        "{name} always carries the gateway: {block}"
+      );
+    }
+    assert!(!empty.contains("external: true"), "no networks block without joins: {empty}");
   }
 
   #[test]

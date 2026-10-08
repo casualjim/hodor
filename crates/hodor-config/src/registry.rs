@@ -74,7 +74,6 @@ pub struct KnownHosts {
   /// Raw `scheme://host[:port]` entries, in declaration order.
   pub hosts: Vec<String>,
   /// Decoy template, if any entry supplies one.
-  /// Decoy template, if any entry supplies one.
   pub pattern: Option<String>,
   /// `OAuth2` token-issuer flow, if any entry declares one.
   pub oauth2: Option<OAuthFlow>,

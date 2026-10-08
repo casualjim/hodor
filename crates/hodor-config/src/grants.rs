@@ -1536,10 +1536,6 @@ mod tests {
 
   #[test]
   fn ssh_material_on_a_non_ssh_rule_fails_closed() {
-    // The demo lost its ssh grant exactly this way: the ssh table sat on a
-    // rule whose allow entries were https, resolve took the token arm, and
-    // the table vanished silently — ssh traffic spliced instead of
-    // terminating. A stated table that cannot apply is an error.
     let mut cfg = cfg_with_ssh(&["https://api.example"], BTreeMap::new());
     cfg.rules.get_mut("t").unwrap().ssh.insert(
       "ssh://git.example".to_string(),

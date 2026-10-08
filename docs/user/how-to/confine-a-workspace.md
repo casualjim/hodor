@@ -43,6 +43,45 @@ include = ["~/.config/mise:ro", "../sibling-project"]
 
 The workspace root itself is always mounted, at its translated path.
 
+### Expose a dev-server port
+
+Static `[workspace] ports` are symmetric (`127.0.0.1:<port>` to the same
+container port) and fixed at container create. For a port you need now, or one
+another workspace already publishes, run:
+
+```sh
+hodor expose 3000             # 127.0.0.1:3000 -> agent :3000
+hodor expose 3000 --host 3001 # second workspace: same server, distinct host port
+hodor expose --list           # this workspace's publishings plus every workspace's claims
+```
+
+The command claims the host port in a registry shared across workspaces (a
+taken port fails naming the owning workspace), appends the
+`[[workspace.expose]]` mapping to the project config, regenerates, and `up`s.
+Publishing is create-time state, so the hodor service (and the agent riding
+its netns) recreates and exec sessions drop. `hodor down` releases the
+workspace's claims.
+
+### Reach the host and sidecar networks
+
+Unmatched traffic splices through the capture byte-identical, so the agent can
+reach anything hodor can route — it only needs the name to resolve.
+`host.docker.internal` always points at the host gateway on both the hodor
+and agent services (`/etc/hosts` is per container: the agent resolves the
+name, hodor dials the upstream), so host-bound dev servers just work. Further
+entries go in `[workspace] extra_hosts`, and existing compose networks in
+`[workspace] networks` — both rendered on the hodor service, both inherited
+by the agent through the shared netns:
+
+```toml
+[workspace]
+extra_hosts = ["devbox:192.168.1.20"]
+networks = ["headroom_default"]
+```
+
+A sidecar like `headroom` on a joined network resolves by name from the
+agent. Joining any network moves hodor off the default project network.
+
 ## 3. Mount tool profiles
 
 Every `<tool>/` directory inside the selected profile mounts into the agent container at the location that tool reads its own configuration from by default. Profiles live under `<config-dir>/hodor/profiles/<name>/` globally, or `<workspace root>/.config/hodor/profiles/<name>/` per workspace. `__shared__` is the base every profile inherits off and hodor always creates. Create the directory for each tool you use:

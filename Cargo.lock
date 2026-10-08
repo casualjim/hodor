@@ -4193,6 +4193,7 @@ dependencies = [
  "pretty_assertions",
  "secrecy",
  "serde",
+ "serde_json",
  "serde_yaml",
  "shellexpand",
  "tempfile",

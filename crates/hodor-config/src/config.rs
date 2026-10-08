@@ -106,6 +106,15 @@ pub struct WorkspaceCfg {
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub ports: Vec<u16>,
+  /// On-demand host publishings with a distinct host port: each entry
+  /// publishes `127.0.0.1:<host>` on the host, forwarded to `<port>` inside
+  /// the agent's shared network namespace (same `fwd` mechanism as `ports`).
+  /// The `hodor expose` command manages these entries so workspaces sharing
+  /// one host never claim the same host port twice. Same load rules as
+  /// `ports`: no zero, no capture listener ports, no host port twice.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub expose: Vec<ExposeMap>,
   /// Env names forwarded into the agent environment as `${NAME}` compose
   /// interpolation: compose substitutes the host value when the stack starts,
   /// so the generated file holds no secret and values stay fresh without
@@ -138,6 +147,25 @@ pub struct WorkspaceCfg {
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub cap_add: Vec<String>,
+  /// Existing compose networks the hodor service joins, each declared
+  /// `external` at the top level: the agent inherits them through the shared
+  /// network namespace (`network_mode: service:hodor`), so a sidecar like
+  /// `headroom` on one of these networks is reachable by name from the
+  /// agent. Joining any network moves hodor off the default project network.
+  /// Applying a change needs a stack restart.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub networks: Vec<String>,
+  /// Extra host entries rendered as `extra_hosts` on the hodor and agent
+  /// services (`host:ip` or `host=ip`), beside the always-rendered
+  /// `host.docker.internal:host-gateway`: `/etc/hosts` is per container, so
+  /// both need each entry — the agent resolves the name, hodor dials the
+  /// upstream. The gateway lets the agent reach host-bound services through
+  /// the (spliced, not blocked) capture. Applying a change needs a stack
+  /// restart.
+  #[config(default = [])]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub extra_hosts: Vec<String>,
   /// Agent image for the generated stack; defaults to the hodor dev image
   /// when unset.
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,6 +284,19 @@ impl fmt::Display for RewriteFormat {
       Self::Talos => "talos",
     })
   }
+}
+
+/// One on-demand host publishing with a distinct host port:
+/// `[[workspace.expose]]` with `port = 3000, host = 3001` publishes
+/// `127.0.0.1:3001` on the host, forwarded to port 3000 inside the agent's
+/// shared network namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposeMap {
+  /// Port inside the agent's shared network namespace.
+  pub port: u16,
+  /// Port bound on the host (`127.0.0.1`).
+  pub host: u16,
 }
 
 /// Dockerfile build for the agent image: paths resolve against the workspace
@@ -809,18 +850,45 @@ impl AppConfig {
       // the `fwd` sidecar only forwards agent-owned listeners, so a published
       // capture port would shadow a host port with a dead binding. The
       // literals must stay in step with hodor-ebpf's `TCP_LISTEN_PORT` and
-      // `UDP_LISTEN_PORT`.
+      // `UDP_LISTEN_PORT` (and with `hodor expose`'s pre-check).
       if *port == 15_000 || *port == 15_001 {
         return Err(Error::CapturePort { port: *port });
+      }
+    }
+    // Host-side publishings must name distinct host ports: two bindings on
+    // one host port is a compose create error, caught here with the setting
+    // named instead.
+    let mut hosts: BTreeSet<u16> = self.workspace.ports.iter().copied().collect();
+    for map in &self.workspace.expose {
+      for port in [map.port, map.host] {
+        if port == 0 {
+          return Err(Error::PortZero);
+        }
+        if port == 15_000 || port == 15_001 {
+          return Err(Error::CapturePort { port });
+        }
+      }
+      if !hosts.insert(map.host) {
+        return Err(Error::ExposeHostConflict { port: map.host });
+      }
+    }
+    for name in &self.workspace.networks {
+      let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+      if !plain {
+        return Err(Error::NetworkInvalid { name: name.clone() });
+      }
+    }
+    for entry in &self.workspace.extra_hosts {
+      let shaped = entry
+        .split_once([':', '='])
+        .is_some_and(|(host, addr)| !host.trim().is_empty() && !addr.trim().is_empty());
+      if !shaped {
+        return Err(Error::ExtraHostsInvalid { entry: entry.clone() });
       }
     }
     Ok(())
   }
 }
-
-// ---------------------------------------------------------------------------
-// format-valid deterministic fakes (port of substitute.py fake_for)
-// ---------------------------------------------------------------------------
 
 /// Deterministic format-valid fake seeded on `seed`. Static decoys seed on
 /// the env name (stable across restarts, distinct per name); runtime token
@@ -1301,14 +1369,11 @@ allow = ["https://a.example"]
     write_file(&project_root.join("Cargo.toml"), "[workspace]\n");
     fs::create_dir_all(&nested).unwrap();
     let _cwd = CwdGuard::enter(&nested);
-    // project beats global
     let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:2222");
-    // env beats project
     set_env("HODOR_LISTEN", "127.0.0.1:3333");
     let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
     assert_eq!(config.proxy.listen.to_string(), "127.0.0.1:3333");
-    // CLI beats env
     let mut proxy = <ProxyCfg as Config>::Layer::empty();
     proxy.listen = Some("127.0.0.1:4444".parse().unwrap());
     let (config, _) = load(&cli_for(&["hodor"]), Some(&proxy)).unwrap();
@@ -1355,7 +1420,6 @@ allow = ["https://a.example"]
     let project = root.join(".config").join("hodor.toml");
     write_file(&project, "[proxy]\n");
     assert_eq!(discover_project_config(&nested), Some(project));
-    // same tree without the file: no project layer
     fs::remove_file(root.join(".config").join("hodor.toml")).unwrap();
     assert_eq!(discover_project_config(&nested), None);
   }
@@ -1420,9 +1484,6 @@ if_missing = "warn"
 
   #[test]
   fn an_ssh_rule_loads_its_key_material_from_the_file() {
-    // Proven by the demo: an ssh rule stated in the config file vanished
-    // between the file and resolve, ssh traffic spliced. This test pins
-    // the whole file path — confique's pass and the label merge.
     let _guard = lock_env();
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
@@ -1569,6 +1630,46 @@ allow = ["https://b.example"]
     assert!(config.workspace.ports.is_empty(), "absent ports stay empty");
     scrub_env();
   }
+
+  /// Workspace networking keys load, default empty, and refuse malformed
+  /// values: blank network names, host entries without a target, zero or
+  /// capture ports in expose maps, and a host port published twice.
+  #[test]
+  fn workspace_networking_keys_validate() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    set_env("HODOR_CONFIG", &global);
+    for (body, expected) in [
+      ("networks = [\"\"]", "not a plain network name"),
+      ("networks = [\"has space\"]", "not a plain network name"),
+      ("extra_hosts = [\"bare-host\"]", "must be `host:ip`"),
+      ("extra_hosts = [\":1.2.3.4\"]", "must be `host:ip`"),
+      ("expose = [{ port = 0, host = 3000 }]", "port 0"),
+      ("expose = [{ port = 3000, host = 15000 }]", "capture listener port"),
+      ("ports = [3000]\nexpose = [{ port = 3000, host = 3000 }]", "published twice"),
+    ] {
+      write_file(&global, format!("[workspace]\n{body}\n").as_str());
+      let err = load(&cli_for(&["hodor"]), None).unwrap_err();
+      assert!(err.to_string().contains(expected), "{body}: {err:?}");
+    }
+    write_file(
+      &global,
+      "[workspace]\nports = [3000]\nnetworks = [\"headroom_default\"]\nextra_hosts = [\"host.docker.internal:host-gateway\"]\n[[workspace.expose]]\nport = 5173\nhost = 5174\n",
+    );
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
+    assert_eq!(config.workspace.networks, vec!["headroom_default".to_string()]);
+    assert_eq!(config.workspace.extra_hosts, vec!["host.docker.internal:host-gateway".to_string()]);
+    assert_eq!(config.workspace.expose, vec![ExposeMap { port: 5173, host: 5174 }]);
+    write_file(&global, "[proxy]\n");
+    let (config, _) = load(&cli_for(&["hodor"]), None).unwrap();
+    assert!(config.workspace.networks.is_empty(), "absent networks stay empty");
+    assert!(config.workspace.extra_hosts.is_empty(), "absent extra_hosts stay empty");
+    assert!(config.workspace.expose.is_empty(), "absent expose stays empty");
+    scrub_env();
+  }
+
   #[test]
   fn workspace_image_and_build_parse() {
     let _guard = lock_env();

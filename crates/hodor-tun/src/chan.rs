@@ -10,7 +10,8 @@ use tokio::sync::mpsc;
 
 use crate::tracker::TaskMsg;
 
-/// writes back toward the guest. RX close = guest FIN (EOF).
+/// Guest-facing stream half: writes go to the task, a closed RX reads as
+/// the guest's FIN (EOF).
 pub(crate) struct ChanStream {
   rx: mpsc::Receiver<Vec<u8>>,
   tx: Option<tokio_util::sync::PollSender<TaskMsg>>,

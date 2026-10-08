@@ -111,6 +111,24 @@ pub enum Error {
     /// Offending port.
     port: u16,
   },
+  /// A network name is blank or carries characters compose rejects.
+  #[error("[workspace] networks `{name}` is not a plain network name ([A-Za-z0-9._-])")]
+  NetworkInvalid {
+    /// Offending name.
+    name: String,
+  },
+  /// An extra host entry is not `host:ip` or `host=ip`.
+  #[error("[workspace] extra_hosts `{entry}` must be `host:ip` or `host=ip`")]
+  ExtraHostsInvalid {
+    /// Offending entry.
+    entry: String,
+  },
+  /// A host port is published twice across `ports` and `expose`.
+  #[error("[workspace] host port {port} is published twice; give each expose mapping its own host port")]
+  ExposeHostConflict {
+    /// Offending host port.
+    port: u16,
+  },
   /// A database rule states `allow` entries; the connection string is the grant.
   #[error("rule `{label}`: a database rule states no allow entries; the connection string is the grant")]
   DatabaseAllow {

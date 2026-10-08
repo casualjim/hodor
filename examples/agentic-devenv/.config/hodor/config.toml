@@ -14,10 +14,10 @@ shell = "bash"
 # `if_missing = "warn"` keeps the stack startable when fnox does not declare
 # the key; `hodor rules` prints these blocks for whatever fnox does declare.
 
-# [rules.anthropic]
-# env = "ANTHROPIC_API_KEY"
-# if_missing = "warn"
+[rules.anthropic]
+env = "ANTHROPIC_API_KEY"
+if_missing = "warn"
 
-# [rules.github]
-# env = "GH_TOKEN"
-# if_missing = "warn"
+[rules.github]
+env = "GH_TOKEN"
+if_missing = "warn"

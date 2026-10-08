@@ -224,8 +224,8 @@ pub fn parse_bypass_cidr(s: &str) -> Result<(Ipv4Addr, u8), String> {
   let (addr, len) = s
     .split_once('/')
     .ok_or_else(|| format!("expected CIDR `address/prefix_len`, got `{s}`"))?;
-  let addr: Ipv4Addr = addr.parse().map_err(|_| format!("invalid bypass network address `{addr}`"))?;
-  let len: u8 = len.parse().map_err(|_| format!("invalid bypass prefix length `{len}`"))?;
+  let addr: Ipv4Addr = addr.parse().map_err(|_source| format!("invalid bypass network address `{addr}`"))?;
+  let len: u8 = len.parse().map_err(|_source| format!("invalid bypass prefix length `{len}`"))?;
   if len == 0 || len > 32 {
     return Err(format!("bypass prefix length must be 1..=32, got `{len}`"));
   }
@@ -320,6 +320,16 @@ fn parse_bypass_file(content: &str, path: &Path) -> Vec<(Ipv4Addr, u8)> {
   out
 }
 
+/// Owns the `getifaddrs` list head and frees the whole list on drop.
+struct IfaddrsList(*mut libc::ifaddrs);
+
+impl Drop for IfaddrsList {
+  fn drop(&mut self) {
+    // SAFETY: the pointer is the head `getifaddrs` wrote.
+    unsafe { libc::freeifaddrs(self.0) };
+  }
+}
+
 /// This netns's own non-loopback IPv4 addresses, one `/32` each in the bypass
 /// list: dials at the devenv by bridge IP (pasta relays, `fwd`-exposed ports)
 /// keep their own routing instead of taking a double hop through the proxy.
@@ -333,14 +343,7 @@ fn local_ipv4_addrs() -> Vec<Ipv4Addr> {
     tracing::debug!("getifaddrs failed: the local-address bypass stays empty");
     return Vec::new();
   }
-  struct List(*mut libc::ifaddrs);
-  impl Drop for List {
-    fn drop(&mut self) {
-      // SAFETY: the pointer is the head `getifaddrs` wrote.
-      unsafe { libc::freeifaddrs(self.0) };
-    }
-  }
-  let _list = List(head);
+  let _list = IfaddrsList(head);
   let mut out = Vec::new();
   let mut cursor = head;
   loop {
@@ -350,6 +353,8 @@ fn local_ipv4_addrs() -> Vec<Ipv4Addr> {
       break;
     };
     cursor = entry.ifa_next;
+    // SAFETY: `entry` is a live `ifaddrs` node owned by `_list`, and its
+    // `ifa_addr` is null or points to a `sockaddr` the kernel wrote for it.
     if i32::from(unsafe { entry.ifa_addr.as_ref() }.map_or(0, |addr| addr.sa_family)) != libc::AF_INET {
       continue;
     }
@@ -700,7 +705,9 @@ impl Config {
       tcp_port: u32::from(tcp_port),
       udp_port: u32::from(udp_port),
       netns_cookie,
-      bypass_count: bypass.len() as u32,
+      // `from_bypass` already bounds the list at `MAX_BYPASS`; the fallback
+      // is unreachable and keeps the constructor total.
+      bypass_count: u32::try_from(bypass.len()).unwrap_or(u32::MAX),
       bypass_nets: nets,
       bypass_lens: lens,
       _pad2: [0; 4],

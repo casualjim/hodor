@@ -916,20 +916,16 @@ async fn ebpf_live_bypass_file_update_applies_without_restart() {
 
   let deadline = Instant::now() + Duration::from_secs(30);
   loop {
-    match TcpStream::connect(SocketAddr::from((TARGET, stub_port))).await {
-      Err(err) => {
-        assert!(
-          err.raw_os_error().is_some(),
-          "the kernel reports its own errno once the bypass lands: {err}"
-        );
-        break;
-      }
-      // Still captured: drop the fake connection and wait for the next poll.
-      Ok(_) => {
-        assert!(Instant::now() < deadline, "bypass file update did not apply within 30s");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-      }
+    if let Err(err) = TcpStream::connect(SocketAddr::from((TARGET, stub_port))).await {
+      assert!(
+        err.raw_os_error().is_some(),
+        "the kernel reports its own errno once the bypass lands: {err}"
+      );
+      break;
     }
+    // Still captured: drop the fake connection and wait for the next poll.
+    assert!(Instant::now() < deadline, "bypass file update did not apply within 30s");
+    tokio::time::sleep(Duration::from_secs(1)).await;
   }
   capture.abort();
 }

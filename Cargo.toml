@@ -7,6 +7,7 @@ description = "Secure your coding agent: decoy credentials that work, real secre
 license = "Apache-2.0"
 repository = "https://github.com/casualjim/hodor"
 keywords = ["agents", "secrets", "mitm", "proxy", "tls"]
+categories = ["network-programming", "command-line-utilities"]
 
 [package.metadata.dist]
 # hodor is a single static-friendly binary; container + tarballs ship from CI.

@@ -294,8 +294,8 @@ mod tests {
       "the base every profile inherits is always made"
     );
     assert!(
-      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display())),
-      "missing tool dirs materialize so first-run setups persist: {mounts:?}"
+      rendered_mounts(&mounts).is_empty(),
+      "unconfigured tools with no profile dir mount nothing: {mounts:?}"
     );
   }
 
@@ -1195,13 +1195,13 @@ mod tests {
       "hodor joins the named network: {hodor_block}"
     );
     assert!(
-      yaml.contains("  networks:\n    \"headroom_default\":\n      external: true\n"),
-      "joined networks are declared external: {yaml}"
+      yaml.contains("networks:\n  \"headroom_default\":\n    external: true\n"),
+      "joined networks are declared external at the top level: {yaml}"
     );
     let agent_block = &yaml[yaml.find("\n  agent:\n").unwrap()..yaml.find("\n  fwd:\n").unwrap()];
     assert!(
-      agent_block.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
-      "the agent resolves the same names (`network_mode` shares no hosts file): {agent_block}"
+      !agent_block.contains("extra_hosts:"),
+      "the daemon rejects host mappings on a `network_mode` service: {agent_block}"
     );
     assert!(
       !agent_block.contains("networks:"),
@@ -1210,12 +1210,14 @@ mod tests {
     let empty = test_stack(ProxyBackend::Tproxy).render();
     let empty_hodor = &empty[..empty.find("\n  agent:\n").unwrap()];
     let empty_agent = &empty[empty.find("\n  agent:\n").unwrap()..empty.find("\n  fwd:\n").unwrap()];
-    for (name, block) in [("hodor", empty_hodor), ("agent", empty_agent)] {
-      assert!(
-        block.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
-        "{name} always carries the gateway: {block}"
-      );
-    }
+    assert!(
+      empty_hodor.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
+      "hodor always carries the gateway: {empty_hodor}"
+    );
+    assert!(
+      !empty_agent.contains("extra_hosts:"),
+      "the agent never carries host mappings: {empty_agent}"
+    );
     assert!(!empty.contains("external: true"), "no networks block without joins: {empty}");
   }
 

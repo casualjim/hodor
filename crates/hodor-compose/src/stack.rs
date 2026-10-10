@@ -1605,9 +1605,9 @@ impl Stack {
     if !self.networks.is_empty() {
       // Joined networks are existing ones (a sidecar's project network, e.g.
       // headroom's): hodor creates none of them, so every one is external.
-      out.push_str("  networks:\n");
+      out.push_str("networks:\n");
       for network in &self.networks {
-        let _ = writeln!(out, "    \"{network}\":\n      external: true");
+        let _ = writeln!(out, "  \"{network}\":\n    external: true");
       }
     }
     out
@@ -1727,12 +1727,9 @@ impl Stack {
       // so the file holds no secret and values stay fresh without regenerating.
       let _ = writeln!(out, "      {name}: \"${{{name}}}\"");
     }
-    // Same block as the hodor service, gateway included: `/etc/hosts` is per
-    // container, and a compose `network_mode` join shares no hosts file.
-    out.push_str("    extra_hosts:\n");
-    for entry in self.effective_extra_hosts() {
-      let _ = writeln!(out, "      - \"{entry}\"");
-    }
+    // No `extra_hosts` here: the daemon rejects custom host-to-IP mappings
+    // on a service joined by `network_mode`. The hodor service owns the
+    // namespace and its mappings; the agent shares that namespace.
     out.push_str("    volumes:\n");
     for mount in self
       .mounts
@@ -1867,13 +1864,31 @@ pub(crate) struct ProfileRoots<'a> {
   pub(crate) global: Option<&'a Path>,
 }
 
+impl ProfileRoots<'_> {
+  /// A profile-chain layer carrying `name`, project first: the directory to
+  /// mount when the tool is already installed somewhere.
+  fn chain_dir(&self, chain: &[String], name: &str) -> Option<PathBuf> {
+    [self.project, self.global]
+      .into_iter()
+      .flatten()
+      .flat_map(|layer| chain.iter().map(move |parent| layer.join(parent).join(name)))
+      .find(|dir| dir.is_dir())
+  }
+
+  /// Where a configured tool's missing profile dir is made: the global
+  /// profiles dir only. The workspace's project layer is read-only — hodor
+  /// never creates anything inside the project root.
+  fn create_base(&self, profile: &str) -> Option<PathBuf> {
+    self.global.map(|global| global.join(profile))
+  }
+}
+
 /// Mount the selected profile's tool configs at the locations the tools read
-/// by default, so nothing has to point a tool at them. Each tool resolves
-/// down its inheritance chain in the project layer first, then the global
-/// one. Writable: the tool owns that directory, and its writes
-/// land beside the profile on the host. Missing dirs are created under the
-/// selected profile, so a first-run tool setup persists instead of landing
-/// on the container overlay. The shared base root is always created.
+/// by default, so nothing has to point a tool at them. Explicitly configured
+/// tools mount (their missing profile dir is created in the global profiles
+/// dir, never the project); known tools mount only a directory the profile
+/// chain already carries — nothing is mapped for a tool nobody installed,
+/// and nothing is ever generated inside the project root.
 pub(crate) fn profile_mounts(
   roots: &ProfileRoots,
   profile: &str,
@@ -1885,50 +1900,50 @@ pub(crate) fn profile_mounts(
     let dir = global.join(SHARED_PROFILE);
     fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
   }
-  let mut names: Vec<String> = TOOL_CONFIG_DIRS.iter().map(|(tool, _)| (*tool).to_string()).collect();
-  names.extend(configured.keys().cloned());
-  names.sort();
-  names.dedup();
+  // Explicit `[tools]` entries are opted in: their profile dir is made under
+  // the global profiles dir when no layer carries it, so a first-run setup
+  // persists — and the project root stays untouched.
   let mut mounts = Vec::new();
-  for name in &names {
+  for (name, tool) in configured {
     if !valid_profile(name) {
       return Err(Error::ToolNameInvalid { name: name.clone() });
     }
-    let template = configured
-      .get(name)
-      .map(|tool| tool.config_dir.as_str())
-      .or_else(|| TOOL_CONFIG_DIRS.iter().find(|(tool, _)| tool == name).map(|(_, dir)| *dir));
-    let Some(template) = template else {
-      continue;
-    };
-    let container = template.replace("{home}", home);
+    let container = tool.config_dir.replace("{home}", home);
     if !container.starts_with('/') {
       return Err(Error::ToolConfigNotAbsolute {
         name: name.clone(),
-        template: template.to_string(),
+        template: tool.config_dir.clone(),
       });
     }
-    let mut host = None;
-    for layer in [roots.project, roots.global].into_iter().flatten() {
-      if let Some(dir) = chain.iter().map(|parent| layer.join(parent).join(name)).find(|dir| dir.is_dir()) {
-        host = Some(dir);
-        break;
+    let host = match (roots.chain_dir(&chain, name), roots.create_base(profile)) {
+      (Some(existing), _) => existing,
+      (None, Some(base)) => {
+        let dir = base.join(name);
+        fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
+        dir
       }
+      (None, None) => continue,
+    };
+    mounts.push(Mount {
+      host,
+      container: PathBuf::from(container),
+      ro: false,
+    });
+  }
+  // Known tools nobody configured mount only a directory the profile chain
+  // already has: nothing is mapped for a tool nobody installed.
+  for (name, template) in TOOL_CONFIG_DIRS {
+    if configured.contains_key(*name) {
+      continue;
     }
-    if host.is_none()
-      && let Some(base) = roots.project.or(roots.global)
-    {
-      let dir = base.join(profile).join(name);
-      fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
-      host = Some(dir);
-    }
-    if let Some(host) = host {
-      mounts.push(Mount {
-        host,
-        container: PathBuf::from(container),
-        ro: false,
-      });
-    }
+    let Some(host) = roots.chain_dir(&chain, name) else {
+      continue;
+    };
+    mounts.push(Mount {
+      host,
+      container: PathBuf::from(template.replace("{home}", home)),
+      ro: false,
+    });
   }
   Ok(mounts)
 }

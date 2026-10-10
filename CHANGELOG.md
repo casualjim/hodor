@@ -1,3 +1,8 @@
+## [0.3.8] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- *(compose)* Correct stack yaml, stop tool mounts in repo
 ## [0.3.7] - 2026-10-10
 
 ### 🚀 Features
@@ -8,6 +13,11 @@
 ### 🐛 Bug Fixes
 
 - *(compose)* Mount missing builtin tool configs
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.7 [ci skip]
+- Release
 ## [0.3.6] - 2026-10-08
 
 ### 🚀 Features

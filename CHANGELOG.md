@@ -1,3 +1,13 @@
+## [0.3.7] - 2026-10-10
+
+### 🚀 Features
+
+- *(compose)* Workspace networking, expose, stack builder
+- *(proxy)* Redis transport, protocol verticals, lock-free state
+
+### 🐛 Bug Fixes
+
+- *(compose)* Mount missing builtin tool configs
 ## [0.3.6] - 2026-10-08
 
 ### 🚀 Features
@@ -8,6 +18,11 @@
 ### 🐛 Bug Fixes
 
 - *(ebpf)* Satisfy clippy 1.99 and cargo metadata lints
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.6 [ci skip]
+- Release
 ## [0.3.5] - 2026-10-07
 
 ### 🚀 Features
